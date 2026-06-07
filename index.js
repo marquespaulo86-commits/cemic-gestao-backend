@@ -255,7 +255,7 @@ async function seedConfiguracoes() {
     ['multa_atraso', JSON.stringify({ ativa: false, multa_percentual: 2, juros_dia_percentual: 0.033 }), 'Multa e juros por atraso (aplicados quando ativa = true)'],
     ['descontos_disponiveis', JSON.stringify([25, 50, 100]), 'Percentuais de desconto disponíveis para Pagante Parcial (bolsista = 100)'],
     ['mensalidades', JSON.stringify({ 'Inglês': 0, 'Espanhol': 0 }), 'Valor da mensalidade integral por curso (R$) — definir antes das matrículas'],
-    ['formas_pagamento', JSON.stringify(['Pix', 'Dinheiro', 'Cartão de Débito', 'Cartão de Crédito', 'Transferência']), 'Formas de pagamento aceitas'],
+    ['formas_pagamento', JSON.stringify(['PIX', 'DINHEIRO', 'CARTÃO DE CRÉDITO', 'CARTÃO DE DÉBITO', 'TRANSFERÊNCIA', 'MISTO']), 'Formas de pagamento aceitas'],
     ['categorias_contas_pagar', JSON.stringify(['Aluguel', 'Energia', 'Água/Internet', 'Salários', 'Material Didático', 'Manutenção', 'Outros']), 'Categorias de contas a pagar'],
     ['categorias_contas_receber', JSON.stringify(['Mensalidade', 'Matrícula', 'Material', 'Evento', 'Outros']), 'Categorias de contas a receber'],
     ['dados_instituicao', JSON.stringify({
