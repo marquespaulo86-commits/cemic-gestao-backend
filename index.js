@@ -1,5 +1,5 @@
 // ============================================================
-// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v2.0 (Fases 1 e 2)
+// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v2.1 (Fases 1 e 2)
 // Banco + Autenticação com perfis + Configurações + CRUDs
 // Stack: Node.js/Express + PostgreSQL (Railway)
 // ============================================================
@@ -251,6 +251,7 @@ async function seedConfiguracoes() {
     ['frequencia_minima', JSON.stringify(75), 'Frequência mínima para aprovação (%)'],
     ['parcelas_semestre', JSON.stringify(6), 'Quantidade de mensalidades geradas por matrícula no semestre'],
     ['dia_vencimento', JSON.stringify(10), 'Dia padrão de vencimento das mensalidades'],
+    ['taxa_matricula', JSON.stringify(0), 'Valor padrão da taxa de matrícula (R$) — ajustável no ato, paga sempre no ato'],
     ['multa_atraso', JSON.stringify({ ativa: false, multa_percentual: 2, juros_dia_percentual: 0.033 }), 'Multa e juros por atraso (aplicados quando ativa = true)'],
     ['descontos_disponiveis', JSON.stringify([25, 50, 100]), 'Percentuais de desconto disponíveis para Pagante Parcial (bolsista = 100)'],
     ['mensalidades', JSON.stringify({ 'Inglês': 0, 'Espanhol': 0 }), 'Valor da mensalidade integral por curso (R$) — definir antes das matrículas'],
@@ -975,6 +976,16 @@ app.post('/admin/matriculas', autenticar, somenteGestao, async (req, res) => {
     const desconto = Number(aluno.desconto_percentual || 0);
     const bolsista = aluno.modalidade === 'bolsista' || desconto >= 100;
 
+    // Taxa de matrícula: geral, paga sempre no ato (bolsista também paga)
+    const taxa = req.body.taxa_matricula !== undefined
+      ? Number(req.body.taxa_matricula) || 0
+      : Number(await getConfig('taxa_matricula', 0)) || 0;
+    const formaTaxa = String(req.body.forma_pagamento_taxa || '').trim();
+    if (taxa > 0 && !formaTaxa) {
+      await client.query('ROLLBACK'); client.release();
+      return res.status(400).json({ erro: 'A taxa de matrícula é paga no ato — informe a forma de pagamento.' });
+    }
+
     const mIns = await client.query(
       `INSERT INTO matriculas (aluno_id, turma_id, valor_mensalidade, desconto_aplicado)
        VALUES ($1,$2,$3,$4) RETURNING *`, [aluno.id, turma.id, valor, desconto]);
@@ -1003,8 +1014,27 @@ app.post('/admin/matriculas', autenticar, somenteGestao, async (req, res) => {
          bolsista ? 'Bolsa integral' : null,
          bolsista ? req.usuario.id : null]);
     }
+    // Lançamento da taxa (já quitada) + dados do recibo automático
+    let recibo = null;
+    if (taxa > 0) {
+      const comp0 = `${hoje.getFullYear()}-${String(hoje.getMonth() + 1).padStart(2, '0')}`;
+      const tIns = await client.query(
+        `INSERT INTO contas_receber
+           (aluno_id, matricula_id, descricao, competencia, valor_original, desconto, valor_final,
+            vencimento, status, data_pagamento, forma_pagamento, recebido_por)
+         VALUES ($1,$2,$3,$4,$5,0,$5,$6,'paga',$6,$7,$8) RETURNING id`,
+        [aluno.id, matricula.id,
+         `Taxa de Matrícula — ${turma.curso_nome} ${turma.nivel_nome} (${turma.nome})`,
+         comp0, taxa, hoje, formaTaxa, req.usuario.id]);
+      recibo = {
+        numero: tIns.rows[0].id, aluno_nome: aluno.nome,
+        curso: turma.curso_nome, nivel: turma.nivel_nome, turma: turma.nome,
+        turno: turma.turno, horario: turma.horario, semestre: turma.semestre,
+        valor: taxa, forma: formaTaxa, data: hoje
+      };
+    }
     await client.query('COMMIT'); client.release();
-    res.status(201).json({ matricula, mensalidades_geradas: parcelas, bolsista });
+    res.status(201).json({ matricula, mensalidades_geradas: parcelas, bolsista, recibo });
   } catch (e) {
     try { await client.query('ROLLBACK'); } catch {}
     client.release();
@@ -1200,7 +1230,7 @@ app.delete('/admin/usuarios/:id', autenticar, exigirPerfil('master'), async (req
 app.get('/health', async (req, res) => {
   try {
     await pool.query('SELECT 1');
-    res.json({ status: 'ok', sistema: 'CEMIC Gestão', versao: '2.0 (Fases 1 e 2)' });
+    res.json({ status: 'ok', sistema: 'CEMIC Gestão', versao: '2.1 (Fases 1 e 2)' });
   } catch {
     res.status(500).json({ status: 'erro', detalhe: 'Banco de dados inacessível.' });
   }
@@ -1208,5 +1238,5 @@ app.get('/health', async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 initDB()
-  .then(() => app.listen(PORT, () => console.log(`CEMIC Gestão — backend v2.0 rodando na porta ${PORT}`)))
+  .then(() => app.listen(PORT, () => console.log(`CEMIC Gestão — backend v2.1 rodando na porta ${PORT}`)))
   .catch(e => { console.error('Falha ao inicializar o banco:', e); process.exit(1); });
