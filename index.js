@@ -1,0 +1,1047 @@
+// ============================================================
+// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v1.0 (Fase 1)
+// Banco + Autenticação com perfis + Configurações + CRUDs
+// Stack: Node.js/Express + PostgreSQL (Railway)
+// ============================================================
+
+const express = require('express');
+const { Pool } = require('pg');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const cors = require('cors');
+const rateLimit = require('express-rate-limit');
+
+const app = express();
+app.set('trust proxy', 1);
+app.use(cors());
+app.use(express.json({ limit: '2mb' }));
+
+// ---------- Variáveis de ambiente obrigatórias ----------
+const { DATABASE_URL, JWT_SECRET } = process.env;
+if (!DATABASE_URL) { console.error('ERRO: DATABASE_URL não definida.'); process.exit(1); }
+if (!JWT_SECRET) { console.error('ERRO: JWT_SECRET não definida.'); process.exit(1); }
+
+const MASTER_CPF = process.env.MASTER_CPF || '00000000000';
+const MASTER_SENHA = process.env.MASTER_SENHA || null; // se ausente, master só é criado se já houver senha definida
+
+const pool = new Pool({
+  connectionString: DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
+});
+
+// ============================================================
+// 1. CRIAÇÃO DO BANCO (idempotente — CREATE IF NOT EXISTS)
+// ============================================================
+async function initDB() {
+  const ddl = `
+  -- ---------- Configurações e autenticação ----------
+  CREATE TABLE IF NOT EXISTS configuracoes (
+    id SERIAL PRIMARY KEY,
+    chave TEXT UNIQUE NOT NULL,
+    valor JSONB NOT NULL,
+    descricao TEXT,
+    atualizado_em TIMESTAMP DEFAULT NOW(),
+    atualizado_por INTEGER
+  );
+
+  CREATE TABLE IF NOT EXISTS usuarios (
+    id SERIAL PRIMARY KEY,
+    nome TEXT NOT NULL,
+    cpf TEXT UNIQUE NOT NULL,
+    email TEXT,
+    whatsapp TEXT,
+    senha_hash TEXT NOT NULL,
+    data_nascimento DATE,
+    perfil TEXT NOT NULL CHECK (perfil IN ('master','secretaria','professor','aluno','responsavel')),
+    referencia_id INTEGER,
+    status TEXT NOT NULL DEFAULT 'ativo' CHECK (status IN ('ativo','inativo')),
+    senha_provisoria BOOLEAN DEFAULT FALSE,
+    criado_em TIMESTAMP DEFAULT NOW(),
+    ultimo_acesso TIMESTAMP
+  );
+
+  -- ---------- Pessoas ----------
+  CREATE TABLE IF NOT EXISTS alunos (
+    id SERIAL PRIMARY KEY,
+    nome TEXT NOT NULL,
+    data_nascimento DATE,
+    email TEXT,
+    cpf TEXT UNIQUE,
+    whatsapp TEXT,
+    status TEXT NOT NULL DEFAULT 'ativo' CHECK (status IN ('ativo','inativo')),
+    modalidade TEXT NOT NULL DEFAULT 'pagante' CHECK (modalidade IN ('pagante','pagante_parcial','bolsista')),
+    desconto_percentual NUMERIC(5,2) NOT NULL DEFAULT 0,
+    data_cadastro DATE DEFAULT CURRENT_DATE,
+    observacoes TEXT
+  );
+
+  CREATE TABLE IF NOT EXISTS responsaveis (
+    id SERIAL PRIMARY KEY,
+    nome TEXT NOT NULL,
+    cpf TEXT UNIQUE NOT NULL,
+    email TEXT,
+    whatsapp TEXT
+  );
+
+  CREATE TABLE IF NOT EXISTS aluno_responsavel (
+    id SERIAL PRIMARY KEY,
+    aluno_id INTEGER NOT NULL REFERENCES alunos(id) ON DELETE CASCADE,
+    responsavel_id INTEGER NOT NULL REFERENCES responsaveis(id) ON DELETE CASCADE,
+    parentesco TEXT,
+    responsavel_financeiro BOOLEAN DEFAULT FALSE,
+    UNIQUE(aluno_id, responsavel_id)
+  );
+
+  CREATE TABLE IF NOT EXISTS professores (
+    id SERIAL PRIMARY KEY,
+    nome TEXT NOT NULL,
+    email TEXT,
+    formacao TEXT,
+    whatsapp TEXT,
+    data_nascimento DATE,
+    status TEXT NOT NULL DEFAULT 'ativo' CHECK (status IN ('ativo','inativo'))
+  );
+
+  -- ---------- Acadêmico ----------
+  CREATE TABLE IF NOT EXISTS cursos (
+    id SERIAL PRIMARY KEY,
+    nome TEXT UNIQUE NOT NULL,
+    status TEXT NOT NULL DEFAULT 'ativo' CHECK (status IN ('ativo','inativo'))
+  );
+
+  CREATE TABLE IF NOT EXISTS niveis (
+    id SERIAL PRIMARY KEY,
+    curso_id INTEGER NOT NULL REFERENCES cursos(id),
+    nome TEXT NOT NULL,
+    ordem INTEGER NOT NULL DEFAULT 1,
+    carga_horaria INTEGER,
+    UNIQUE(curso_id, nome)
+  );
+
+  CREATE TABLE IF NOT EXISTS turmas (
+    id SERIAL PRIMARY KEY,
+    nivel_id INTEGER NOT NULL REFERENCES niveis(id),
+    nome TEXT NOT NULL,
+    semestre TEXT NOT NULL,
+    turno TEXT,
+    horario TEXT,
+    professor_id INTEGER REFERENCES professores(id),
+    capacidade INTEGER NOT NULL DEFAULT 15,
+    status TEXT NOT NULL DEFAULT 'em_formacao' CHECK (status IN ('em_formacao','em_andamento','encerrada')),
+    UNIQUE(nome, semestre)
+  );
+
+  CREATE TABLE IF NOT EXISTS matriculas (
+    id SERIAL PRIMARY KEY,
+    aluno_id INTEGER NOT NULL REFERENCES alunos(id),
+    turma_id INTEGER NOT NULL REFERENCES turmas(id),
+    data_matricula DATE DEFAULT CURRENT_DATE,
+    valor_mensalidade NUMERIC(10,2) NOT NULL DEFAULT 0,
+    desconto_aplicado NUMERIC(5,2) NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'ativa' CHECK (status IN ('ativa','trancada','cancelada','concluida')),
+    resultado TEXT CHECK (resultado IN ('aprovado','reprovado')),
+    media_final NUMERIC(5,2),
+    frequencia_final NUMERIC(5,2),
+    UNIQUE(aluno_id, turma_id)
+  );
+
+  CREATE TABLE IF NOT EXISTS avaliacoes (
+    id SERIAL PRIMARY KEY,
+    turma_id INTEGER NOT NULL REFERENCES turmas(id) ON DELETE CASCADE,
+    nome TEXT NOT NULL,
+    peso NUMERIC(5,2) NOT NULL DEFAULT 1,
+    data DATE
+  );
+
+  CREATE TABLE IF NOT EXISTS notas (
+    id SERIAL PRIMARY KEY,
+    avaliacao_id INTEGER NOT NULL REFERENCES avaliacoes(id) ON DELETE CASCADE,
+    matricula_id INTEGER NOT NULL REFERENCES matriculas(id) ON DELETE CASCADE,
+    nota NUMERIC(5,2) NOT NULL,
+    lancada_por INTEGER REFERENCES usuarios(id),
+    lancada_em TIMESTAMP DEFAULT NOW(),
+    UNIQUE(avaliacao_id, matricula_id)
+  );
+
+  CREATE TABLE IF NOT EXISTS aulas (
+    id SERIAL PRIMARY KEY,
+    turma_id INTEGER NOT NULL REFERENCES turmas(id) ON DELETE CASCADE,
+    data DATE NOT NULL,
+    conteudo TEXT
+  );
+
+  CREATE TABLE IF NOT EXISTS frequencias (
+    id SERIAL PRIMARY KEY,
+    aula_id INTEGER NOT NULL REFERENCES aulas(id) ON DELETE CASCADE,
+    matricula_id INTEGER NOT NULL REFERENCES matriculas(id) ON DELETE CASCADE,
+    presente BOOLEAN NOT NULL DEFAULT TRUE,
+    justificativa TEXT,
+    UNIQUE(aula_id, matricula_id)
+  );
+
+  -- ---------- Financeiro ----------
+  CREATE TABLE IF NOT EXISTS fornecedores (
+    id SERIAL PRIMARY KEY,
+    nome TEXT NOT NULL,
+    cpf_cnpj TEXT,
+    email TEXT,
+    whatsapp TEXT,
+    categoria TEXT,
+    observacoes TEXT,
+    status TEXT NOT NULL DEFAULT 'ativo' CHECK (status IN ('ativo','inativo'))
+  );
+
+  CREATE TABLE IF NOT EXISTS contas_pagar (
+    id SERIAL PRIMARY KEY,
+    fornecedor_id INTEGER REFERENCES fornecedores(id),
+    descricao TEXT NOT NULL,
+    categoria TEXT,
+    valor NUMERIC(10,2) NOT NULL,
+    vencimento DATE NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pendente' CHECK (status IN ('pendente','paga','atrasada','cancelada')),
+    data_pagamento DATE,
+    forma_pagamento TEXT,
+    comprovante_url TEXT,
+    criado_por INTEGER REFERENCES usuarios(id),
+    criado_em TIMESTAMP DEFAULT NOW()
+  );
+
+  CREATE TABLE IF NOT EXISTS contas_receber (
+    id SERIAL PRIMARY KEY,
+    aluno_id INTEGER NOT NULL REFERENCES alunos(id),
+    matricula_id INTEGER REFERENCES matriculas(id),
+    descricao TEXT NOT NULL,
+    competencia TEXT,
+    valor_original NUMERIC(10,2) NOT NULL,
+    desconto NUMERIC(10,2) NOT NULL DEFAULT 0,
+    valor_final NUMERIC(10,2) NOT NULL,
+    vencimento DATE NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pendente' CHECK (status IN ('pendente','paga','atrasada','cancelada')),
+    data_pagamento DATE,
+    forma_pagamento TEXT,
+    recebido_por INTEGER REFERENCES usuarios(id),
+    criado_em TIMESTAMP DEFAULT NOW()
+  );
+
+  -- ---------- Comunicação ----------
+  CREATE TABLE IF NOT EXISTS avisos (
+    id SERIAL PRIMARY KEY,
+    autor_id INTEGER REFERENCES usuarios(id),
+    escopo TEXT NOT NULL DEFAULT 'geral' CHECK (escopo IN ('geral','turma','aluno')),
+    turma_id INTEGER REFERENCES turmas(id) ON DELETE CASCADE,
+    aluno_id INTEGER REFERENCES alunos(id) ON DELETE CASCADE,
+    titulo TEXT NOT NULL,
+    mensagem TEXT NOT NULL,
+    criado_em TIMESTAMP DEFAULT NOW()
+  );
+  `;
+  await pool.query(ddl);
+  await seedConfiguracoes();
+  await seedCursosNiveis();
+  await seedMaster();
+  console.log('Banco verificado/criado com sucesso.');
+}
+
+// ---------- Seeds de configurações padrão ----------
+async function seedConfiguracoes() {
+  const padroes = [
+    ['semestre_vigente', JSON.stringify('2026.2'), 'Semestre letivo vigente (formato AAAA.S)'],
+    ['capacidade_padrao_turma', JSON.stringify(15), 'Capacidade padrão de alunos por turma (ajustável por turma)'],
+    ['media_aprovacao', JSON.stringify(7), 'Média mínima para aprovação (0 a 10)'],
+    ['frequencia_minima', JSON.stringify(75), 'Frequência mínima para aprovação (%)'],
+    ['parcelas_semestre', JSON.stringify(6), 'Quantidade de mensalidades geradas por matrícula no semestre'],
+    ['dia_vencimento', JSON.stringify(10), 'Dia padrão de vencimento das mensalidades'],
+    ['multa_atraso', JSON.stringify({ ativa: false, multa_percentual: 2, juros_dia_percentual: 0.033 }), 'Multa e juros por atraso (aplicados quando ativa = true)'],
+    ['descontos_disponiveis', JSON.stringify([25, 50, 100]), 'Percentuais de desconto disponíveis para Pagante Parcial (bolsista = 100)'],
+    ['mensalidades', JSON.stringify({ 'Inglês': 0, 'Espanhol': 0 }), 'Valor da mensalidade integral por curso (R$) — definir antes das matrículas'],
+    ['formas_pagamento', JSON.stringify(['Pix', 'Dinheiro', 'Cartão de Débito', 'Cartão de Crédito', 'Transferência']), 'Formas de pagamento aceitas'],
+    ['categorias_contas_pagar', JSON.stringify(['Aluguel', 'Energia', 'Água/Internet', 'Salários', 'Material Didático', 'Manutenção', 'Outros']), 'Categorias de contas a pagar'],
+    ['categorias_contas_receber', JSON.stringify(['Mensalidade', 'Matrícula', 'Material', 'Evento', 'Outros']), 'Categorias de contas a receber'],
+    ['dados_instituicao', JSON.stringify({
+      nome: 'CEMIC — Centro Maranhense de Idiomas e Culturas',
+      cnpj: '', endereco: 'São Luís - MA', telefone: '', email: '', logo_url: ''
+    }), 'Dados institucionais usados em documentos e PDFs'],
+    ['modelo_boletim', JSON.stringify({ titulo: 'Boletim de Desempenho', exibir_frequencia: true, exibir_observacoes: true, rodape: 'Documento emitido pelo CEMIC.' }), 'Modelo do boletim do aluno'],
+    ['modelo_historico', JSON.stringify({ titulo: 'Histórico Escolar', exibir_carga_horaria: true, rodape: 'Documento emitido pelo CEMIC.' }), 'Modelo do histórico do aluno']
+  ];
+  for (const [chave, valor, descricao] of padroes) {
+    await pool.query(
+      `INSERT INTO configuracoes (chave, valor, descricao) VALUES ($1, $2, $3) ON CONFLICT (chave) DO NOTHING`,
+      [chave, valor, descricao]
+    );
+  }
+}
+
+// ---------- Seeds de cursos e níveis ----------
+async function seedCursosNiveis() {
+  const cursos = ['Inglês', 'Espanhol'];
+  const niveis = ['Kids', 'Basic', 'Pre-Intermediate', 'Intermediate', 'Advanced'];
+  for (const nomeCurso of cursos) {
+    const c = await pool.query(
+      `INSERT INTO cursos (nome) VALUES ($1) ON CONFLICT (nome) DO UPDATE SET nome = EXCLUDED.nome RETURNING id`,
+      [nomeCurso]
+    );
+    const cursoId = c.rows[0].id;
+    for (let i = 0; i < niveis.length; i++) {
+      await pool.query(
+        `INSERT INTO niveis (curso_id, nome, ordem) VALUES ($1, $2, $3) ON CONFLICT (curso_id, nome) DO NOTHING`,
+        [cursoId, niveis[i], i + 1]
+      );
+    }
+  }
+}
+
+// ---------- Bootstrap do usuário master ----------
+async function seedMaster() {
+  const existe = await pool.query(`SELECT id FROM usuarios WHERE perfil = 'master' LIMIT 1`);
+  if (existe.rows.length > 0) return;
+  if (!MASTER_SENHA) {
+    console.warn('AVISO: nenhum usuário master existe e MASTER_SENHA não foi definida. Defina MASTER_CPF e MASTER_SENHA nas variáveis do Railway e reinicie.');
+    return;
+  }
+  const hash = await bcrypt.hash(MASTER_SENHA, 10);
+  await pool.query(
+    `INSERT INTO usuarios (nome, cpf, senha_hash, perfil, status) VALUES ($1, $2, $3, 'master', 'ativo')`,
+    ['Paulo (Master)', MASTER_CPF, hash]
+  );
+  console.log('Usuário master criado a partir das variáveis de ambiente.');
+}
+
+// ============================================================
+// 2. AUTENTICAÇÃO E MIDDLEWARES
+// ============================================================
+const limiterLogin = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  message: { erro: 'Muitas tentativas de login. Aguarde 15 minutos.' }
+});
+
+function autenticar(req, res, next) {
+  const header = req.headers.authorization || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7) : null;
+  if (!token) return res.status(401).json({ erro: 'Token não fornecido.' });
+  try {
+    req.usuario = jwt.verify(token, JWT_SECRET);
+    next();
+  } catch {
+    return res.status(401).json({ erro: 'Token inválido ou expirado.' });
+  }
+}
+
+function exigirPerfil(...perfis) {
+  return (req, res, next) => {
+    if (!perfis.includes(req.usuario.perfil)) {
+      return res.status(403).json({ erro: 'Acesso negado para o seu perfil.' });
+    }
+    next();
+  };
+}
+
+const somenteGestao = exigirPerfil('master', 'secretaria');
+
+function obrigatorios(body, campos) {
+  const faltando = campos.filter(c => body[c] === undefined || body[c] === null || body[c] === '');
+  return faltando.length ? `Campos obrigatórios ausentes: ${faltando.join(', ')}` : null;
+}
+
+const soDigitos = (s) => String(s || '').replace(/\D/g, '');
+
+// ---------- POST /auth/login ----------
+app.post('/auth/login', limiterLogin, async (req, res) => {
+  try {
+    const erro = obrigatorios(req.body, ['cpf', 'senha']);
+    if (erro) return res.status(400).json({ erro });
+    const cpf = soDigitos(req.body.cpf);
+    const r = await pool.query(`SELECT * FROM usuarios WHERE cpf = $1`, [cpf]);
+    const u = r.rows[0];
+    if (!u || u.status !== 'ativo') return res.status(401).json({ erro: 'CPF ou senha inválidos.' });
+    const ok = await bcrypt.compare(req.body.senha, u.senha_hash);
+    if (!ok) return res.status(401).json({ erro: 'CPF ou senha inválidos.' });
+    await pool.query(`UPDATE usuarios SET ultimo_acesso = NOW() WHERE id = $1`, [u.id]);
+    const token = jwt.sign(
+      { id: u.id, nome: u.nome, perfil: u.perfil, referencia_id: u.referencia_id },
+      JWT_SECRET,
+      { expiresIn: '8h' }
+    );
+    res.json({
+      token,
+      usuario: { id: u.id, nome: u.nome, perfil: u.perfil, senha_provisoria: u.senha_provisoria }
+    });
+  } catch (e) {
+    console.error('Erro /auth/login:', e);
+    res.status(500).json({ erro: 'Erro interno no login.' });
+  }
+});
+
+// ---------- POST /auth/trocar-senha ----------
+app.post('/auth/trocar-senha', autenticar, async (req, res) => {
+  try {
+    const erro = obrigatorios(req.body, ['senha_atual', 'senha_nova']);
+    if (erro) return res.status(400).json({ erro });
+    if (String(req.body.senha_nova).length < 8) {
+      return res.status(400).json({ erro: 'A nova senha deve ter ao menos 8 caracteres.' });
+    }
+    const r = await pool.query(`SELECT senha_hash FROM usuarios WHERE id = $1`, [req.usuario.id]);
+    const ok = await bcrypt.compare(req.body.senha_atual, r.rows[0].senha_hash);
+    if (!ok) return res.status(401).json({ erro: 'Senha atual incorreta.' });
+    const hash = await bcrypt.hash(req.body.senha_nova, 10);
+    await pool.query(`UPDATE usuarios SET senha_hash = $1, senha_provisoria = FALSE WHERE id = $2`, [hash, req.usuario.id]);
+    res.json({ mensagem: 'Senha alterada com sucesso.' });
+  } catch (e) {
+    console.error('Erro /auth/trocar-senha:', e);
+    res.status(500).json({ erro: 'Erro interno ao trocar senha.' });
+  }
+});
+
+// ============================================================
+// 3. CONFIGURAÇÕES
+// ============================================================
+app.get('/admin/configuracoes', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const r = await pool.query(`SELECT chave, valor, descricao, atualizado_em FROM configuracoes ORDER BY chave`);
+    res.json(r.rows);
+  } catch (e) {
+    console.error('Erro GET configuracoes:', e);
+    res.status(500).json({ erro: 'Erro ao listar configurações.' });
+  }
+});
+
+app.put('/admin/configuracoes/:chave', autenticar, exigirPerfil('master'), async (req, res) => {
+  try {
+    if (req.body.valor === undefined) return res.status(400).json({ erro: 'Campo "valor" é obrigatório.' });
+    const r = await pool.query(
+      `UPDATE configuracoes SET valor = $1, atualizado_em = NOW(), atualizado_por = $2 WHERE chave = $3 RETURNING chave, valor`,
+      [JSON.stringify(req.body.valor), req.usuario.id, req.params.chave]
+    );
+    if (!r.rows.length) return res.status(404).json({ erro: 'Configuração não encontrada.' });
+    res.json({ mensagem: 'Configuração atualizada.', configuracao: r.rows[0] });
+  } catch (e) {
+    console.error('Erro PUT configuracoes:', e);
+    res.status(500).json({ erro: 'Erro ao atualizar configuração.' });
+  }
+});
+
+async function getConfig(chave, padrao = null) {
+  const r = await pool.query(`SELECT valor FROM configuracoes WHERE chave = $1`, [chave]);
+  return r.rows.length ? r.rows[0].valor : padrao;
+}
+
+// ============================================================
+// 4. CRUD — ALUNOS
+// ============================================================
+app.get('/admin/alunos', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const { busca, status, modalidade } = req.query;
+    const cond = [];
+    const params = [];
+    if (busca) { params.push(`%${busca}%`); cond.push(`(a.nome ILIKE $${params.length} OR a.cpf ILIKE $${params.length})`); }
+    if (status) { params.push(status); cond.push(`a.status = $${params.length}`); }
+    if (modalidade) { params.push(modalidade); cond.push(`a.modalidade = $${params.length}`); }
+    const where = cond.length ? `WHERE ${cond.join(' AND ')}` : '';
+    const r = await pool.query(`SELECT a.* FROM alunos a ${where} ORDER BY a.nome`, params);
+    res.json(r.rows);
+  } catch (e) {
+    console.error('Erro GET alunos:', e);
+    res.status(500).json({ erro: 'Erro ao listar alunos.' });
+  }
+});
+
+app.get('/admin/alunos/:id', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const a = await pool.query(`SELECT * FROM alunos WHERE id = $1`, [req.params.id]);
+    if (!a.rows.length) return res.status(404).json({ erro: 'Aluno não encontrado.' });
+    const resp = await pool.query(
+      `SELECT ar.id AS vinculo_id, r.id, r.nome, r.cpf, r.whatsapp, r.email, ar.parentesco, ar.responsavel_financeiro
+       FROM aluno_responsavel ar JOIN responsaveis r ON r.id = ar.responsavel_id
+       WHERE ar.aluno_id = $1`, [req.params.id]
+    );
+    res.json({ ...a.rows[0], responsaveis: resp.rows });
+  } catch (e) {
+    console.error('Erro GET aluno:', e);
+    res.status(500).json({ erro: 'Erro ao buscar aluno.' });
+  }
+});
+
+app.post('/admin/alunos', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const erro = obrigatorios(req.body, ['nome', 'modalidade']);
+    if (erro) return res.status(400).json({ erro });
+    const { nome, data_nascimento, email, whatsapp, modalidade, observacoes } = req.body;
+    const cpf = req.body.cpf ? soDigitos(req.body.cpf) : null;
+
+    // Validação do desconto contra as opções de Configurações
+    let desconto = Number(req.body.desconto_percentual || 0);
+    if (modalidade === 'bolsista') desconto = 100;
+    if (modalidade === 'pagante') desconto = 0;
+    if (modalidade === 'pagante_parcial') {
+      const opcoes = (await getConfig('descontos_disponiveis', [])) || [];
+      if (!opcoes.includes(desconto)) {
+        return res.status(400).json({ erro: `Desconto inválido. Opções configuradas: ${opcoes.join('%, ')}%.` });
+      }
+    }
+
+    const r = await pool.query(
+      `INSERT INTO alunos (nome, data_nascimento, email, cpf, whatsapp, modalidade, desconto_percentual, observacoes)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
+      [nome, data_nascimento || null, email || null, cpf, whatsapp || null, modalidade, desconto, observacoes || null]
+    );
+    res.status(201).json(r.rows[0]);
+  } catch (e) {
+    if (e.code === '23505') return res.status(409).json({ erro: 'Já existe aluno com este CPF.' });
+    console.error('Erro POST aluno:', e);
+    res.status(500).json({ erro: 'Erro ao cadastrar aluno.' });
+  }
+});
+
+app.put('/admin/alunos/:id', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const atual = await pool.query(`SELECT * FROM alunos WHERE id = $1`, [req.params.id]);
+    if (!atual.rows.length) return res.status(404).json({ erro: 'Aluno não encontrado.' });
+    const a = atual.rows[0];
+    const modalidade = req.body.modalidade || a.modalidade;
+    let desconto = req.body.desconto_percentual !== undefined ? Number(req.body.desconto_percentual) : Number(a.desconto_percentual);
+    if (modalidade === 'bolsista') desconto = 100;
+    if (modalidade === 'pagante') desconto = 0;
+    if (modalidade === 'pagante_parcial') {
+      const opcoes = (await getConfig('descontos_disponiveis', [])) || [];
+      if (!opcoes.includes(desconto)) {
+        return res.status(400).json({ erro: `Desconto inválido. Opções configuradas: ${opcoes.join('%, ')}%.` });
+      }
+    }
+    const r = await pool.query(
+      `UPDATE alunos SET nome=$1, data_nascimento=$2, email=$3, cpf=$4, whatsapp=$5, status=$6, modalidade=$7, desconto_percentual=$8, observacoes=$9
+       WHERE id=$10 RETURNING *`,
+      [
+        req.body.nome ?? a.nome,
+        req.body.data_nascimento ?? a.data_nascimento,
+        req.body.email ?? a.email,
+        req.body.cpf !== undefined ? soDigitos(req.body.cpf) : a.cpf,
+        req.body.whatsapp ?? a.whatsapp,
+        req.body.status ?? a.status,
+        modalidade, desconto,
+        req.body.observacoes ?? a.observacoes,
+        req.params.id
+      ]
+    );
+    res.json(r.rows[0]);
+  } catch (e) {
+    if (e.code === '23505') return res.status(409).json({ erro: 'Já existe aluno com este CPF.' });
+    console.error('Erro PUT aluno:', e);
+    res.status(500).json({ erro: 'Erro ao atualizar aluno.' });
+  }
+});
+
+app.delete('/admin/alunos/:id', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const m = await pool.query(`SELECT COUNT(*)::int AS n FROM matriculas WHERE aluno_id = $1`, [req.params.id]);
+    if (m.rows[0].n > 0) {
+      return res.status(409).json({ erro: 'Aluno possui matrículas registradas. Para preservar o histórico, altere o status para "inativo" em vez de excluir.' });
+    }
+    const r = await pool.query(`DELETE FROM alunos WHERE id = $1 RETURNING id`, [req.params.id]);
+    if (!r.rows.length) return res.status(404).json({ erro: 'Aluno não encontrado.' });
+    res.json({ mensagem: 'Aluno excluído.' });
+  } catch (e) {
+    console.error('Erro DELETE aluno:', e);
+    res.status(500).json({ erro: 'Erro ao excluir aluno.' });
+  }
+});
+
+// ---------- Vínculo aluno ↔ responsável ----------
+app.post('/admin/alunos/:id/responsaveis', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const erro = obrigatorios(req.body, ['responsavel_id']);
+    if (erro) return res.status(400).json({ erro });
+    const r = await pool.query(
+      `INSERT INTO aluno_responsavel (aluno_id, responsavel_id, parentesco, responsavel_financeiro)
+       VALUES ($1,$2,$3,$4) RETURNING *`,
+      [req.params.id, req.body.responsavel_id, req.body.parentesco || null, !!req.body.responsavel_financeiro]
+    );
+    res.status(201).json(r.rows[0]);
+  } catch (e) {
+    if (e.code === '23505') return res.status(409).json({ erro: 'Este responsável já está vinculado ao aluno.' });
+    if (e.code === '23503') return res.status(400).json({ erro: 'Aluno ou responsável inexistente.' });
+    console.error('Erro vínculo responsável:', e);
+    res.status(500).json({ erro: 'Erro ao vincular responsável.' });
+  }
+});
+
+app.delete('/admin/alunos/:id/responsaveis/:vinculoId', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const r = await pool.query(
+      `DELETE FROM aluno_responsavel WHERE id = $1 AND aluno_id = $2 RETURNING id`,
+      [req.params.vinculoId, req.params.id]
+    );
+    if (!r.rows.length) return res.status(404).json({ erro: 'Vínculo não encontrado.' });
+    res.json({ mensagem: 'Vínculo removido.' });
+  } catch (e) {
+    console.error('Erro remover vínculo:', e);
+    res.status(500).json({ erro: 'Erro ao remover vínculo.' });
+  }
+});
+
+// ============================================================
+// 5. CRUD — RESPONSÁVEIS
+// ============================================================
+app.get('/admin/responsaveis', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const { busca } = req.query;
+    const params = [];
+    let where = '';
+    if (busca) { params.push(`%${busca}%`); where = `WHERE nome ILIKE $1 OR cpf ILIKE $1`; }
+    const r = await pool.query(`SELECT * FROM responsaveis ${where} ORDER BY nome`, params);
+    res.json(r.rows);
+  } catch (e) {
+    console.error('Erro GET responsaveis:', e);
+    res.status(500).json({ erro: 'Erro ao listar responsáveis.' });
+  }
+});
+
+app.post('/admin/responsaveis', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const erro = obrigatorios(req.body, ['nome', 'cpf']);
+    if (erro) return res.status(400).json({ erro });
+    const r = await pool.query(
+      `INSERT INTO responsaveis (nome, cpf, email, whatsapp) VALUES ($1,$2,$3,$4) RETURNING *`,
+      [req.body.nome, soDigitos(req.body.cpf), req.body.email || null, req.body.whatsapp || null]
+    );
+    res.status(201).json(r.rows[0]);
+  } catch (e) {
+    if (e.code === '23505') return res.status(409).json({ erro: 'Já existe responsável com este CPF.' });
+    console.error('Erro POST responsavel:', e);
+    res.status(500).json({ erro: 'Erro ao cadastrar responsável.' });
+  }
+});
+
+app.put('/admin/responsaveis/:id', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const atual = await pool.query(`SELECT * FROM responsaveis WHERE id = $1`, [req.params.id]);
+    if (!atual.rows.length) return res.status(404).json({ erro: 'Responsável não encontrado.' });
+    const x = atual.rows[0];
+    const r = await pool.query(
+      `UPDATE responsaveis SET nome=$1, cpf=$2, email=$3, whatsapp=$4 WHERE id=$5 RETURNING *`,
+      [
+        req.body.nome ?? x.nome,
+        req.body.cpf !== undefined ? soDigitos(req.body.cpf) : x.cpf,
+        req.body.email ?? x.email,
+        req.body.whatsapp ?? x.whatsapp,
+        req.params.id
+      ]
+    );
+    res.json(r.rows[0]);
+  } catch (e) {
+    if (e.code === '23505') return res.status(409).json({ erro: 'Já existe responsável com este CPF.' });
+    console.error('Erro PUT responsavel:', e);
+    res.status(500).json({ erro: 'Erro ao atualizar responsável.' });
+  }
+});
+
+app.delete('/admin/responsaveis/:id', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const r = await pool.query(`DELETE FROM responsaveis WHERE id = $1 RETURNING id`, [req.params.id]);
+    if (!r.rows.length) return res.status(404).json({ erro: 'Responsável não encontrado.' });
+    res.json({ mensagem: 'Responsável excluído (vínculos com alunos removidos automaticamente).' });
+  } catch (e) {
+    console.error('Erro DELETE responsavel:', e);
+    res.status(500).json({ erro: 'Erro ao excluir responsável.' });
+  }
+});
+
+// ============================================================
+// 6. CRUD — PROFESSORES
+// ============================================================
+app.get('/admin/professores', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const r = await pool.query(`SELECT * FROM professores ORDER BY nome`);
+    res.json(r.rows);
+  } catch (e) {
+    console.error('Erro GET professores:', e);
+    res.status(500).json({ erro: 'Erro ao listar professores.' });
+  }
+});
+
+app.post('/admin/professores', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const erro = obrigatorios(req.body, ['nome']);
+    if (erro) return res.status(400).json({ erro });
+    const r = await pool.query(
+      `INSERT INTO professores (nome, email, formacao, whatsapp, data_nascimento) VALUES ($1,$2,$3,$4,$5) RETURNING *`,
+      [req.body.nome, req.body.email || null, req.body.formacao || null, req.body.whatsapp || null, req.body.data_nascimento || null]
+    );
+    res.status(201).json(r.rows[0]);
+  } catch (e) {
+    console.error('Erro POST professor:', e);
+    res.status(500).json({ erro: 'Erro ao cadastrar professor.' });
+  }
+});
+
+app.put('/admin/professores/:id', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const atual = await pool.query(`SELECT * FROM professores WHERE id = $1`, [req.params.id]);
+    if (!atual.rows.length) return res.status(404).json({ erro: 'Professor não encontrado.' });
+    const x = atual.rows[0];
+    const r = await pool.query(
+      `UPDATE professores SET nome=$1, email=$2, formacao=$3, whatsapp=$4, data_nascimento=$5, status=$6 WHERE id=$7 RETURNING *`,
+      [
+        req.body.nome ?? x.nome, req.body.email ?? x.email, req.body.formacao ?? x.formacao,
+        req.body.whatsapp ?? x.whatsapp, req.body.data_nascimento ?? x.data_nascimento,
+        req.body.status ?? x.status, req.params.id
+      ]
+    );
+    res.json(r.rows[0]);
+  } catch (e) {
+    console.error('Erro PUT professor:', e);
+    res.status(500).json({ erro: 'Erro ao atualizar professor.' });
+  }
+});
+
+app.delete('/admin/professores/:id', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const t = await pool.query(`SELECT COUNT(*)::int AS n FROM turmas WHERE professor_id = $1`, [req.params.id]);
+    if (t.rows[0].n > 0) {
+      return res.status(409).json({ erro: 'Professor vinculado a turmas. Altere o status para "inativo" ou troque o professor das turmas antes de excluir.' });
+    }
+    const r = await pool.query(`DELETE FROM professores WHERE id = $1 RETURNING id`, [req.params.id]);
+    if (!r.rows.length) return res.status(404).json({ erro: 'Professor não encontrado.' });
+    res.json({ mensagem: 'Professor excluído.' });
+  } catch (e) {
+    console.error('Erro DELETE professor:', e);
+    res.status(500).json({ erro: 'Erro ao excluir professor.' });
+  }
+});
+
+// ============================================================
+// 7. CRUD — CURSOS E NÍVEIS
+// ============================================================
+app.get('/admin/cursos', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const cursos = await pool.query(`SELECT * FROM cursos ORDER BY nome`);
+    const niveis = await pool.query(`SELECT * FROM niveis ORDER BY curso_id, ordem`);
+    res.json(cursos.rows.map(c => ({ ...c, niveis: niveis.rows.filter(n => n.curso_id === c.id) })));
+  } catch (e) {
+    console.error('Erro GET cursos:', e);
+    res.status(500).json({ erro: 'Erro ao listar cursos.' });
+  }
+});
+
+app.post('/admin/cursos', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const erro = obrigatorios(req.body, ['nome']);
+    if (erro) return res.status(400).json({ erro });
+    const r = await pool.query(`INSERT INTO cursos (nome) VALUES ($1) RETURNING *`, [req.body.nome]);
+    res.status(201).json(r.rows[0]);
+  } catch (e) {
+    if (e.code === '23505') return res.status(409).json({ erro: 'Já existe curso com este nome.' });
+    console.error('Erro POST curso:', e);
+    res.status(500).json({ erro: 'Erro ao cadastrar curso.' });
+  }
+});
+
+app.post('/admin/niveis', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const erro = obrigatorios(req.body, ['curso_id', 'nome', 'ordem']);
+    if (erro) return res.status(400).json({ erro });
+    const r = await pool.query(
+      `INSERT INTO niveis (curso_id, nome, ordem, carga_horaria) VALUES ($1,$2,$3,$4) RETURNING *`,
+      [req.body.curso_id, req.body.nome, req.body.ordem, req.body.carga_horaria || null]
+    );
+    res.status(201).json(r.rows[0]);
+  } catch (e) {
+    if (e.code === '23505') return res.status(409).json({ erro: 'Já existe nível com este nome neste curso.' });
+    if (e.code === '23503') return res.status(400).json({ erro: 'Curso inexistente.' });
+    console.error('Erro POST nivel:', e);
+    res.status(500).json({ erro: 'Erro ao cadastrar nível.' });
+  }
+});
+
+app.put('/admin/niveis/:id', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const atual = await pool.query(`SELECT * FROM niveis WHERE id = $1`, [req.params.id]);
+    if (!atual.rows.length) return res.status(404).json({ erro: 'Nível não encontrado.' });
+    const x = atual.rows[0];
+    const r = await pool.query(
+      `UPDATE niveis SET nome=$1, ordem=$2, carga_horaria=$3 WHERE id=$4 RETURNING *`,
+      [req.body.nome ?? x.nome, req.body.ordem ?? x.ordem, req.body.carga_horaria ?? x.carga_horaria, req.params.id]
+    );
+    res.json(r.rows[0]);
+  } catch (e) {
+    console.error('Erro PUT nivel:', e);
+    res.status(500).json({ erro: 'Erro ao atualizar nível.' });
+  }
+});
+
+app.delete('/admin/niveis/:id', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const t = await pool.query(`SELECT COUNT(*)::int AS n FROM turmas WHERE nivel_id = $1`, [req.params.id]);
+    if (t.rows[0].n > 0) return res.status(409).json({ erro: 'Nível vinculado a turmas existentes. Exclusão bloqueada para preservar o histórico.' });
+    const r = await pool.query(`DELETE FROM niveis WHERE id = $1 RETURNING id`, [req.params.id]);
+    if (!r.rows.length) return res.status(404).json({ erro: 'Nível não encontrado.' });
+    res.json({ mensagem: 'Nível excluído.' });
+  } catch (e) {
+    console.error('Erro DELETE nivel:', e);
+    res.status(500).json({ erro: 'Erro ao excluir nível.' });
+  }
+});
+
+// ============================================================
+// 8. CRUD — TURMAS
+// ============================================================
+app.get('/admin/turmas', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const { semestre, status } = req.query;
+    const cond = []; const params = [];
+    if (semestre) { params.push(semestre); cond.push(`t.semestre = $${params.length}`); }
+    if (status) { params.push(status); cond.push(`t.status = $${params.length}`); }
+    const where = cond.length ? `WHERE ${cond.join(' AND ')}` : '';
+    const r = await pool.query(
+      `SELECT t.*, n.nome AS nivel_nome, c.nome AS curso_nome, p.nome AS professor_nome,
+              (SELECT COUNT(*)::int FROM matriculas m WHERE m.turma_id = t.id AND m.status = 'ativa') AS matriculados
+       FROM turmas t
+       JOIN niveis n ON n.id = t.nivel_id
+       JOIN cursos c ON c.id = n.curso_id
+       LEFT JOIN professores p ON p.id = t.professor_id
+       ${where}
+       ORDER BY t.semestre DESC, c.nome, n.ordem, t.nome`, params
+    );
+    res.json(r.rows);
+  } catch (e) {
+    console.error('Erro GET turmas:', e);
+    res.status(500).json({ erro: 'Erro ao listar turmas.' });
+  }
+});
+
+app.post('/admin/turmas', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const erro = obrigatorios(req.body, ['nivel_id', 'nome', 'semestre']);
+    if (erro) return res.status(400).json({ erro });
+    let capacidade = req.body.capacidade;
+    if (capacidade === undefined || capacidade === null || capacidade === '') {
+      capacidade = (await getConfig('capacidade_padrao_turma', 15)) || 15;
+    }
+    const r = await pool.query(
+      `INSERT INTO turmas (nivel_id, nome, semestre, turno, horario, professor_id, capacidade)
+       VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
+      [req.body.nivel_id, req.body.nome, req.body.semestre, req.body.turno || null,
+       req.body.horario || null, req.body.professor_id || null, Number(capacidade)]
+    );
+    res.status(201).json(r.rows[0]);
+  } catch (e) {
+    if (e.code === '23505') return res.status(409).json({ erro: 'Já existe turma com este nome neste semestre.' });
+    if (e.code === '23503') return res.status(400).json({ erro: 'Nível ou professor inexistente.' });
+    console.error('Erro POST turma:', e);
+    res.status(500).json({ erro: 'Erro ao cadastrar turma.' });
+  }
+});
+
+app.put('/admin/turmas/:id', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const atual = await pool.query(`SELECT * FROM turmas WHERE id = $1`, [req.params.id]);
+    if (!atual.rows.length) return res.status(404).json({ erro: 'Turma não encontrada.' });
+    const x = atual.rows[0];
+    const r = await pool.query(
+      `UPDATE turmas SET nivel_id=$1, nome=$2, semestre=$3, turno=$4, horario=$5, professor_id=$6, capacidade=$7, status=$8
+       WHERE id=$9 RETURNING *`,
+      [
+        req.body.nivel_id ?? x.nivel_id, req.body.nome ?? x.nome, req.body.semestre ?? x.semestre,
+        req.body.turno ?? x.turno, req.body.horario ?? x.horario,
+        req.body.professor_id !== undefined ? req.body.professor_id : x.professor_id,
+        req.body.capacidade ?? x.capacidade, req.body.status ?? x.status, req.params.id
+      ]
+    );
+    res.json(r.rows[0]);
+  } catch (e) {
+    if (e.code === '23505') return res.status(409).json({ erro: 'Já existe turma com este nome neste semestre.' });
+    console.error('Erro PUT turma:', e);
+    res.status(500).json({ erro: 'Erro ao atualizar turma.' });
+  }
+});
+
+app.delete('/admin/turmas/:id', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const m = await pool.query(`SELECT COUNT(*)::int AS n FROM matriculas WHERE turma_id = $1`, [req.params.id]);
+    if (m.rows[0].n > 0) return res.status(409).json({ erro: 'Turma possui matrículas. Altere o status para "encerrada" em vez de excluir.' });
+    const r = await pool.query(`DELETE FROM turmas WHERE id = $1 RETURNING id`, [req.params.id]);
+    if (!r.rows.length) return res.status(404).json({ erro: 'Turma não encontrada.' });
+    res.json({ mensagem: 'Turma excluída.' });
+  } catch (e) {
+    console.error('Erro DELETE turma:', e);
+    res.status(500).json({ erro: 'Erro ao excluir turma.' });
+  }
+});
+
+// ============================================================
+// 9. CRUD — FORNECEDORES
+// ============================================================
+app.get('/admin/fornecedores', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const r = await pool.query(`SELECT * FROM fornecedores ORDER BY nome`);
+    res.json(r.rows);
+  } catch (e) {
+    console.error('Erro GET fornecedores:', e);
+    res.status(500).json({ erro: 'Erro ao listar fornecedores.' });
+  }
+});
+
+app.post('/admin/fornecedores', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const erro = obrigatorios(req.body, ['nome']);
+    if (erro) return res.status(400).json({ erro });
+    const r = await pool.query(
+      `INSERT INTO fornecedores (nome, cpf_cnpj, email, whatsapp, categoria, observacoes)
+       VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
+      [req.body.nome, req.body.cpf_cnpj || null, req.body.email || null,
+       req.body.whatsapp || null, req.body.categoria || null, req.body.observacoes || null]
+    );
+    res.status(201).json(r.rows[0]);
+  } catch (e) {
+    console.error('Erro POST fornecedor:', e);
+    res.status(500).json({ erro: 'Erro ao cadastrar fornecedor.' });
+  }
+});
+
+app.put('/admin/fornecedores/:id', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const atual = await pool.query(`SELECT * FROM fornecedores WHERE id = $1`, [req.params.id]);
+    if (!atual.rows.length) return res.status(404).json({ erro: 'Fornecedor não encontrado.' });
+    const x = atual.rows[0];
+    const r = await pool.query(
+      `UPDATE fornecedores SET nome=$1, cpf_cnpj=$2, email=$3, whatsapp=$4, categoria=$5, observacoes=$6, status=$7
+       WHERE id=$8 RETURNING *`,
+      [
+        req.body.nome ?? x.nome, req.body.cpf_cnpj ?? x.cpf_cnpj, req.body.email ?? x.email,
+        req.body.whatsapp ?? x.whatsapp, req.body.categoria ?? x.categoria,
+        req.body.observacoes ?? x.observacoes, req.body.status ?? x.status, req.params.id
+      ]
+    );
+    res.json(r.rows[0]);
+  } catch (e) {
+    console.error('Erro PUT fornecedor:', e);
+    res.status(500).json({ erro: 'Erro ao atualizar fornecedor.' });
+  }
+});
+
+app.delete('/admin/fornecedores/:id', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const c = await pool.query(`SELECT COUNT(*)::int AS n FROM contas_pagar WHERE fornecedor_id = $1`, [req.params.id]);
+    if (c.rows[0].n > 0) return res.status(409).json({ erro: 'Fornecedor possui contas registradas. Altere o status para "inativo" em vez de excluir.' });
+    const r = await pool.query(`DELETE FROM fornecedores WHERE id = $1 RETURNING id`, [req.params.id]);
+    if (!r.rows.length) return res.status(404).json({ erro: 'Fornecedor não encontrado.' });
+    res.json({ mensagem: 'Fornecedor excluído.' });
+  } catch (e) {
+    console.error('Erro DELETE fornecedor:', e);
+    res.status(500).json({ erro: 'Erro ao excluir fornecedor.' });
+  }
+});
+
+// ============================================================
+// 10. CRUD — USUÁRIOS (apenas master)
+// ============================================================
+app.get('/admin/usuarios', autenticar, exigirPerfil('master'), async (req, res) => {
+  try {
+    const r = await pool.query(
+      `SELECT id, nome, cpf, email, whatsapp, data_nascimento, perfil, referencia_id, status, senha_provisoria, criado_em, ultimo_acesso
+       FROM usuarios ORDER BY nome`
+    );
+    res.json(r.rows);
+  } catch (e) {
+    console.error('Erro GET usuarios:', e);
+    res.status(500).json({ erro: 'Erro ao listar usuários.' });
+  }
+});
+
+app.post('/admin/usuarios', autenticar, exigirPerfil('master'), async (req, res) => {
+  try {
+    const erro = obrigatorios(req.body, ['nome', 'cpf', 'senha', 'perfil']);
+    if (erro) return res.status(400).json({ erro });
+    if (String(req.body.senha).length < 8) return res.status(400).json({ erro: 'A senha deve ter ao menos 8 caracteres.' });
+    const hash = await bcrypt.hash(req.body.senha, 10);
+    const r = await pool.query(
+      `INSERT INTO usuarios (nome, cpf, email, whatsapp, senha_hash, data_nascimento, perfil, referencia_id, senha_provisoria)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,TRUE)
+       RETURNING id, nome, cpf, perfil, referencia_id, status`,
+      [req.body.nome, soDigitos(req.body.cpf), req.body.email || null, req.body.whatsapp || null,
+       hash, req.body.data_nascimento || null, req.body.perfil, req.body.referencia_id || null]
+    );
+    res.status(201).json(r.rows[0]);
+  } catch (e) {
+    if (e.code === '23505') return res.status(409).json({ erro: 'Já existe usuário com este CPF.' });
+    console.error('Erro POST usuario:', e);
+    res.status(500).json({ erro: 'Erro ao cadastrar usuário.' });
+  }
+});
+
+app.put('/admin/usuarios/:id', autenticar, exigirPerfil('master'), async (req, res) => {
+  try {
+    const atual = await pool.query(`SELECT * FROM usuarios WHERE id = $1`, [req.params.id]);
+    if (!atual.rows.length) return res.status(404).json({ erro: 'Usuário não encontrado.' });
+    const x = atual.rows[0];
+
+    // Proteção: não permitir inativar/rebaixar o último master ativo
+    const novoPerfil = req.body.perfil ?? x.perfil;
+    const novoStatus = req.body.status ?? x.status;
+    if (x.perfil === 'master' && (novoPerfil !== 'master' || novoStatus !== 'ativo')) {
+      const outros = await pool.query(`SELECT COUNT(*)::int AS n FROM usuarios WHERE perfil='master' AND status='ativo' AND id <> $1`, [x.id]);
+      if (outros.rows[0].n === 0) return res.status(409).json({ erro: 'Não é possível inativar ou rebaixar o único usuário master ativo.' });
+    }
+
+    let senha_hash = x.senha_hash;
+    let senha_provisoria = x.senha_provisoria;
+    if (req.body.senha) {
+      if (String(req.body.senha).length < 8) return res.status(400).json({ erro: 'A senha deve ter ao menos 8 caracteres.' });
+      senha_hash = await bcrypt.hash(req.body.senha, 10);
+      senha_provisoria = true;
+    }
+    const r = await pool.query(
+      `UPDATE usuarios SET nome=$1, cpf=$2, email=$3, whatsapp=$4, data_nascimento=$5, perfil=$6, referencia_id=$7, status=$8, senha_hash=$9, senha_provisoria=$10
+       WHERE id=$11 RETURNING id, nome, cpf, perfil, referencia_id, status`,
+      [
+        req.body.nome ?? x.nome,
+        req.body.cpf !== undefined ? soDigitos(req.body.cpf) : x.cpf,
+        req.body.email ?? x.email, req.body.whatsapp ?? x.whatsapp,
+        req.body.data_nascimento ?? x.data_nascimento,
+        novoPerfil, req.body.referencia_id ?? x.referencia_id, novoStatus,
+        senha_hash, senha_provisoria, req.params.id
+      ]
+    );
+    res.json(r.rows[0]);
+  } catch (e) {
+    if (e.code === '23505') return res.status(409).json({ erro: 'Já existe usuário com este CPF.' });
+    console.error('Erro PUT usuario:', e);
+    res.status(500).json({ erro: 'Erro ao atualizar usuário.' });
+  }
+});
+
+app.delete('/admin/usuarios/:id', autenticar, exigirPerfil('master'), async (req, res) => {
+  try {
+    if (Number(req.params.id) === req.usuario.id) {
+      return res.status(409).json({ erro: 'Você não pode excluir o próprio usuário em uso.' });
+    }
+    const alvo = await pool.query(`SELECT perfil, status FROM usuarios WHERE id = $1`, [req.params.id]);
+    if (!alvo.rows.length) return res.status(404).json({ erro: 'Usuário não encontrado.' });
+    if (alvo.rows[0].perfil === 'master') {
+      const outros = await pool.query(`SELECT COUNT(*)::int AS n FROM usuarios WHERE perfil='master' AND status='ativo' AND id <> $1`, [req.params.id]);
+      if (outros.rows[0].n === 0) return res.status(409).json({ erro: 'Não é possível excluir o único usuário master ativo.' });
+    }
+    await pool.query(`DELETE FROM usuarios WHERE id = $1`, [req.params.id]);
+    res.json({ mensagem: 'Usuário excluído.' });
+  } catch (e) {
+    console.error('Erro DELETE usuario:', e);
+    res.status(500).json({ erro: 'Erro ao excluir usuário.' });
+  }
+});
+
+// ============================================================
+// 11. SAÚDE E INICIALIZAÇÃO
+// ============================================================
+app.get('/health', async (req, res) => {
+  try {
+    await pool.query('SELECT 1');
+    res.json({ status: 'ok', sistema: 'CEMIC Gestão', versao: '1.0 (Fase 1)' });
+  } catch {
+    res.status(500).json({ status: 'erro', detalhe: 'Banco de dados inacessível.' });
+  }
+});
+
+const PORT = process.env.PORT || 3000;
+initDB()
+  .then(() => app.listen(PORT, () => console.log(`CEMIC Gestão — backend v1.0 rodando na porta ${PORT}`)))
+  .catch(e => { console.error('Falha ao inicializar o banco:', e); process.exit(1); });
