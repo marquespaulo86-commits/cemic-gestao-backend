@@ -1,10 +1,12 @@
 // ============================================================
-// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v3.2 (Fases 1 a 3 — núcleo)
+// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v3.4 (Fases 1 a 3 — núcleo)
 // Banco + Autenticação com perfis + Configurações + CRUDs
 // Stack: Node.js/Express + PostgreSQL (Railway)
 // ============================================================
 
 const express = require('express');
+const path = require('path');
+const fs = require('fs');
 const { Pool } = require('pg');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
@@ -1064,17 +1066,28 @@ app.get('/admin/contas-receber', autenticar, somenteGestao, async (req, res) => 
     if (req.query.aluno_id) { params.push(req.query.aluno_id); cond.push(`cr.aluno_id = $${params.length}`); }
     if (req.query.status) { params.push(req.query.status); cond.push(`cr.status = $${params.length}`); }
     if (req.query.competencia) { params.push(req.query.competencia); cond.push(`cr.competencia = $${params.length}`); }
-    if (req.query.busca) { params.push(`%${req.query.busca}%`); cond.push(`a.nome ILIKE $${params.length}`); }
+    if (req.query.busca) {
+      params.push(`%${req.query.busca}%`);
+      cond.push(`(a.nome ILIKE $${params.length} OR EXISTS (
+        SELECT 1 FROM aluno_responsavel arb JOIN responsaveis rb ON rb.id = arb.responsavel_id
+        WHERE arb.aluno_id = cr.aluno_id AND rb.nome ILIKE $${params.length}))`);
+    }
     const where = cond.length ? `WHERE ${cond.join(' AND ')}` : '';
     const r = await pool.query(
       `SELECT cr.*, a.nome AS aluno_nome, t.nome AS turma_nome, t.turno, t.horario, t.semestre,
-              n.nome AS nivel_nome, c.nome AS curso_nome
+              n.nome AS nivel_nome, c.nome AS curso_nome, pgt.nome AS pagante_nome
        FROM contas_receber cr
        JOIN alunos a ON a.id = cr.aluno_id
        LEFT JOIN matriculas m ON m.id = cr.matricula_id
        LEFT JOIN turmas t ON t.id = m.turma_id
        LEFT JOIN niveis n ON n.id = t.nivel_id
        LEFT JOIN cursos c ON c.id = n.curso_id
+       LEFT JOIN LATERAL (
+         SELECT r2.nome FROM aluno_responsavel ar2
+         JOIN responsaveis r2 ON r2.id = ar2.responsavel_id
+         WHERE ar2.aluno_id = cr.aluno_id AND ar2.responsavel_financeiro = TRUE
+         ORDER BY ar2.id LIMIT 1
+       ) pgt ON TRUE
        ${where} ORDER BY cr.vencimento, cr.id`, params);
     res.json(r.rows);
   } catch (e) { console.error('Erro GET contas-receber:', e); res.status(500).json({ erro: 'Erro ao listar cobranças.' }); }
@@ -1297,12 +1310,23 @@ app.delete('/admin/usuarios/:id', autenticar, exigirPerfil('master'), async (req
 });
 
 // ============================================================
-// 11. SAÚDE E INICIALIZAÇÃO
+// 11. FRONTEND SERVIDO PELO BACKEND (pasta /public no repositório)
+// ============================================================
+const PASTA_PUBLIC = path.join(__dirname, 'public');
+app.use(express.static(PASTA_PUBLIC));
+app.get('/', (req, res) => {
+  const arquivo = path.join(PASTA_PUBLIC, 'index.html');
+  if (fs.existsSync(arquivo)) return res.sendFile(arquivo);
+  res.status(200).send('CEMIC Gestão — backend no ar. Adicione o index.html na pasta /public do repositório para servir o sistema por aqui.');
+});
+
+// ============================================================
+// 12. SAÚDE E INICIALIZAÇÃO
 // ============================================================
 app.get('/health', async (req, res) => {
   try {
     await pool.query('SELECT 1');
-    res.json({ status: 'ok', sistema: 'CEMIC Gestão', versao: '3.2 (Fases 1 a 3 — núcleo)' });
+    res.json({ status: 'ok', sistema: 'CEMIC Gestão', versao: '3.4 (Fases 1 a 3 — núcleo)' });
   } catch {
     res.status(500).json({ status: 'erro', detalhe: 'Banco de dados inacessível.' });
   }
@@ -1310,5 +1334,5 @@ app.get('/health', async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 initDB()
-  .then(() => app.listen(PORT, () => console.log(`CEMIC Gestão — backend v3.2 rodando na porta ${PORT}`)))
+  .then(() => app.listen(PORT, () => console.log(`CEMIC Gestão — backend v3.4 rodando na porta ${PORT}`)))
   .catch(e => { console.error('Falha ao inicializar o banco:', e); process.exit(1); });
