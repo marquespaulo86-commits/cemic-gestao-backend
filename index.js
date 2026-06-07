@@ -1,5 +1,5 @@
 // ============================================================
-// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v1.0 (Fase 1)
+// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v1.1 (Fase 1)
 // Banco + Autenticação com perfis + Configurações + CRUDs
 // Stack: Node.js/Express + PostgreSQL (Railway)
 // ============================================================
@@ -549,12 +549,32 @@ app.delete('/admin/alunos/:id', autenticar, somenteGestao, async (req, res) => {
 // ---------- Vínculo aluno ↔ responsável ----------
 app.post('/admin/alunos/:id/responsaveis', autenticar, somenteGestao, async (req, res) => {
   try {
-    const erro = obrigatorios(req.body, ['responsavel_id']);
-    if (erro) return res.status(400).json({ erro });
+    // Aceita responsavel_id (vínculo direto) OU dados do responsável (nome + cpf),
+    // com upsert por CPF: se já existe, atualiza contato e apenas vincula.
+    let respId = req.body.responsavel_id || null;
+    if (!respId) {
+      const erro = obrigatorios(req.body, ['nome', 'cpf']);
+      if (erro) return res.status(400).json({ erro });
+      const cpf = soDigitos(req.body.cpf);
+      const existe = await pool.query(`SELECT id FROM responsaveis WHERE cpf = $1`, [cpf]);
+      if (existe.rows.length) {
+        respId = existe.rows[0].id;
+        await pool.query(
+          `UPDATE responsaveis SET nome=$1, email=COALESCE(NULLIF($2,''), email), whatsapp=COALESCE(NULLIF($3,''), whatsapp) WHERE id=$4`,
+          [req.body.nome, req.body.email || '', req.body.whatsapp || '', respId]
+        );
+      } else {
+        const novo = await pool.query(
+          `INSERT INTO responsaveis (nome, cpf, email, whatsapp) VALUES ($1,$2,$3,$4) RETURNING id`,
+          [req.body.nome, cpf, req.body.email || null, req.body.whatsapp || null]
+        );
+        respId = novo.rows[0].id;
+      }
+    }
     const r = await pool.query(
       `INSERT INTO aluno_responsavel (aluno_id, responsavel_id, parentesco, responsavel_financeiro)
        VALUES ($1,$2,$3,$4) RETURNING *`,
-      [req.params.id, req.body.responsavel_id, req.body.parentesco || null, !!req.body.responsavel_financeiro]
+      [req.params.id, respId, req.body.parentesco || null, !!req.body.responsavel_financeiro]
     );
     res.status(201).json(r.rows[0]);
   } catch (e) {
@@ -1035,7 +1055,7 @@ app.delete('/admin/usuarios/:id', autenticar, exigirPerfil('master'), async (req
 app.get('/health', async (req, res) => {
   try {
     await pool.query('SELECT 1');
-    res.json({ status: 'ok', sistema: 'CEMIC Gestão', versao: '1.0 (Fase 1)' });
+    res.json({ status: 'ok', sistema: 'CEMIC Gestão', versao: '1.1 (Fase 1)' });
   } catch {
     res.status(500).json({ status: 'erro', detalhe: 'Banco de dados inacessível.' });
   }
@@ -1043,5 +1063,5 @@ app.get('/health', async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 initDB()
-  .then(() => app.listen(PORT, () => console.log(`CEMIC Gestão — backend v1.0 rodando na porta ${PORT}`)))
+  .then(() => app.listen(PORT, () => console.log(`CEMIC Gestão — backend v1.1 rodando na porta ${PORT}`)))
   .catch(e => { console.error('Falha ao inicializar o banco:', e); process.exit(1); });
