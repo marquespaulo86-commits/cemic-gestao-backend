@@ -1,5 +1,5 @@
 // ============================================================
-// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v2.1 (Fases 1 e 2)
+// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v3.1 (Fases 1 a 3 — núcleo)
 // Banco + Autenticação com perfis + Configurações + CRUDs
 // Stack: Node.js/Express + PostgreSQL (Railway)
 // ============================================================
@@ -236,6 +236,10 @@ async function initDB() {
   );
   `;
   await pool.query(ddl);
+  // Migrações (idempotentes): desconto em R$ e pontualidade
+  await pool.query(`ALTER TABLE alunos ADD COLUMN IF NOT EXISTS desconto_valor NUMERIC(10,2) NOT NULL DEFAULT 0`);
+  await pool.query(`ALTER TABLE matriculas ALTER COLUMN desconto_aplicado TYPE NUMERIC(10,2)`);
+  await pool.query(`ALTER TABLE contas_receber ADD COLUMN IF NOT EXISTS desconto_pontualidade NUMERIC(10,2) NOT NULL DEFAULT 0`);
   await seedConfiguracoes();
   await seedCursosNiveis();
   await seedMaster();
@@ -252,6 +256,7 @@ async function seedConfiguracoes() {
     ['parcelas_semestre', JSON.stringify(6), 'Quantidade de mensalidades geradas por matrícula no semestre'],
     ['dia_vencimento', JSON.stringify(10), 'Dia padrão de vencimento das mensalidades'],
     ['taxa_matricula', JSON.stringify(0), 'Valor padrão da taxa de matrícula (R$) — ajustável no ato, paga sempre no ato'],
+    ['desconto_pontualidade', JSON.stringify(0), 'Desconto de pontualidade (R$) abatido da mensalidade paga até o vencimento'],
     ['multa_atraso', JSON.stringify({ ativa: false, multa_percentual: 2, juros_dia_percentual: 0.033 }), 'Multa e juros por atraso (aplicados quando ativa = true)'],
     ['descontos_disponiveis', JSON.stringify([25, 50, 100]), 'Percentuais de desconto disponíveis para Pagante Parcial (bolsista = 100)'],
     ['mensalidades', JSON.stringify({ 'Inglês': 0, 'Espanhol': 0 }), 'Valor da mensalidade integral por curso (R$) — definir antes das matrículas'],
@@ -483,19 +488,12 @@ app.post('/admin/alunos', autenticar, somenteGestao, async (req, res) => {
     const cpf = req.body.cpf ? soDigitos(req.body.cpf) : null;
     if (cpf && !cpfValido(cpf)) return res.status(400).json({ erro: 'CPF do aluno inválido — confira os dígitos.' });
 
-    // Validação do desconto contra as opções de Configurações
-    let desconto = Number(req.body.desconto_percentual || 0);
-    if (modalidade === 'bolsista') desconto = 100;
-    if (modalidade === 'pagante') desconto = 0;
-    if (modalidade === 'pagante_parcial') {
-      const opcoes = (await getConfig('descontos_disponiveis', [])) || [];
-      if (!opcoes.includes(desconto)) {
-        return res.status(400).json({ erro: `Desconto inválido. Opções configuradas: ${opcoes.join('%, ')}%.` });
-      }
-    }
+    // Desconto fixo em R$ na mensalidade (apenas Pagante Parcial; bolsista é isento; taxa de matrícula nunca tem desconto)
+    let desconto = Number(req.body.desconto_valor || 0);
+    if (modalidade !== 'pagante_parcial' || isNaN(desconto) || desconto < 0) desconto = 0;
 
     const r = await pool.query(
-      `INSERT INTO alunos (nome, data_nascimento, email, cpf, whatsapp, modalidade, desconto_percentual, observacoes)
+      `INSERT INTO alunos (nome, data_nascimento, email, cpf, whatsapp, modalidade, desconto_valor, observacoes)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
       [nome, data_nascimento || null, email || null, cpf, whatsapp || null, modalidade, desconto, observacoes || null]
     );
@@ -513,20 +511,13 @@ app.put('/admin/alunos/:id', autenticar, somenteGestao, async (req, res) => {
     if (!atual.rows.length) return res.status(404).json({ erro: 'Aluno não encontrado.' });
     const a = atual.rows[0];
     const modalidade = req.body.modalidade || a.modalidade;
-    let desconto = req.body.desconto_percentual !== undefined ? Number(req.body.desconto_percentual) : Number(a.desconto_percentual);
-    if (modalidade === 'bolsista') desconto = 100;
-    if (modalidade === 'pagante') desconto = 0;
-    if (modalidade === 'pagante_parcial') {
-      const opcoes = (await getConfig('descontos_disponiveis', [])) || [];
-      if (!opcoes.includes(desconto)) {
-        return res.status(400).json({ erro: `Desconto inválido. Opções configuradas: ${opcoes.join('%, ')}%.` });
-      }
-    }
+    let desconto = req.body.desconto_valor !== undefined ? Number(req.body.desconto_valor) : Number(a.desconto_valor || 0);
+    if (modalidade !== 'pagante_parcial' || isNaN(desconto) || desconto < 0) desconto = 0;
     if (req.body.cpf !== undefined && soDigitos(req.body.cpf) && !cpfValido(soDigitos(req.body.cpf))) {
       return res.status(400).json({ erro: 'CPF do aluno inválido — confira os dígitos.' });
     }
     const r = await pool.query(
-      `UPDATE alunos SET nome=$1, data_nascimento=$2, email=$3, cpf=$4, whatsapp=$5, status=$6, modalidade=$7, desconto_percentual=$8, observacoes=$9
+      `UPDATE alunos SET nome=$1, data_nascimento=$2, email=$3, cpf=$4, whatsapp=$5, status=$6, modalidade=$7, desconto_valor=$8, observacoes=$9
        WHERE id=$10 RETURNING *`,
       [
         req.body.nome ?? a.nome,
@@ -933,8 +924,13 @@ app.get('/admin/matriculas', autenticar, somenteGestao, async (req, res) => {
     if (req.query.turma_id) { params.push(req.query.turma_id); cond.push(`m.turma_id = $${params.length}`); }
     const where = cond.length ? `WHERE ${cond.join(' AND ')}` : '';
     const r = await pool.query(
-      `SELECT m.*, a.nome AS aluno_nome, t.nome AS turma_nome, t.semestre
-       FROM matriculas m JOIN alunos a ON a.id = m.aluno_id JOIN turmas t ON t.id = m.turma_id
+      `SELECT m.*, a.nome AS aluno_nome, t.nome AS turma_nome, t.semestre, t.turno, t.horario,
+              n.nome AS nivel_nome, c.nome AS curso_nome
+       FROM matriculas m
+       JOIN alunos a ON a.id = m.aluno_id
+       JOIN turmas t ON t.id = m.turma_id
+       JOIN niveis n ON n.id = t.nivel_id
+       JOIN cursos c ON c.id = n.curso_id
        ${where} ORDER BY t.semestre DESC, a.nome`, params);
     res.json(r.rows);
   } catch (e) { console.error('Erro GET matriculas:', e); res.status(500).json({ erro: 'Erro ao listar matrículas.' }); }
@@ -973,8 +969,10 @@ app.post('/admin/matriculas', autenticar, somenteGestao, async (req, res) => {
       await client.query('ROLLBACK'); client.release();
       return res.status(400).json({ erro: `Defina o valor da mensalidade do curso ${turma.curso_nome} em Configurações antes de matricular.` });
     }
-    const desconto = Number(aluno.desconto_percentual || 0);
-    const bolsista = aluno.modalidade === 'bolsista' || desconto >= 100;
+    const descontoAluno = Number(aluno.desconto_valor || 0);
+    const bolsista = aluno.modalidade === 'bolsista';
+    const vDesc = bolsista ? valor : +Math.min(descontoAluno, valor).toFixed(2);
+    const vFinal = +(valor - vDesc).toFixed(2);
 
     // Taxa de matrícula: geral, paga sempre no ato (bolsista também paga)
     const taxa = req.body.taxa_matricula !== undefined
@@ -988,15 +986,13 @@ app.post('/admin/matriculas', autenticar, somenteGestao, async (req, res) => {
 
     const mIns = await client.query(
       `INSERT INTO matriculas (aluno_id, turma_id, valor_mensalidade, desconto_aplicado)
-       VALUES ($1,$2,$3,$4) RETURNING *`, [aluno.id, turma.id, valor, desconto]);
+       VALUES ($1,$2,$3,$4) RETURNING *`, [aluno.id, turma.id, valor, vDesc]);
     const matricula = mIns.rows[0];
 
     // Geração automática das mensalidades do semestre
     const parcelas = Number(await getConfig('parcelas_semestre', 6)) || 6;
     const diaVenc = Math.min(Number(await getConfig('dia_vencimento', 10)) || 10, 28);
     const hoje = new Date();
-    const vDesc = +(valor * desconto / 100).toFixed(2);
-    const vFinal = +(valor - vDesc).toFixed(2);
     for (let i = 0; i < parcelas; i++) {
       const ref = new Date(hoje.getFullYear(), hoje.getMonth() + i, 1);
       const venc = new Date(ref.getFullYear(), ref.getMonth(), diaVenc);
@@ -1057,6 +1053,81 @@ app.put('/admin/matriculas/:id', autenticar, somenteGestao, async (req, res) => 
     }
     res.json({ mensagem: 'Matrícula atualizada.', matricula: r.rows[0] });
   } catch (e) { console.error('Erro PUT matricula:', e); res.status(500).json({ erro: 'Erro ao atualizar matrícula.' }); }
+});
+
+// ============================================================
+// 8C. CONTAS A RECEBER — extrato e baixa com pontualidade (Fase 3)
+// ============================================================
+app.get('/admin/contas-receber', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const cond = []; const params = [];
+    if (req.query.aluno_id) { params.push(req.query.aluno_id); cond.push(`cr.aluno_id = $${params.length}`); }
+    if (req.query.status) { params.push(req.query.status); cond.push(`cr.status = $${params.length}`); }
+    if (req.query.competencia) { params.push(req.query.competencia); cond.push(`cr.competencia = $${params.length}`); }
+    const where = cond.length ? `WHERE ${cond.join(' AND ')}` : '';
+    const r = await pool.query(
+      `SELECT cr.*, a.nome AS aluno_nome, t.nome AS turma_nome, t.turno, t.horario, t.semestre,
+              n.nome AS nivel_nome, c.nome AS curso_nome
+       FROM contas_receber cr
+       JOIN alunos a ON a.id = cr.aluno_id
+       LEFT JOIN matriculas m ON m.id = cr.matricula_id
+       LEFT JOIN turmas t ON t.id = m.turma_id
+       LEFT JOIN niveis n ON n.id = t.nivel_id
+       LEFT JOIN cursos c ON c.id = n.curso_id
+       ${where} ORDER BY cr.vencimento, cr.id`, params);
+    res.json(r.rows);
+  } catch (e) { console.error('Erro GET contas-receber:', e); res.status(500).json({ erro: 'Erro ao listar cobranças.' }); }
+});
+
+app.post('/admin/contas-receber/:id/baixa', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const forma = String(req.body.forma_pagamento || '').trim();
+    if (!forma) return res.status(400).json({ erro: 'Informe a forma de pagamento.' });
+
+    const cq = await pool.query(
+      `SELECT cr.*, a.nome AS aluno_nome, t.nome AS turma_nome, t.turno, t.horario, t.semestre,
+              n.nome AS nivel_nome, c.nome AS curso_nome
+       FROM contas_receber cr
+       JOIN alunos a ON a.id = cr.aluno_id
+       LEFT JOIN matriculas m ON m.id = cr.matricula_id
+       LEFT JOIN turmas t ON t.id = m.turma_id
+       LEFT JOIN niveis n ON n.id = t.nivel_id
+       LEFT JOIN cursos c ON c.id = n.curso_id
+       WHERE cr.id = $1`, [req.params.id]);
+    if (!cq.rows.length) return res.status(404).json({ erro: 'Cobrança não encontrada.' });
+    const conta = cq.rows[0];
+    if (!['pendente', 'atrasada'].includes(conta.status)) {
+      return res.status(409).json({ erro: `Esta cobrança já está ${conta.status}.` });
+    }
+
+    const dataPg = req.body.data_pagamento
+      ? new Date(req.body.data_pagamento + 'T12:00:00') : new Date();
+
+    // Desconto de pontualidade: somente mensalidades pagas até o vencimento
+    const ehMensalidade = String(conta.descricao || '').startsWith('Mensalidade');
+    const pontual = dataPg.toISOString().slice(0, 10) <= new Date(conta.vencimento).toISOString().slice(0, 10);
+    const descCfg = Number(await getConfig('desconto_pontualidade', 0)) || 0;
+    const descP = (ehMensalidade && pontual) ? Math.min(descCfg, Number(conta.valor_final)) : 0;
+    const cobrado = +(Number(conta.valor_final) - descP).toFixed(2);
+
+    await pool.query(
+      `UPDATE contas_receber SET status='paga', data_pagamento=$1, forma_pagamento=$2,
+              desconto_pontualidade=$3, recebido_por=$4 WHERE id=$5`,
+      [dataPg, forma, descP, req.usuario.id, req.params.id]);
+
+    res.json({
+      mensagem: descP > 0
+        ? `Pagamento registrado com desconto de pontualidade de R$ ${descP.toFixed(2)}.`
+        : 'Pagamento registrado.',
+      recibo: {
+        numero: conta.id, aluno_nome: conta.aluno_nome,
+        referente: conta.descricao + (conta.semestre ? ` · Semestre ${conta.semestre}` : ''),
+        turma: conta.turma_nome, turno: conta.turno, horario: conta.horario,
+        valor_base: Number(conta.valor_final), desconto_pontualidade: descP,
+        valor: cobrado, forma, data: dataPg
+      }
+    });
+  } catch (e) { console.error('Erro baixa contas-receber:', e); res.status(500).json({ erro: 'Erro ao registrar o pagamento.' }); }
 });
 
 // ============================================================
@@ -1230,7 +1301,7 @@ app.delete('/admin/usuarios/:id', autenticar, exigirPerfil('master'), async (req
 app.get('/health', async (req, res) => {
   try {
     await pool.query('SELECT 1');
-    res.json({ status: 'ok', sistema: 'CEMIC Gestão', versao: '2.1 (Fases 1 e 2)' });
+    res.json({ status: 'ok', sistema: 'CEMIC Gestão', versao: '3.1 (Fases 1 a 3 — núcleo)' });
   } catch {
     res.status(500).json({ status: 'erro', detalhe: 'Banco de dados inacessível.' });
   }
@@ -1238,5 +1309,5 @@ app.get('/health', async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 initDB()
-  .then(() => app.listen(PORT, () => console.log(`CEMIC Gestão — backend v2.1 rodando na porta ${PORT}`)))
+  .then(() => app.listen(PORT, () => console.log(`CEMIC Gestão — backend v3.1 rodando na porta ${PORT}`)))
   .catch(e => { console.error('Falha ao inicializar o banco:', e); process.exit(1); });
