@@ -1,5 +1,5 @@
 // ============================================================
-// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v3.1 (Fases 1 a 3 — núcleo)
+// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v3.2 (Fases 1 a 3 — núcleo)
 // Banco + Autenticação com perfis + Configurações + CRUDs
 // Stack: Node.js/Express + PostgreSQL (Railway)
 // ============================================================
@@ -1064,6 +1064,7 @@ app.get('/admin/contas-receber', autenticar, somenteGestao, async (req, res) => 
     if (req.query.aluno_id) { params.push(req.query.aluno_id); cond.push(`cr.aluno_id = $${params.length}`); }
     if (req.query.status) { params.push(req.query.status); cond.push(`cr.status = $${params.length}`); }
     if (req.query.competencia) { params.push(req.query.competencia); cond.push(`cr.competencia = $${params.length}`); }
+    if (req.query.busca) { params.push(`%${req.query.busca}%`); cond.push(`a.nome ILIKE $${params.length}`); }
     const where = cond.length ? `WHERE ${cond.join(' AND ')}` : '';
     const r = await pool.query(
       `SELECT cr.*, a.nome AS aluno_nome, t.nome AS turma_nome, t.turno, t.horario, t.semestre,
@@ -1301,7 +1302,7 @@ app.delete('/admin/usuarios/:id', autenticar, exigirPerfil('master'), async (req
 app.get('/health', async (req, res) => {
   try {
     await pool.query('SELECT 1');
-    res.json({ status: 'ok', sistema: 'CEMIC Gestão', versao: '3.1 (Fases 1 a 3 — núcleo)' });
+    res.json({ status: 'ok', sistema: 'CEMIC Gestão', versao: '3.2 (Fases 1 a 3 — núcleo)' });
   } catch {
     res.status(500).json({ status: 'erro', detalhe: 'Banco de dados inacessível.' });
   }
@@ -1309,5 +1310,5 @@ app.get('/health', async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 initDB()
-  .then(() => app.listen(PORT, () => console.log(`CEMIC Gestão — backend v3.1 rodando na porta ${PORT}`)))
+  .then(() => app.listen(PORT, () => console.log(`CEMIC Gestão — backend v3.2 rodando na porta ${PORT}`)))
   .catch(e => { console.error('Falha ao inicializar o banco:', e); process.exit(1); });
