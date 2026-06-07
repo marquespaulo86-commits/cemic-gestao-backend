@@ -1,5 +1,5 @@
 // ============================================================
-// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v1.1 (Fase 1)
+// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v2.0 (Fases 1 e 2)
 // Banco + Autenticação com perfis + Configurações + CRUDs
 // Stack: Node.js/Express + PostgreSQL (Railway)
 // ============================================================
@@ -346,6 +346,18 @@ function obrigatorios(body, campos) {
 
 const soDigitos = (s) => String(s || '').replace(/\D/g, '');
 
+// Validação matemática de CPF (dígitos verificadores)
+function cpfValido(cpf) {
+  cpf = soDigitos(cpf);
+  if (cpf.length !== 11 || /^(\d)\1{10}$/.test(cpf)) return false;
+  let s = 0;
+  for (let i = 0; i < 9; i++) s += Number(cpf[i]) * (10 - i);
+  if ((s * 10) % 11 % 10 !== Number(cpf[9])) return false;
+  s = 0;
+  for (let i = 0; i < 10; i++) s += Number(cpf[i]) * (11 - i);
+  return (s * 10) % 11 % 10 === Number(cpf[10]);
+}
+
 // ---------- POST /auth/login ----------
 app.post('/auth/login', limiterLogin, async (req, res) => {
   try {
@@ -468,6 +480,7 @@ app.post('/admin/alunos', autenticar, somenteGestao, async (req, res) => {
     if (erro) return res.status(400).json({ erro });
     const { nome, data_nascimento, email, whatsapp, modalidade, observacoes } = req.body;
     const cpf = req.body.cpf ? soDigitos(req.body.cpf) : null;
+    if (cpf && !cpfValido(cpf)) return res.status(400).json({ erro: 'CPF do aluno inválido — confira os dígitos.' });
 
     // Validação do desconto contra as opções de Configurações
     let desconto = Number(req.body.desconto_percentual || 0);
@@ -507,6 +520,9 @@ app.put('/admin/alunos/:id', autenticar, somenteGestao, async (req, res) => {
       if (!opcoes.includes(desconto)) {
         return res.status(400).json({ erro: `Desconto inválido. Opções configuradas: ${opcoes.join('%, ')}%.` });
       }
+    }
+    if (req.body.cpf !== undefined && soDigitos(req.body.cpf) && !cpfValido(soDigitos(req.body.cpf))) {
+      return res.status(400).json({ erro: 'CPF do aluno inválido — confira os dígitos.' });
     }
     const r = await pool.query(
       `UPDATE alunos SET nome=$1, data_nascimento=$2, email=$3, cpf=$4, whatsapp=$5, status=$6, modalidade=$7, desconto_percentual=$8, observacoes=$9
@@ -556,6 +572,7 @@ app.post('/admin/alunos/:id/responsaveis', autenticar, somenteGestao, async (req
       const erro = obrigatorios(req.body, ['nome', 'cpf']);
       if (erro) return res.status(400).json({ erro });
       const cpf = soDigitos(req.body.cpf);
+      if (!cpfValido(cpf)) return res.status(400).json({ erro: 'CPF do responsável inválido — confira os dígitos.' });
       const existe = await pool.query(`SELECT id FROM responsaveis WHERE cpf = $1`, [cpf]);
       if (existe.rows.length) {
         respId = existe.rows[0].id;
@@ -620,6 +637,7 @@ app.post('/admin/responsaveis', autenticar, somenteGestao, async (req, res) => {
   try {
     const erro = obrigatorios(req.body, ['nome', 'cpf']);
     if (erro) return res.status(400).json({ erro });
+    if (!cpfValido(soDigitos(req.body.cpf))) return res.status(400).json({ erro: 'CPF do responsável inválido — confira os dígitos.' });
     const r = await pool.query(
       `INSERT INTO responsaveis (nome, cpf, email, whatsapp) VALUES ($1,$2,$3,$4) RETURNING *`,
       [req.body.nome, soDigitos(req.body.cpf), req.body.email || null, req.body.whatsapp || null]
@@ -889,6 +907,129 @@ app.delete('/admin/turmas/:id', autenticar, somenteGestao, async (req, res) => {
 });
 
 // ============================================================
+// 8B. MATRÍCULAS (Fase 2) — vaga validada, valores congelados,
+//     mensalidades geradas automaticamente (R$ 0 para bolsistas)
+// ============================================================
+app.get('/admin/turmas/:id', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const t = await pool.query(
+      `SELECT t.*, n.nome AS nivel_nome, c.nome AS curso_nome, p.nome AS professor_nome
+       FROM turmas t JOIN niveis n ON n.id = t.nivel_id JOIN cursos c ON c.id = n.curso_id
+       LEFT JOIN professores p ON p.id = t.professor_id WHERE t.id = $1`, [req.params.id]);
+    if (!t.rows.length) return res.status(404).json({ erro: 'Turma não encontrada.' });
+    const m = await pool.query(
+      `SELECT m.*, a.nome AS aluno_nome, a.modalidade
+       FROM matriculas m JOIN alunos a ON a.id = m.aluno_id
+       WHERE m.turma_id = $1 ORDER BY a.nome`, [req.params.id]);
+    res.json({ ...t.rows[0], matriculas: m.rows });
+  } catch (e) { console.error('Erro GET turma:', e); res.status(500).json({ erro: 'Erro ao buscar turma.' }); }
+});
+
+app.get('/admin/matriculas', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const cond = []; const params = [];
+    if (req.query.aluno_id) { params.push(req.query.aluno_id); cond.push(`m.aluno_id = $${params.length}`); }
+    if (req.query.turma_id) { params.push(req.query.turma_id); cond.push(`m.turma_id = $${params.length}`); }
+    const where = cond.length ? `WHERE ${cond.join(' AND ')}` : '';
+    const r = await pool.query(
+      `SELECT m.*, a.nome AS aluno_nome, t.nome AS turma_nome, t.semestre
+       FROM matriculas m JOIN alunos a ON a.id = m.aluno_id JOIN turmas t ON t.id = m.turma_id
+       ${where} ORDER BY t.semestre DESC, a.nome`, params);
+    res.json(r.rows);
+  } catch (e) { console.error('Erro GET matriculas:', e); res.status(500).json({ erro: 'Erro ao listar matrículas.' }); }
+});
+
+app.post('/admin/matriculas', autenticar, somenteGestao, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const erro = obrigatorios(req.body, ['aluno_id', 'turma_id']);
+    if (erro) { client.release(); return res.status(400).json({ erro }); }
+
+    await client.query('BEGIN');
+    const tq = await client.query(
+      `SELECT t.*, n.nome AS nivel_nome, c.nome AS curso_nome
+       FROM turmas t JOIN niveis n ON n.id = t.nivel_id JOIN cursos c ON c.id = n.curso_id
+       WHERE t.id = $1 FOR UPDATE OF t`, [req.body.turma_id]);
+    if (!tq.rows.length) { await client.query('ROLLBACK'); client.release(); return res.status(404).json({ erro: 'Turma não encontrada.' }); }
+    const turma = tq.rows[0];
+    if (turma.status === 'encerrada') { await client.query('ROLLBACK'); client.release(); return res.status(409).json({ erro: 'Turma encerrada não recebe matrículas.' }); }
+
+    const aq = await client.query(`SELECT * FROM alunos WHERE id = $1`, [req.body.aluno_id]);
+    if (!aq.rows.length) { await client.query('ROLLBACK'); client.release(); return res.status(404).json({ erro: 'Aluno não encontrado.' }); }
+    const aluno = aq.rows[0];
+    if (aluno.status !== 'ativo') { await client.query('ROLLBACK'); client.release(); return res.status(409).json({ erro: 'Aluno inativo não pode ser matriculado. Reative o cadastro primeiro.' }); }
+
+    const ocup = await client.query(`SELECT COUNT(*)::int AS n FROM matriculas WHERE turma_id = $1 AND status = 'ativa'`, [turma.id]);
+    if (ocup.rows[0].n >= turma.capacidade) {
+      await client.query('ROLLBACK'); client.release();
+      return res.status(409).json({ erro: `Turma lotada — capacidade de ${turma.capacidade} alunos atingida.` });
+    }
+
+    // Valor congelado a partir das Configurações
+    const tabela = (await getConfig('mensalidades', {})) || {};
+    const valor = Number(tabela[turma.curso_nome] || 0);
+    if (!valor) {
+      await client.query('ROLLBACK'); client.release();
+      return res.status(400).json({ erro: `Defina o valor da mensalidade do curso ${turma.curso_nome} em Configurações antes de matricular.` });
+    }
+    const desconto = Number(aluno.desconto_percentual || 0);
+    const bolsista = aluno.modalidade === 'bolsista' || desconto >= 100;
+
+    const mIns = await client.query(
+      `INSERT INTO matriculas (aluno_id, turma_id, valor_mensalidade, desconto_aplicado)
+       VALUES ($1,$2,$3,$4) RETURNING *`, [aluno.id, turma.id, valor, desconto]);
+    const matricula = mIns.rows[0];
+
+    // Geração automática das mensalidades do semestre
+    const parcelas = Number(await getConfig('parcelas_semestre', 6)) || 6;
+    const diaVenc = Math.min(Number(await getConfig('dia_vencimento', 10)) || 10, 28);
+    const hoje = new Date();
+    const vDesc = +(valor * desconto / 100).toFixed(2);
+    const vFinal = +(valor - vDesc).toFixed(2);
+    for (let i = 0; i < parcelas; i++) {
+      const ref = new Date(hoje.getFullYear(), hoje.getMonth() + i, 1);
+      const venc = new Date(ref.getFullYear(), ref.getMonth(), diaVenc);
+      const comp = `${ref.getFullYear()}-${String(ref.getMonth() + 1).padStart(2, '0')}`;
+      await client.query(
+        `INSERT INTO contas_receber
+           (aluno_id, matricula_id, descricao, competencia, valor_original, desconto, valor_final,
+            vencimento, status, data_pagamento, forma_pagamento, recebido_por)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+        [aluno.id, matricula.id,
+         `Mensalidade ${comp.split('-')[1]}/${comp.split('-')[0]} — ${turma.curso_nome} ${turma.nivel_nome}`,
+         comp, valor, vDesc, vFinal, venc,
+         bolsista ? 'paga' : 'pendente',
+         bolsista ? hoje : null,
+         bolsista ? 'Bolsa integral' : null,
+         bolsista ? req.usuario.id : null]);
+    }
+    await client.query('COMMIT'); client.release();
+    res.status(201).json({ matricula, mensalidades_geradas: parcelas, bolsista });
+  } catch (e) {
+    try { await client.query('ROLLBACK'); } catch {}
+    client.release();
+    if (e.code === '23505') return res.status(409).json({ erro: 'Este aluno já está matriculado nesta turma.' });
+    console.error('Erro POST matricula:', e);
+    res.status(500).json({ erro: 'Erro ao efetivar matrícula.' });
+  }
+});
+
+app.put('/admin/matriculas/:id', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const novo = req.body.status;
+    if (!['ativa', 'trancada', 'cancelada'].includes(novo)) return res.status(400).json({ erro: 'Status inválido.' });
+    const r = await pool.query(
+      `UPDATE matriculas SET status = $1 WHERE id = $2 AND status <> 'concluida' RETURNING *`,
+      [novo, req.params.id]);
+    if (!r.rows.length) return res.status(404).json({ erro: 'Matrícula não encontrada (ou já concluída).' });
+    if (novo === 'cancelada' || novo === 'trancada') {
+      await pool.query(`UPDATE contas_receber SET status = 'cancelada' WHERE matricula_id = $1 AND status = 'pendente'`, [req.params.id]);
+    }
+    res.json({ mensagem: 'Matrícula atualizada.', matricula: r.rows[0] });
+  } catch (e) { console.error('Erro PUT matricula:', e); res.status(500).json({ erro: 'Erro ao atualizar matrícula.' }); }
+});
+
+// ============================================================
 // 9. CRUD — FORNECEDORES
 // ============================================================
 app.get('/admin/fornecedores', autenticar, somenteGestao, async (req, res) => {
@@ -973,6 +1114,7 @@ app.post('/admin/usuarios', autenticar, exigirPerfil('master'), async (req, res)
     const erro = obrigatorios(req.body, ['nome', 'cpf', 'senha', 'perfil']);
     if (erro) return res.status(400).json({ erro });
     if (String(req.body.senha).length < 8) return res.status(400).json({ erro: 'A senha deve ter ao menos 8 caracteres.' });
+    if (!cpfValido(soDigitos(req.body.cpf))) return res.status(400).json({ erro: 'CPF do usuário inválido — confira os dígitos.' });
     const hash = await bcrypt.hash(req.body.senha, 10);
     const r = await pool.query(
       `INSERT INTO usuarios (nome, cpf, email, whatsapp, senha_hash, data_nascimento, perfil, referencia_id, senha_provisoria)
@@ -994,6 +1136,9 @@ app.put('/admin/usuarios/:id', autenticar, exigirPerfil('master'), async (req, r
     const atual = await pool.query(`SELECT * FROM usuarios WHERE id = $1`, [req.params.id]);
     if (!atual.rows.length) return res.status(404).json({ erro: 'Usuário não encontrado.' });
     const x = atual.rows[0];
+    if (req.body.cpf !== undefined && !cpfValido(soDigitos(req.body.cpf))) {
+      return res.status(400).json({ erro: 'CPF do usuário inválido — confira os dígitos.' });
+    }
 
     // Proteção: não permitir inativar/rebaixar o último master ativo
     const novoPerfil = req.body.perfil ?? x.perfil;
@@ -1055,7 +1200,7 @@ app.delete('/admin/usuarios/:id', autenticar, exigirPerfil('master'), async (req
 app.get('/health', async (req, res) => {
   try {
     await pool.query('SELECT 1');
-    res.json({ status: 'ok', sistema: 'CEMIC Gestão', versao: '1.1 (Fase 1)' });
+    res.json({ status: 'ok', sistema: 'CEMIC Gestão', versao: '2.0 (Fases 1 e 2)' });
   } catch {
     res.status(500).json({ status: 'erro', detalhe: 'Banco de dados inacessível.' });
   }
@@ -1063,5 +1208,5 @@ app.get('/health', async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 initDB()
-  .then(() => app.listen(PORT, () => console.log(`CEMIC Gestão — backend v1.1 rodando na porta ${PORT}`)))
+  .then(() => app.listen(PORT, () => console.log(`CEMIC Gestão — backend v2.0 rodando na porta ${PORT}`)))
   .catch(e => { console.error('Falha ao inicializar o banco:', e); process.exit(1); });
