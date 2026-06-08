@@ -1,5 +1,5 @@
 // ============================================================
-// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v3.4 (Fases 1 a 3 — núcleo)
+// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v3.5 (Fases 1 a 3 + Relatórios)
 // Banco + Autenticação com perfis + Configurações + CRUDs
 // Stack: Node.js/Express + PostgreSQL (Railway)
 // ============================================================
@@ -440,6 +440,11 @@ app.put('/admin/configuracoes/:chave', autenticar, exigirPerfil('master'), async
     res.status(500).json({ erro: 'Erro ao atualizar configuração.' });
   }
 });
+
+async function marcarAtrasados() {
+  await pool.query(`UPDATE contas_receber SET status='atrasada' WHERE status='pendente' AND vencimento < CURRENT_DATE`);
+  await pool.query(`UPDATE contas_pagar SET status='atrasada' WHERE status='pendente' AND vencimento < CURRENT_DATE`);
+}
 
 async function getConfig(chave, padrao = null) {
   const r = await pool.query(`SELECT valor FROM configuracoes WHERE chave = $1`, [chave]);
@@ -1062,6 +1067,7 @@ app.put('/admin/matriculas/:id', autenticar, somenteGestao, async (req, res) => 
 // ============================================================
 app.get('/admin/contas-receber', autenticar, somenteGestao, async (req, res) => {
   try {
+    await marcarAtrasados();
     const cond = []; const params = [];
     if (req.query.aluno_id) { params.push(req.query.aluno_id); cond.push(`cr.aluno_id = $${params.length}`); }
     if (req.query.status) { params.push(req.query.status); cond.push(`cr.status = $${params.length}`); }
@@ -1209,6 +1215,136 @@ app.delete('/admin/fornecedores/:id', autenticar, somenteGestao, async (req, res
 });
 
 // ============================================================
+// 9B. CONTAS A PAGAR (Fase 3) + marcação automática de atrasados
+// ============================================================
+app.get('/admin/contas-pagar', autenticar, somenteGestao, async (req, res) => {
+  try {
+    await marcarAtrasados();
+    const cond = []; const params = [];
+    if (req.query.status) { params.push(req.query.status); cond.push(`cp.status = $${params.length}`); }
+    if (req.query.categoria) { params.push(req.query.categoria); cond.push(`cp.categoria = $${params.length}`); }
+    if (req.query.busca) { params.push(`%${req.query.busca}%`); cond.push(`(cp.descricao ILIKE $${params.length} OR f.nome ILIKE $${params.length})`); }
+    const where = cond.length ? `WHERE ${cond.join(' AND ')}` : '';
+    const r = await pool.query(
+      `SELECT cp.*, f.nome AS fornecedor_nome
+       FROM contas_pagar cp LEFT JOIN fornecedores f ON f.id = cp.fornecedor_id
+       ${where} ORDER BY cp.vencimento, cp.id`, params);
+    res.json(r.rows);
+  } catch (e) { console.error('Erro GET contas-pagar:', e); res.status(500).json({ erro: 'Erro ao listar contas a pagar.' }); }
+});
+
+app.post('/admin/contas-pagar', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const erro = obrigatorios(req.body, ['descricao', 'valor', 'vencimento']);
+    if (erro) return res.status(400).json({ erro });
+    const r = await pool.query(
+      `INSERT INTO contas_pagar (fornecedor_id, descricao, categoria, valor, vencimento, criado_por)
+       VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
+      [req.body.fornecedor_id || null, req.body.descricao, req.body.categoria || null,
+       Number(req.body.valor), req.body.vencimento, req.usuario.id]);
+    res.status(201).json(r.rows[0]);
+  } catch (e) { console.error('Erro POST contas-pagar:', e); res.status(500).json({ erro: 'Erro ao cadastrar conta a pagar.' }); }
+});
+
+app.put('/admin/contas-pagar/:id', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const atual = await pool.query(`SELECT * FROM contas_pagar WHERE id = $1`, [req.params.id]);
+    if (!atual.rows.length) return res.status(404).json({ erro: 'Conta não encontrada.' });
+    const x = atual.rows[0];
+    const r = await pool.query(
+      `UPDATE contas_pagar SET fornecedor_id=$1, descricao=$2, categoria=$3, valor=$4, vencimento=$5 WHERE id=$6 RETURNING *`,
+      [req.body.fornecedor_id !== undefined ? req.body.fornecedor_id : x.fornecedor_id,
+       req.body.descricao ?? x.descricao, req.body.categoria ?? x.categoria,
+       req.body.valor !== undefined ? Number(req.body.valor) : x.valor,
+       req.body.vencimento ?? x.vencimento, req.params.id]);
+    res.json(r.rows[0]);
+  } catch (e) { console.error('Erro PUT contas-pagar:', e); res.status(500).json({ erro: 'Erro ao atualizar conta a pagar.' }); }
+});
+
+app.post('/admin/contas-pagar/:id/baixa', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const forma = String(req.body.forma_pagamento || '').trim();
+    if (!forma) return res.status(400).json({ erro: 'Informe a forma de pagamento.' });
+    const dataPg = req.body.data_pagamento ? new Date(req.body.data_pagamento + 'T12:00:00') : new Date();
+    const r = await pool.query(
+      `UPDATE contas_pagar SET status='paga', data_pagamento=$1, forma_pagamento=$2 WHERE id=$3 AND status <> 'cancelada' RETURNING *`,
+      [dataPg, forma, req.params.id]);
+    if (!r.rows.length) return res.status(404).json({ erro: 'Conta não encontrada (ou cancelada).' });
+    res.json({ mensagem: 'Conta paga.', conta: r.rows[0] });
+  } catch (e) { console.error('Erro baixa contas-pagar:', e); res.status(500).json({ erro: 'Erro ao pagar a conta.' }); }
+});
+
+app.delete('/admin/contas-pagar/:id', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const r = await pool.query(`DELETE FROM contas_pagar WHERE id = $1 RETURNING id`, [req.params.id]);
+    if (!r.rows.length) return res.status(404).json({ erro: 'Conta não encontrada.' });
+    res.json({ mensagem: 'Conta a pagar excluída.' });
+  } catch (e) { console.error('Erro DELETE contas-pagar:', e); res.status(500).json({ erro: 'Erro ao excluir conta a pagar.' }); }
+});
+
+// ============================================================
+// 9C. RELATÓRIOS (Fase 5 — núcleo financeiro e de turmas)
+// ============================================================
+app.get('/admin/relatorios/financeiro', autenticar, somenteGestao, async (req, res) => {
+  try {
+    await marcarAtrasados();
+    const hoje = new Date();
+    const ini = req.query.inicio || `${hoje.getFullYear()}-${String(hoje.getMonth() + 1).padStart(2, '0')}-01`;
+    const fim = req.query.fim || hoje.toISOString().slice(0, 10);
+
+    const recebido = await pool.query(
+      `SELECT COALESCE(SUM(valor_final - desconto_pontualidade),0)::numeric AS total, COUNT(*)::int AS qtd
+       FROM contas_receber WHERE status='paga' AND data_pagamento::date BETWEEN $1 AND $2`, [ini, fim]);
+    const porForma = await pool.query(
+      `SELECT forma_pagamento, COALESCE(SUM(valor_final - desconto_pontualidade),0)::numeric AS total, COUNT(*)::int AS qtd
+       FROM contas_receber WHERE status='paga' AND data_pagamento::date BETWEEN $1 AND $2
+       GROUP BY forma_pagamento ORDER BY total DESC`, [ini, fim]);
+    const aberto = await pool.query(
+      `SELECT COALESCE(SUM(valor_final),0)::numeric AS total, COUNT(*)::int AS qtd,
+              COALESCE(SUM(valor_final) FILTER (WHERE status='atrasada'),0)::numeric AS total_atrasado,
+              COUNT(*) FILTER (WHERE status='atrasada')::int AS qtd_atrasado
+       FROM contas_receber WHERE status IN ('pendente','atrasada')`);
+    const pontualidade = await pool.query(
+      `SELECT COALESCE(SUM(desconto_pontualidade),0)::numeric AS total
+       FROM contas_receber WHERE status='paga' AND data_pagamento::date BETWEEN $1 AND $2`, [ini, fim]);
+    const bolsas = await pool.query(
+      `SELECT COALESCE(SUM(valor_original),0)::numeric AS total, COUNT(*)::int AS qtd
+       FROM contas_receber WHERE forma_pagamento='Bolsa integral' AND data_pagamento::date BETWEEN $1 AND $2`, [ini, fim]);
+    const pago = await pool.query(
+      `SELECT COALESCE(SUM(valor),0)::numeric AS total, COUNT(*)::int AS qtd
+       FROM contas_pagar WHERE status='paga' AND data_pagamento::date BETWEEN $1 AND $2`, [ini, fim]);
+    const aPagar = await pool.query(
+      `SELECT COALESCE(SUM(valor),0)::numeric AS total, COUNT(*)::int AS qtd,
+              COALESCE(SUM(valor) FILTER (WHERE status='atrasada'),0)::numeric AS total_atrasado
+       FROM contas_pagar WHERE status IN ('pendente','atrasada')`);
+
+    res.json({
+      periodo: { inicio: ini, fim },
+      recebido: recebido.rows[0], por_forma: porForma.rows, a_receber: aberto.rows[0],
+      pontualidade_concedida: pontualidade.rows[0].total, bolsas: bolsas.rows[0],
+      pago: pago.rows[0], a_pagar: aPagar.rows[0]
+    });
+  } catch (e) { console.error('Erro relatório financeiro:', e); res.status(500).json({ erro: 'Erro ao gerar relatório financeiro.' }); }
+});
+
+app.get('/admin/relatorios/turmas', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const cond = []; const params = [];
+    if (req.query.semestre) { params.push(req.query.semestre); cond.push(`t.semestre = $${params.length}`); }
+    const where = cond.length ? `WHERE ${cond.join(' AND ')}` : '';
+    const r = await pool.query(
+      `SELECT t.id, t.nome, t.semestre, t.turno, t.horario, t.capacidade, t.status,
+              c.nome AS curso_nome, n.nome AS nivel_nome, p.nome AS professor_nome,
+              (SELECT COUNT(*)::int FROM matriculas m WHERE m.turma_id=t.id AND m.status='ativa') AS matriculados,
+              (SELECT COUNT(*)::int FROM matriculas m JOIN alunos a ON a.id=m.aluno_id WHERE m.turma_id=t.id AND m.status='ativa' AND a.modalidade='bolsista') AS bolsistas
+       FROM turmas t JOIN niveis n ON n.id=t.nivel_id JOIN cursos c ON c.id=n.curso_id
+       LEFT JOIN professores p ON p.id=t.professor_id
+       ${where} ORDER BY t.semestre DESC, c.nome, n.ordem, t.nome`, params);
+    res.json(r.rows);
+  } catch (e) { console.error('Erro relatório turmas:', e); res.status(500).json({ erro: 'Erro ao gerar relatório de turmas.' }); }
+});
+
+// ============================================================
 // 10. CRUD — USUÁRIOS (apenas master)
 // ============================================================
 app.get('/admin/usuarios', autenticar, exigirPerfil('master'), async (req, res) => {
@@ -1326,7 +1462,7 @@ app.get('/', (req, res) => {
 app.get('/health', async (req, res) => {
   try {
     await pool.query('SELECT 1');
-    res.json({ status: 'ok', sistema: 'CEMIC Gestão', versao: '3.4 (Fases 1 a 3 — núcleo)' });
+    res.json({ status: 'ok', sistema: 'CEMIC Gestão', versao: '3.5 (Fases 1 a 3 + Relatórios)' });
   } catch {
     res.status(500).json({ status: 'erro', detalhe: 'Banco de dados inacessível.' });
   }
@@ -1334,5 +1470,5 @@ app.get('/health', async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 initDB()
-  .then(() => app.listen(PORT, () => console.log(`CEMIC Gestão — backend v3.4 rodando na porta ${PORT}`)))
+  .then(() => app.listen(PORT, () => console.log(`CEMIC Gestão — backend v3.5 rodando na porta ${PORT}`)))
   .catch(e => { console.error('Falha ao inicializar o banco:', e); process.exit(1); });
