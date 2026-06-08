@@ -1,5 +1,5 @@
 // ============================================================
-// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v3.5 (Fases 1 a 3 + Relatórios)
+// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v3.6 (Fases 1 a 3 + Relatórios)
 // Banco + Autenticação com perfis + Configurações + CRUDs
 // Stack: Node.js/Express + PostgreSQL (Railway)
 // ============================================================
@@ -1341,7 +1341,54 @@ app.get('/admin/relatorios/turmas', autenticar, somenteGestao, async (req, res) 
        LEFT JOIN professores p ON p.id=t.professor_id
        ${where} ORDER BY t.semestre DESC, c.nome, n.ordem, t.nome`, params);
     res.json(r.rows);
-  } catch (e) { console.error('Erro relatório turmas:', e); res.status(500).json({ erro: 'Erro ao gerar relatório de turmas.' }); }
+  } catch (e) { console.error('Erro relatório turmas:', e); res.status(500).json({ erro: 'Erro ao gerar relatório de turmas.' });
+
+app.get('/admin/relatorios/financeiro-detalhado', autenticar, somenteGestao, async (req, res) => {
+  try {
+    await marcarAtrasados();
+    const hoje = new Date();
+    const ini = req.query.inicio || `${hoje.getFullYear()}-${String(hoje.getMonth() + 1).padStart(2, '0')}-01`;
+    const fim = req.query.fim || hoje.toISOString().slice(0, 10);
+
+    const SELECT = `
+      SELECT cr.id, cr.descricao, cr.competencia, cr.vencimento, cr.valor_final, cr.desconto_pontualidade,
+             cr.data_pagamento, cr.forma_pagamento, cr.status,
+             a.nome AS aluno_nome, pgt.nome AS pagante_nome,
+             CASE WHEN cr.descricao LIKE 'Mensalidade%' THEN
+               (SELECT COUNT(*) FROM contas_receber x WHERE x.matricula_id = cr.matricula_id
+                 AND x.descricao LIKE 'Mensalidade%' AND x.vencimento <= cr.vencimento) END AS parcela_num,
+             CASE WHEN cr.descricao LIKE 'Mensalidade%' THEN
+               (SELECT COUNT(*) FROM contas_receber x WHERE x.matricula_id = cr.matricula_id
+                 AND x.descricao LIKE 'Mensalidade%') END AS parcela_total
+      FROM contas_receber cr
+      JOIN alunos a ON a.id = cr.aluno_id
+      LEFT JOIN LATERAL (
+        SELECT r2.nome FROM aluno_responsavel ar2 JOIN responsaveis r2 ON r2.id = ar2.responsavel_id
+        WHERE ar2.aluno_id = cr.aluno_id AND ar2.responsavel_financeiro = TRUE ORDER BY ar2.id LIMIT 1
+      ) pgt ON TRUE `;
+
+    const recebidas = await pool.query(
+      `${SELECT} WHERE cr.status='paga' AND cr.data_pagamento::date BETWEEN $1 AND $2
+       ORDER BY cr.data_pagamento, pgt.nome NULLS LAST, a.nome`, [ini, fim]);
+    const aReceber = await pool.query(
+      `${SELECT} WHERE cr.status='pendente' AND cr.vencimento BETWEEN $1 AND $2
+       ORDER BY cr.vencimento, pgt.nome NULLS LAST, a.nome`, [ini, fim]);
+    const vencidas = await pool.query(
+      `${SELECT} WHERE cr.status='atrasada' AND cr.vencimento <= $1
+       ORDER BY cr.vencimento, pgt.nome NULLS LAST, a.nome`, [fim]);
+
+    const soma = (rows, campo) => rows.reduce((s, r) => s + Number(r[campo] || 0), 0);
+    res.json({
+      periodo: { inicio: ini, fim },
+      recebidas: recebidas.rows, a_receber: aReceber.rows, vencidas: vencidas.rows,
+      totais: {
+        recebido: recebidas.rows.reduce((s, r) => s + (Number(r.valor_final) - Number(r.desconto_pontualidade || 0)), 0),
+        a_receber: soma(aReceber.rows, 'valor_final'),
+        vencido: soma(vencidas.rows, 'valor_final')
+      }
+    });
+  } catch (e) { console.error('Erro relatório detalhado:', e); res.status(500).json({ erro: 'Erro ao gerar relatório detalhado.' }); }
+}); }
 });
 
 // ============================================================
@@ -1462,7 +1509,7 @@ app.get('/', (req, res) => {
 app.get('/health', async (req, res) => {
   try {
     await pool.query('SELECT 1');
-    res.json({ status: 'ok', sistema: 'CEMIC Gestão', versao: '3.5 (Fases 1 a 3 + Relatórios)' });
+    res.json({ status: 'ok', sistema: 'CEMIC Gestão', versao: '3.6 (Fases 1 a 3 + Relatórios)' });
   } catch {
     res.status(500).json({ status: 'erro', detalhe: 'Banco de dados inacessível.' });
   }
@@ -1470,5 +1517,5 @@ app.get('/health', async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 initDB()
-  .then(() => app.listen(PORT, () => console.log(`CEMIC Gestão — backend v3.5 rodando na porta ${PORT}`)))
+  .then(() => app.listen(PORT, () => console.log(`CEMIC Gestão — backend v3.6 rodando na porta ${PORT}`)))
   .catch(e => { console.error('Falha ao inicializar o banco:', e); process.exit(1); });
