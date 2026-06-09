@@ -1,5 +1,5 @@
 // ============================================================
-// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v3.6 (Fases 1 a 3 + Relatórios)
+// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v3.7 (Fases 1 a 3 + Relatórios)
 // Banco + Autenticação com perfis + Configurações + CRUDs
 // Stack: Node.js/Express + PostgreSQL (Railway)
 // ============================================================
@@ -258,6 +258,7 @@ async function seedConfiguracoes() {
     ['parcelas_semestre', JSON.stringify(6), 'Quantidade de mensalidades geradas por matrícula no semestre'],
     ['dia_vencimento', JSON.stringify(10), 'Dia padrão de vencimento das mensalidades'],
     ['taxa_matricula', JSON.stringify(0), 'Valor padrão da taxa de matrícula (R$) — ajustável no ato, paga sempre no ato'],
+    ['valor_plataforma', JSON.stringify(25), 'Valor da Taxa da Plataforma Acadêmica (R$) — lançada 1x por semestre'],
     ['desconto_pontualidade', JSON.stringify(0), 'Desconto de pontualidade (R$) abatido da mensalidade paga até o vencimento'],
     ['multa_atraso', JSON.stringify({ ativa: false, multa_percentual: 2, juros_dia_percentual: 0.033 }), 'Multa e juros por atraso (aplicados quando ativa = true)'],
     ['descontos_disponiveis', JSON.stringify([25, 50, 100]), 'Percentuais de desconto disponíveis para Pagante Parcial (bolsista = 100)'],
@@ -969,15 +970,27 @@ app.post('/admin/matriculas', autenticar, somenteGestao, async (req, res) => {
       return res.status(409).json({ erro: `Turma lotada — capacidade de ${turma.capacidade} alunos atingida.` });
     }
 
-    // Valor congelado a partir das Configurações
+    const bolsista = aluno.modalidade === 'bolsista';
+    const hoje = new Date();
+    const diaVenc = Math.min(Number(await getConfig('dia_vencimento', 10)) || 10, 28);
+
+    // Esquema de lançamento financeiro escolhido no ato:
+    // '1' = 1º semestre (fev–jun) · '2' = 2º semestre (ago–dez) · 'sem' = sem financeiro (bolsista)
+    let semLanc = String(req.body.semestre_lancamento || '').trim();
+    if (!['1', '2', 'sem'].includes(semLanc)) {
+      semLanc = bolsista ? 'sem' : (String(turma.semestre || '').endsWith('.1') ? '1' : '2');
+    }
+    const anoBase = parseInt(String(turma.semestre || '').split('.')[0], 10) || hoje.getFullYear();
+    const mesesSem = semLanc === '1' ? [1, 2, 3, 4, 5] : semLanc === '2' ? [7, 8, 9, 10, 11] : [];
+
+    // Valor da mensalidade (necessário apenas quando há lançamento de parcelas)
     const tabela = (await getConfig('mensalidades', {})) || {};
     const valor = Number(tabela[turma.curso_nome] || 0);
-    if (!valor) {
+    if (mesesSem.length && !valor) {
       await client.query('ROLLBACK'); client.release();
       return res.status(400).json({ erro: `Defina o valor da mensalidade do curso ${turma.curso_nome} em Configurações antes de matricular.` });
     }
     const descontoAluno = Number(aluno.desconto_valor || 0);
-    const bolsista = aluno.modalidade === 'bolsista';
     const vDesc = bolsista ? valor : +Math.min(descontoAluno, valor).toFixed(2);
     const vFinal = +(valor - vDesc).toFixed(2);
 
@@ -996,27 +1009,44 @@ app.post('/admin/matriculas', autenticar, somenteGestao, async (req, res) => {
        VALUES ($1,$2,$3,$4) RETURNING *`, [aluno.id, turma.id, valor, vDesc]);
     const matricula = mIns.rows[0];
 
-    // Geração automática das mensalidades do semestre
-    const parcelas = Number(await getConfig('parcelas_semestre', 6)) || 6;
-    const diaVenc = Math.min(Number(await getConfig('dia_vencimento', 10)) || 10, 28);
-    const hoje = new Date();
-    for (let i = 0; i < parcelas; i++) {
-      const ref = new Date(hoje.getFullYear(), hoje.getMonth() + i, 1);
-      const venc = new Date(ref.getFullYear(), ref.getMonth(), diaVenc);
-      const comp = `${ref.getFullYear()}-${String(ref.getMonth() + 1).padStart(2, '0')}`;
+    // Mensalidades do semestre escolhido (5 parcelas; bolsista usa "sem financeiro")
+    for (const mes of mesesSem) {
+      const venc = new Date(anoBase, mes, diaVenc);
+      const comp = `${anoBase}-${String(mes + 1).padStart(2, '0')}`;
       await client.query(
         `INSERT INTO contas_receber
            (aluno_id, matricula_id, descricao, competencia, valor_original, desconto, valor_final,
             vencimento, status, data_pagamento, forma_pagamento, recebido_por)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
         [aluno.id, matricula.id,
-         `Mensalidade ${comp.split('-')[1]}/${comp.split('-')[0]} — ${turma.curso_nome} ${turma.nivel_nome}`,
+         `Mensalidade ${String(mes + 1).padStart(2, '0')}/${anoBase} — ${turma.curso_nome} ${turma.nivel_nome}`,
          comp, valor, vDesc, vFinal, venc,
          bolsista ? 'paga' : 'pendente',
          bolsista ? hoje : null,
          bolsista ? 'Bolsa integral' : null,
          bolsista ? req.usuario.id : null]);
     }
+    const parcelas = mesesSem.length;
+
+    // Taxa da Plataforma Acadêmica (campo separado): 1 parcela, venc. 01/02 (1º) ou 01/08 (2º)
+    let plataformaLancada = false;
+    const querPlataforma = req.body.plataforma === true || req.body.plataforma === 'true';
+    if (querPlataforma && semLanc !== 'sem') {
+      const valorPlat = Number(req.body.valor_plataforma) || Number(await getConfig('valor_plataforma', 25)) || 25;
+      const mesPlat = semLanc === '1' ? 1 : 7;
+      const vencPlat = new Date(anoBase, mesPlat, 1);
+      const compPlat = `${anoBase}-${String(mesPlat + 1).padStart(2, '0')}`;
+      await client.query(
+        `INSERT INTO contas_receber
+           (aluno_id, matricula_id, descricao, competencia, valor_original, desconto, valor_final,
+            vencimento, status, data_pagamento, forma_pagamento, recebido_por)
+         VALUES ($1,$2,$3,$4,$5,0,$5,$6,'pendente',NULL,NULL,NULL)`,
+        [aluno.id, matricula.id,
+         `Taxa da Plataforma Acadêmica — ${turma.curso_nome} ${turma.nivel_nome}`,
+         compPlat, valorPlat, vencPlat]);
+      plataformaLancada = true;
+    }
+
     // Lançamento da taxa (já quitada) + dados do recibo automático
     let recibo = null;
     if (taxa > 0) {
@@ -1037,7 +1067,7 @@ app.post('/admin/matriculas', autenticar, somenteGestao, async (req, res) => {
       };
     }
     await client.query('COMMIT'); client.release();
-    res.status(201).json({ matricula, mensalidades_geradas: parcelas, bolsista, recibo });
+    res.status(201).json({ matricula, mensalidades_geradas: parcelas, plataforma_lancada: plataformaLancada, bolsista, recibo });
   } catch (e) {
     try { await client.query('ROLLBACK'); } catch {}
     client.release();
@@ -1509,7 +1539,7 @@ app.get('/', (req, res) => {
 app.get('/health', async (req, res) => {
   try {
     await pool.query('SELECT 1');
-    res.json({ status: 'ok', sistema: 'CEMIC Gestão', versao: '3.6 (Fases 1 a 3 + Relatórios)' });
+    res.json({ status: 'ok', sistema: 'CEMIC Gestão', versao: '3.7 (Fases 1 a 3 + Relatórios)' });
   } catch {
     res.status(500).json({ status: 'erro', detalhe: 'Banco de dados inacessível.' });
   }
@@ -1517,5 +1547,5 @@ app.get('/health', async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 initDB()
-  .then(() => app.listen(PORT, () => console.log(`CEMIC Gestão — backend v3.6 rodando na porta ${PORT}`)))
+  .then(() => app.listen(PORT, () => console.log(`CEMIC Gestão — backend v3.7 rodando na porta ${PORT}`)))
   .catch(e => { console.error('Falha ao inicializar o banco:', e); process.exit(1); });
