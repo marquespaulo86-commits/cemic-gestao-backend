@@ -1,5 +1,5 @@
 // ============================================================
-// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v3.7 (Fases 1 a 3 + Relatórios)
+// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v3.8 (Fases 1 a 3 + Relatórios)
 // Banco + Autenticação com perfis + Configurações + CRUDs
 // Stack: Node.js/Express + PostgreSQL (Railway)
 // ============================================================
@@ -944,6 +944,31 @@ app.get('/admin/matriculas', autenticar, somenteGestao, async (req, res) => {
   } catch (e) { console.error('Erro GET matriculas:', e); res.status(500).json({ erro: 'Erro ao listar matrículas.' }); }
 });
 
+app.delete('/admin/contas-receber/:id', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const r = await pool.query(`DELETE FROM contas_receber WHERE id = $1 RETURNING id`, [req.params.id]);
+    if (!r.rows.length) return res.status(404).json({ erro: 'Parcela não encontrada.' });
+    res.json({ mensagem: 'Parcela excluída.' });
+  } catch (e) { console.error('Erro DELETE contas-receber:', e); res.status(500).json({ erro: 'Erro ao excluir a parcela.' }); }
+});
+
+app.post('/admin/turmas/:id/encerrar', autenticar, somenteGestao, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const t = await client.query(`UPDATE turmas SET status='encerrada' WHERE id = $1 RETURNING id, nome`, [req.params.id]);
+    if (!t.rows.length) { await client.query('ROLLBACK'); client.release(); return res.status(404).json({ erro: 'Turma não encontrada.' }); }
+    const m = await client.query(`UPDATE matriculas SET status='concluida' WHERE turma_id = $1 AND status = 'ativa' RETURNING id`, [req.params.id]);
+    await client.query('COMMIT'); client.release();
+    res.json({ mensagem: 'Turma encerrada.', matriculas_concluidas: m.rows.length });
+  } catch (e) {
+    try { await client.query('ROLLBACK'); } catch {}
+    client.release();
+    console.error('Erro encerrar turma:', e);
+    res.status(500).json({ erro: 'Erro ao encerrar a turma.' });
+  }
+});
+
 app.post('/admin/matriculas', autenticar, somenteGestao, async (req, res) => {
   const client = await pool.connect();
   try {
@@ -1028,12 +1053,16 @@ app.post('/admin/matriculas', autenticar, somenteGestao, async (req, res) => {
     }
     const parcelas = mesesSem.length;
 
-    // Taxa da Plataforma Acadêmica (campo separado): 1 parcela, venc. 01/02 (1º) ou 01/08 (2º)
+    // Taxa da Plataforma Acadêmica (campo separado): 01/02, 01/08 ou bolsista (não lançar)
     let plataformaLancada = false;
-    const querPlataforma = req.body.plataforma === true || req.body.plataforma === 'true';
-    if (querPlataforma && semLanc !== 'sem') {
+    let platMes = String(req.body.plataforma_mes || '').trim(); // '2' | '8' | 'sem'
+    if (!['2', '8', 'sem'].includes(platMes)) {
+      const querPlat = req.body.plataforma === true || req.body.plataforma === 'true';
+      platMes = querPlat && semLanc !== 'sem' ? (semLanc === '1' ? '2' : '8') : 'sem';
+    }
+    if (platMes === '2' || platMes === '8') {
       const valorPlat = Number(req.body.valor_plataforma) || Number(await getConfig('valor_plataforma', 25)) || 25;
-      const mesPlat = semLanc === '1' ? 1 : 7;
+      const mesPlat = platMes === '2' ? 1 : 7;
       const vencPlat = new Date(anoBase, mesPlat, 1);
       const compPlat = `${anoBase}-${String(mesPlat + 1).padStart(2, '0')}`;
       await client.query(
@@ -1539,7 +1568,7 @@ app.get('/', (req, res) => {
 app.get('/health', async (req, res) => {
   try {
     await pool.query('SELECT 1');
-    res.json({ status: 'ok', sistema: 'CEMIC Gestão', versao: '3.7 (Fases 1 a 3 + Relatórios)' });
+    res.json({ status: 'ok', sistema: 'CEMIC Gestão', versao: '3.8 (Fases 1 a 3 + Relatórios)' });
   } catch {
     res.status(500).json({ status: 'erro', detalhe: 'Banco de dados inacessível.' });
   }
@@ -1547,5 +1576,5 @@ app.get('/health', async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 initDB()
-  .then(() => app.listen(PORT, () => console.log(`CEMIC Gestão — backend v3.7 rodando na porta ${PORT}`)))
+  .then(() => app.listen(PORT, () => console.log(`CEMIC Gestão — backend v3.8 rodando na porta ${PORT}`)))
   .catch(e => { console.error('Falha ao inicializar o banco:', e); process.exit(1); });
