@@ -1,5 +1,5 @@
 // ============================================================
-// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v3.8 (Fases 1 a 3 + Relatórios)
+// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v3.11 (… + Portal dos Pais + Pix Inter)
 // Banco + Autenticação com perfis + Configurações + CRUDs
 // Stack: Node.js/Express + PostgreSQL (Railway)
 // ============================================================
@@ -7,6 +7,8 @@
 const express = require('express');
 const path = require('path');
 const fs = require('fs');
+const https = require('https');
+const crypto = require('crypto');
 const { Pool } = require('pg');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
@@ -242,6 +244,84 @@ async function initDB() {
   await pool.query(`ALTER TABLE alunos ADD COLUMN IF NOT EXISTS desconto_valor NUMERIC(10,2) NOT NULL DEFAULT 0`);
   await pool.query(`ALTER TABLE matriculas ALTER COLUMN desconto_aplicado TYPE NUMERIC(10,2)`);
   await pool.query(`ALTER TABLE contas_receber ADD COLUMN IF NOT EXISTS desconto_pontualidade NUMERIC(10,2) NOT NULL DEFAULT 0`);
+
+  // ---------- Migrações — Módulo Financeiro v3.9 ----------
+  // Código de identificação por entidade (determinístico a partir do id) + backfill dos existentes
+  await pool.query(`ALTER TABLE alunos       ADD COLUMN IF NOT EXISTS codigo TEXT`);
+  await pool.query(`ALTER TABLE professores  ADD COLUMN IF NOT EXISTS codigo TEXT`);
+  await pool.query(`ALTER TABLE usuarios     ADD COLUMN IF NOT EXISTS codigo TEXT`);
+  await pool.query(`ALTER TABLE fornecedores ADD COLUMN IF NOT EXISTS codigo TEXT`);
+  await pool.query(`UPDATE alunos       SET codigo = 'ALU-' || lpad(id::text, 4, '0') WHERE codigo IS NULL`);
+  await pool.query(`UPDATE professores  SET codigo = 'PRF-' || lpad(id::text, 4, '0') WHERE codigo IS NULL`);
+  await pool.query(`UPDATE usuarios     SET codigo = 'USR-' || lpad(id::text, 4, '0') WHERE codigo IS NULL`);
+  await pool.query(`UPDATE fornecedores SET codigo = 'FRN-' || lpad(id::text, 4, '0') WHERE codigo IS NULL`);
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_alunos_codigo       ON alunos(codigo)`);
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_professores_codigo  ON professores(codigo)`);
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_usuarios_codigo     ON usuarios(codigo)`);
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_fornecedores_codigo ON fornecedores(codigo)`);
+
+  // Contas a Receber: documento, juros, valor recebido e cliente livre; aluno_id passa a ser opcional (avulsa)
+  await pool.query(`ALTER TABLE contas_receber ADD COLUMN IF NOT EXISTS numero_documento TEXT`);
+  await pool.query(`ALTER TABLE contas_receber ADD COLUMN IF NOT EXISTS juros NUMERIC(10,2) NOT NULL DEFAULT 0`);
+  await pool.query(`ALTER TABLE contas_receber ADD COLUMN IF NOT EXISTS valor_recebido NUMERIC(10,2)`);
+  await pool.query(`ALTER TABLE contas_receber ADD COLUMN IF NOT EXISTS cliente_nome TEXT`);
+  await pool.query(`ALTER TABLE contas_receber ALTER COLUMN aluno_id DROP NOT NULL`);
+  await pool.query(`UPDATE contas_receber SET numero_documento = 'CR-' || to_char(COALESCE(criado_em, NOW()), 'YYYY') || '-' || lpad(id::text, 6, '0') WHERE numero_documento IS NULL`);
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_contas_receber_documento ON contas_receber(numero_documento)`);
+
+  // Geração automática de código/documento em novas inserções.
+  // AFTER INSERT + UPDATE: o NEW.id é garantido nesse ponto, sem depender da ordem
+  // de avaliação de DEFAULT em BEFORE INSERT — abordagem à prova de falhas.
+  await pool.query(`CREATE OR REPLACE FUNCTION gera_codigo() RETURNS trigger AS $func$
+    BEGIN
+      IF NEW.codigo IS NULL THEN
+        EXECUTE format('UPDATE %I SET codigo = $1 WHERE id = $2', TG_TABLE_NAME)
+          USING TG_ARGV[0] || lpad(NEW.id::text, 4, '0'), NEW.id;
+      END IF;
+      RETURN NULL;
+    END; $func$ LANGUAGE plpgsql`);
+  await pool.query(`CREATE OR REPLACE FUNCTION gera_documento_cr() RETURNS trigger AS $func$
+    BEGIN
+      IF NEW.numero_documento IS NULL THEN
+        UPDATE contas_receber
+          SET numero_documento = 'CR-' || to_char(COALESCE(NEW.criado_em, NOW()), 'YYYY') || '-' || lpad(NEW.id::text, 6, '0')
+          WHERE id = NEW.id;
+      END IF;
+      RETURN NULL;
+    END; $func$ LANGUAGE plpgsql`);
+  for (const [tab, pref] of [['alunos', 'ALU-'], ['professores', 'PRF-'], ['usuarios', 'USR-'], ['fornecedores', 'FRN-']]) {
+    await pool.query(`DROP TRIGGER IF EXISTS trg_codigo_${tab} ON ${tab}`);
+    await pool.query(`CREATE TRIGGER trg_codigo_${tab} AFTER INSERT ON ${tab} FOR EACH ROW EXECUTE FUNCTION gera_codigo('${pref}')`);
+  }
+  await pool.query(`DROP TRIGGER IF EXISTS trg_documento_cr ON contas_receber`);
+  await pool.query(`CREATE TRIGGER trg_documento_cr AFTER INSERT ON contas_receber FOR EACH ROW EXECUTE FUNCTION gera_documento_cr()`);
+
+  // ---------- Portal dos Pais — Pré-inscrições (v3.10) ----------
+  await pool.query(`CREATE TABLE IF NOT EXISTS pre_inscricoes (
+    id SERIAL PRIMARY KEY,
+    protocolo TEXT,
+    aluno_nome TEXT NOT NULL,
+    aluno_data_nascimento DATE,
+    aluno_cpf TEXT,
+    programa TEXT,
+    turno TEXT,
+    responsavel_nome TEXT NOT NULL,
+    responsavel_cpf TEXT,
+    responsavel_whatsapp TEXT,
+    responsavel_email TEXT,
+    parentesco TEXT,
+    valor_taxa NUMERIC(10,2) NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'aguardando_pagamento'
+      CHECK (status IN ('aguardando_pagamento','pago','cancelada','efetivada')),
+    mp_payment_id TEXT,
+    pix_qr TEXT,
+    pix_copia_cola TEXT,
+    aluno_id INTEGER REFERENCES alunos(id),
+    matricula_id INTEGER REFERENCES matriculas(id),
+    observacoes TEXT,
+    criado_em TIMESTAMPTZ DEFAULT NOW(),
+    pago_em TIMESTAMPTZ
+  )`);
   await seedConfiguracoes();
   await seedCursosNiveis();
   await seedMaster();
@@ -323,6 +403,14 @@ const limiterLogin = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 10,
   message: { erro: 'Muitas tentativas de login. Aguarde 15 minutos.' }
+});
+
+const limiterPublico = rateLimit({
+  windowMs: 60 * 1000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { erro: 'Muitas requisições. Aguarde alguns instantes e tente novamente.' }
 });
 
 function autenticar(req, res, next) {
@@ -1133,16 +1221,16 @@ app.get('/admin/contas-receber', autenticar, somenteGestao, async (req, res) => 
     if (req.query.competencia) { params.push(req.query.competencia); cond.push(`cr.competencia = $${params.length}`); }
     if (req.query.busca) {
       params.push(`%${req.query.busca}%`);
-      cond.push(`(a.nome ILIKE $${params.length} OR EXISTS (
+      cond.push(`(a.nome ILIKE $${params.length} OR cr.cliente_nome ILIKE $${params.length} OR cr.numero_documento ILIKE $${params.length} OR EXISTS (
         SELECT 1 FROM aluno_responsavel arb JOIN responsaveis rb ON rb.id = arb.responsavel_id
         WHERE arb.aluno_id = cr.aluno_id AND rb.nome ILIKE $${params.length}))`);
     }
     const where = cond.length ? `WHERE ${cond.join(' AND ')}` : '';
     const r = await pool.query(
-      `SELECT cr.*, a.nome AS aluno_nome, t.nome AS turma_nome, t.turno, t.horario, t.semestre,
+      `SELECT cr.*, COALESCE(a.nome, cr.cliente_nome) AS aluno_nome, t.nome AS turma_nome, t.turno, t.horario, t.semestre,
               n.nome AS nivel_nome, c.nome AS curso_nome, pgt.nome AS pagante_nome
        FROM contas_receber cr
-       JOIN alunos a ON a.id = cr.aluno_id
+       LEFT JOIN alunos a ON a.id = cr.aluno_id
        LEFT JOIN matriculas m ON m.id = cr.matricula_id
        LEFT JOIN turmas t ON t.id = m.turma_id
        LEFT JOIN niveis n ON n.id = t.nivel_id
@@ -1158,16 +1246,37 @@ app.get('/admin/contas-receber', autenticar, somenteGestao, async (req, res) => 
   } catch (e) { console.error('Erro GET contas-receber:', e); res.status(500).json({ erro: 'Erro ao listar cobranças.' }); }
 });
 
+app.post('/admin/contas-receber', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const descricao = String(req.body.descricao || '').trim();
+    const valor = Number(req.body.valor || 0);
+    const vencimento = String(req.body.vencimento || '').trim();
+    if (!descricao) return res.status(400).json({ erro: 'Informe a descrição da cobrança.' });
+    if (!(valor > 0)) return res.status(400).json({ erro: 'Informe um valor maior que zero.' });
+    if (!vencimento) return res.status(400).json({ erro: 'Informe o vencimento.' });
+    const alunoId = req.body.aluno_id ? Number(req.body.aluno_id) : null;
+    const clienteNome = String(req.body.cliente_nome || '').trim() || null;
+    if (!alunoId && !clienteNome) return res.status(400).json({ erro: 'Informe um aluno ou o nome do cliente.' });
+    const competencia = String(req.body.competencia || '').trim() || vencimento.slice(0, 7);
+    const r = await pool.query(
+      `INSERT INTO contas_receber
+         (aluno_id, matricula_id, descricao, competencia, valor_original, desconto, valor_final, vencimento, status, cliente_nome)
+       VALUES ($1, NULL, $2, $3, $4, 0, $4, $5, 'pendente', $6) RETURNING *`,
+      [alunoId, descricao, competencia, valor, vencimento, clienteNome]);
+    res.status(201).json(r.rows[0]);
+  } catch (e) { console.error('Erro POST conta avulsa:', e); res.status(500).json({ erro: 'Erro ao lançar a conta a receber.' }); }
+});
+
 app.post('/admin/contas-receber/:id/baixa', autenticar, somenteGestao, async (req, res) => {
   try {
     const forma = String(req.body.forma_pagamento || '').trim();
     if (!forma) return res.status(400).json({ erro: 'Informe a forma de pagamento.' });
 
     const cq = await pool.query(
-      `SELECT cr.*, a.nome AS aluno_nome, t.nome AS turma_nome, t.turno, t.horario, t.semestre,
+      `SELECT cr.*, COALESCE(a.nome, cr.cliente_nome) AS aluno_nome, t.nome AS turma_nome, t.turno, t.horario, t.semestre,
               n.nome AS nivel_nome, c.nome AS curso_nome
        FROM contas_receber cr
-       JOIN alunos a ON a.id = cr.aluno_id
+       LEFT JOIN alunos a ON a.id = cr.aluno_id
        LEFT JOIN matriculas m ON m.id = cr.matricula_id
        LEFT JOIN turmas t ON t.id = m.turma_id
        LEFT JOIN niveis n ON n.id = t.nivel_id
@@ -1181,29 +1290,34 @@ app.post('/admin/contas-receber/:id/baixa', autenticar, somenteGestao, async (re
 
     const dataPg = req.body.data_pagamento
       ? new Date(req.body.data_pagamento + 'T12:00:00') : new Date();
+    const valorFinal = Number(conta.valor_final);
 
-    // Desconto de pontualidade: somente mensalidades pagas até o vencimento
+    // Desconto: usa o informado na baixa; se ausente, sugere a pontualidade (mensalidade paga até o vencimento)
     const ehMensalidade = String(conta.descricao || '').startsWith('Mensalidade');
     const pontual = dataPg.toISOString().slice(0, 10) <= new Date(conta.vencimento).toISOString().slice(0, 10);
     const descCfg = Number(await getConfig('desconto_pontualidade', 0)) || 0;
-    const descP = (ehMensalidade && pontual) ? Math.min(descCfg, Number(conta.valor_final)) : 0;
-    const cobrado = +(Number(conta.valor_final) - descP).toFixed(2);
+    const sugestao = (ehMensalidade && pontual) ? Math.min(descCfg, valorFinal) : 0;
+    let desconto = req.body.desconto !== undefined ? Number(req.body.desconto) || 0 : sugestao;
+    desconto = +Math.max(0, Math.min(desconto, valorFinal)).toFixed(2);
+    const juros = +Math.max(0, Number(req.body.juros || 0)).toFixed(2);
+    let valorRecebido = req.body.valor_recebido !== undefined
+      ? Number(req.body.valor_recebido) || 0
+      : +(valorFinal - desconto + juros).toFixed(2);
+    valorRecebido = +Math.max(0, valorRecebido).toFixed(2);
 
     await pool.query(
       `UPDATE contas_receber SET status='paga', data_pagamento=$1, forma_pagamento=$2,
-              desconto_pontualidade=$3, recebido_por=$4 WHERE id=$5`,
-      [dataPg, forma, descP, req.usuario.id, req.params.id]);
+              desconto_pontualidade=$3, juros=$4, valor_recebido=$5, recebido_por=$6 WHERE id=$7`,
+      [dataPg, forma, desconto, juros, valorRecebido, req.usuario.id, req.params.id]);
 
     res.json({
-      mensagem: descP > 0
-        ? `Pagamento registrado com desconto de pontualidade de R$ ${descP.toFixed(2)}.`
-        : 'Pagamento registrado.',
+      mensagem: 'Pagamento registrado.',
       recibo: {
-        numero: conta.id, aluno_nome: conta.aluno_nome,
+        numero: conta.numero_documento, aluno_nome: conta.aluno_nome,
         referente: conta.descricao + (conta.semestre ? ` · Semestre ${conta.semestre}` : ''),
         turma: conta.turma_nome, turno: conta.turno, horario: conta.horario,
-        valor_base: Number(conta.valor_final), desconto_pontualidade: descP,
-        valor: cobrado, forma, data: dataPg
+        valor_base: valorFinal, desconto, juros, desconto_pontualidade: desconto,
+        valor: valorRecebido, forma, data: dataPg
       }
     });
   } catch (e) { console.error('Erro baixa contas-receber:', e); res.status(500).json({ erro: 'Erro ao registrar o pagamento.' }); }
@@ -1352,10 +1466,10 @@ app.get('/admin/relatorios/financeiro', autenticar, somenteGestao, async (req, r
     const fim = req.query.fim || hoje.toISOString().slice(0, 10);
 
     const recebido = await pool.query(
-      `SELECT COALESCE(SUM(valor_final - desconto_pontualidade),0)::numeric AS total, COUNT(*)::int AS qtd
+      `SELECT COALESCE(SUM(COALESCE(valor_recebido, valor_final - desconto_pontualidade)),0)::numeric AS total, COUNT(*)::int AS qtd
        FROM contas_receber WHERE status='paga' AND data_pagamento::date BETWEEN $1 AND $2`, [ini, fim]);
     const porForma = await pool.query(
-      `SELECT forma_pagamento, COALESCE(SUM(valor_final - desconto_pontualidade),0)::numeric AS total, COUNT(*)::int AS qtd
+      `SELECT forma_pagamento, COALESCE(SUM(COALESCE(valor_recebido, valor_final - desconto_pontualidade)),0)::numeric AS total, COUNT(*)::int AS qtd
        FROM contas_receber WHERE status='paga' AND data_pagamento::date BETWEEN $1 AND $2
        GROUP BY forma_pagamento ORDER BY total DESC`, [ini, fim]);
     const aberto = await pool.query(
@@ -1412,7 +1526,7 @@ app.get('/admin/relatorios/financeiro-detalhado', autenticar, somenteGestao, asy
     const SELECT = `
       SELECT cr.id, cr.descricao, cr.competencia, cr.vencimento, cr.valor_final, cr.desconto_pontualidade,
              cr.data_pagamento, cr.forma_pagamento, cr.status,
-             a.nome AS aluno_nome, pgt.nome AS pagante_nome,
+             COALESCE(a.nome, cr.cliente_nome) AS aluno_nome, pgt.nome AS pagante_nome,
              CASE WHEN cr.descricao LIKE 'Mensalidade%' THEN
                (SELECT COUNT(*) FROM contas_receber x WHERE x.matricula_id = cr.matricula_id
                  AND x.descricao LIKE 'Mensalidade%' AND x.vencimento <= cr.vencimento) END AS parcela_num,
@@ -1420,7 +1534,7 @@ app.get('/admin/relatorios/financeiro-detalhado', autenticar, somenteGestao, asy
                (SELECT COUNT(*) FROM contas_receber x WHERE x.matricula_id = cr.matricula_id
                  AND x.descricao LIKE 'Mensalidade%') END AS parcela_total
       FROM contas_receber cr
-      JOIN alunos a ON a.id = cr.aluno_id
+      LEFT JOIN alunos a ON a.id = cr.aluno_id
       LEFT JOIN LATERAL (
         SELECT r2.nome FROM aluno_responsavel ar2 JOIN responsaveis r2 ON r2.id = ar2.responsavel_id
         WHERE ar2.aluno_id = cr.aluno_id AND ar2.responsavel_financeiro = TRUE ORDER BY ar2.id LIMIT 1
@@ -1456,7 +1570,7 @@ app.get('/admin/relatorios/financeiro-detalhado', autenticar, somenteGestao, asy
 app.get('/admin/usuarios', autenticar, exigirPerfil('master'), async (req, res) => {
   try {
     const r = await pool.query(
-      `SELECT id, nome, cpf, email, whatsapp, data_nascimento, perfil, referencia_id, status, senha_provisoria, criado_em, ultimo_acesso
+      `SELECT id, codigo, nome, cpf, email, whatsapp, data_nascimento, perfil, referencia_id, status, senha_provisoria, criado_em, ultimo_acesso
        FROM usuarios ORDER BY nome`
     );
     res.json(r.rows);
@@ -1555,6 +1669,228 @@ app.delete('/admin/usuarios/:id', autenticar, exigirPerfil('master'), async (req
 // 11. FRONTEND SERVIDO PELO BACKEND (pasta /public no repositório)
 // ============================================================
 const PASTA_PUBLIC = path.join(__dirname, 'public');
+// ============================================================
+// PORTAL DOS PAIS — PRÉ-INSCRIÇÃO ONLINE (públicas, sem autenticação)
+// ============================================================
+app.get('/publico/opcoes', limiterPublico, async (req, res) => {
+  try {
+    const taxa = Number(await getConfig('taxa_matricula', 0)) || 0;
+    const semestre = String(await getConfig('semestre_vigente', '') || '');
+    const t = await pool.query(
+      `SELECT DISTINCT turno FROM turmas WHERE status <> 'encerrada' AND turno IS NOT NULL AND turno <> '' ORDER BY turno`);
+    let turnos = t.rows.map(r => r.turno);
+    if (!turnos.length) turnos = ['Matutino', 'Vespertino'];
+    res.json({ taxa_matricula: taxa, semestre, turnos });
+  } catch (e) { console.error('Erro /publico/opcoes:', e); res.status(500).json({ erro: 'Erro ao carregar as opções de inscrição.' }); }
+});
+
+app.post('/publico/pre-inscricao', limiterPublico, async (req, res) => {
+  try {
+    const alunoNome = String(req.body.aluno_nome || '').trim();
+    const nasc = String(req.body.aluno_data_nascimento || '').trim();
+    const turno = String(req.body.turno || '').trim();
+    const respNome = String(req.body.responsavel_nome || '').trim();
+    const respZap = String(req.body.responsavel_whatsapp || '').trim();
+    const respEmail = String(req.body.responsavel_email || '').trim();
+    const respCpf = String(req.body.responsavel_cpf || '').trim();
+    const alunoCpf = String(req.body.aluno_cpf || '').trim();
+    const parentesco = String(req.body.parentesco || '').trim();
+    const aceite = req.body.aceite_termos === true || req.body.aceite_termos === 'true';
+
+    if (!alunoNome) return res.status(400).json({ erro: 'Informe o nome do aluno.' });
+    if (!nasc) return res.status(400).json({ erro: 'Informe a data de nascimento do aluno.' });
+    if (!turno) return res.status(400).json({ erro: 'Escolha o turno.' });
+    if (!respNome) return res.status(400).json({ erro: 'Informe o nome do responsável.' });
+    if (!respZap && !respEmail) return res.status(400).json({ erro: 'Informe ao menos um contato (WhatsApp ou e-mail).' });
+    if (!aceite) return res.status(400).json({ erro: 'É necessário aceitar os Termos e a Política de Privacidade.' });
+
+    const dn = new Date(nasc + 'T12:00:00');
+    if (isNaN(dn.getTime())) return res.status(400).json({ erro: 'Data de nascimento inválida.' });
+    const hoje = new Date();
+    let idade = hoje.getFullYear() - dn.getFullYear();
+    const dm = hoje.getMonth() - dn.getMonth();
+    if (dm < 0 || (dm === 0 && hoje.getDate() < dn.getDate())) idade--;
+    if (idade < 0 || idade > 120) return res.status(400).json({ erro: 'Data de nascimento inválida.' });
+    const programa = idade < 10 ? 'kids' : 'basico';
+
+    const taxa = Number(await getConfig('taxa_matricula', 0)) || 0;
+
+    const r = await pool.query(
+      `INSERT INTO pre_inscricoes
+         (aluno_nome, aluno_data_nascimento, aluno_cpf, programa, turno,
+          responsavel_nome, responsavel_cpf, responsavel_whatsapp, responsavel_email, parentesco, valor_taxa)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING id`,
+      [alunoNome.toUpperCase(), nasc, alunoCpf || null, programa, turno,
+       respNome.toUpperCase(), respCpf || null, respZap || null, respEmail || null, parentesco || null, taxa]);
+    const id = r.rows[0].id;
+    const protocolo = `PRE-${hoje.getFullYear()}-${String(id).padStart(6, '0')}`;
+    await pool.query(`UPDATE pre_inscricoes SET protocolo = $1 WHERE id = $2`, [protocolo, id]);
+
+    res.status(201).json({
+      id, protocolo, programa, programa_label: programa === 'kids' ? 'KIDS' : 'Básico',
+      turno, idade, valor_taxa: taxa,
+      mensagem: 'Pré-inscrição registrada. O pagamento da taxa via PIX será habilitado na próxima etapa.'
+    });
+  } catch (e) { console.error('Erro /publico/pre-inscricao:', e); res.status(500).json({ erro: 'Erro ao registrar a pré-inscrição.' }); }
+});
+
+app.get('/admin/pre-inscricoes', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const cond = []; const params = [];
+    if (req.query.status) { params.push(req.query.status); cond.push(`status = $${params.length}`); }
+    const where = cond.length ? `WHERE ${cond.join(' AND ')}` : '';
+    const r = await pool.query(`SELECT * FROM pre_inscricoes ${where} ORDER BY criado_em DESC`, params);
+    res.json(r.rows);
+  } catch (e) { console.error('Erro GET pre-inscricoes:', e); res.status(500).json({ erro: 'Erro ao listar pré-inscrições.' }); }
+});
+
+// ============================================================
+// INTEGRAÇÃO PIX — BANCO INTER (Portal dos Pais)
+// ============================================================
+const INTER = {
+  base: process.env.INTER_BASE_URL || 'https://cdpj.partners.bancointer.com.br',
+  clientId: process.env.INTER_CLIENT_ID || '',
+  clientSecret: process.env.INTER_CLIENT_SECRET || '',
+  cert: (process.env.INTER_CERT || '').replace(/\\n/g, '\n'),
+  key: (process.env.INTER_KEY || '').replace(/\\n/g, '\n'),
+  chave: process.env.INTER_PIX_KEY || '',
+  conta: process.env.INTER_CONTA_CORRENTE || ''
+};
+const INTER_SCOPES = 'cob.write cob.read pix.read webhook.write webhook.read';
+function interConfigurado() {
+  return !!(INTER.clientId && INTER.clientSecret && INTER.cert && INTER.key && INTER.chave);
+}
+let interAgent = null;
+function getInterAgent() {
+  if (!interAgent) interAgent = new https.Agent({ cert: INTER.cert, key: INTER.key, keepAlive: true });
+  return interAgent;
+}
+function interHttp(method, pathname, { token, body, form } = {}) {
+  return new Promise((resolve, reject) => {
+    const url = new URL(INTER.base + pathname);
+    const payload = form ? new URLSearchParams(form).toString() : (body ? JSON.stringify(body) : null);
+    const headers = {};
+    if (form) headers['Content-Type'] = 'application/x-www-form-urlencoded';
+    else if (body) headers['Content-Type'] = 'application/json';
+    if (token) headers['Authorization'] = 'Bearer ' + token;
+    if (INTER.conta) headers['x-conta-corrente'] = INTER.conta;
+    if (payload) headers['Content-Length'] = Buffer.byteLength(payload);
+    const r = https.request({ hostname: url.hostname, path: url.pathname + url.search, method, headers, agent: getInterAgent() }, (resp) => {
+      let data = '';
+      resp.on('data', c => data += c);
+      resp.on('end', () => {
+        let parsed; try { parsed = data ? JSON.parse(data) : {}; } catch { parsed = { raw: data }; }
+        if (resp.statusCode >= 200 && resp.statusCode < 300) resolve(parsed);
+        else reject(new Error(`Inter ${resp.statusCode}: ${JSON.stringify(parsed)}`));
+      });
+    });
+    r.on('error', reject);
+    if (payload) r.write(payload);
+    r.end();
+  });
+}
+let interTokenCache = { token: null, exp: 0 };
+async function interToken() {
+  const now = Date.now();
+  if (interTokenCache.token && interTokenCache.exp > now + 30000) return interTokenCache.token;
+  const r = await interHttp('POST', '/oauth/v2/token', { form: {
+    client_id: INTER.clientId, client_secret: INTER.clientSecret,
+    grant_type: 'client_credentials', scope: INTER_SCOPES
+  }});
+  interTokenCache = { token: r.access_token, exp: now + (Number(r.expires_in || 3600) * 1000) };
+  return r.access_token;
+}
+async function interCriarCob(txid, valor, solicitacao) {
+  const token = await interToken();
+  return interHttp('PUT', `/pix/v2/cob/${txid}`, { token, body: {
+    calendario: { expiracao: 3600 },
+    valor: { original: Number(valor).toFixed(2) },
+    chave: INTER.chave,
+    solicitacaoPagador: String(solicitacao || '').slice(0, 140)
+  }});
+}
+async function interConsultarCob(txid) {
+  const token = await interToken();
+  return interHttp('GET', `/pix/v2/cob/${txid}`, { token });
+}
+async function marcarPreInscricaoPaga(preId) {
+  const r = await pool.query(
+    `UPDATE pre_inscricoes SET status='pago', pago_em=NOW() WHERE id=$1 AND status='aguardando_pagamento' RETURNING id`,
+    [preId]);
+  return r.rows.length > 0;
+}
+
+// Gera (ou reaproveita) a cobrança PIX da taxa de uma pré-inscrição
+app.post('/publico/pre-inscricao/:id/pix', limiterPublico, async (req, res) => {
+  try {
+    if (!interConfigurado()) return res.status(503).json({ erro: 'Pagamento via PIX ainda não está configurado.' });
+    const q = await pool.query(`SELECT * FROM pre_inscricoes WHERE id = $1`, [req.params.id]);
+    if (!q.rows.length) return res.status(404).json({ erro: 'Pré-inscrição não encontrada.' });
+    const pre = q.rows[0];
+    if (['pago', 'efetivada'].includes(pre.status)) return res.status(409).json({ erro: 'Esta inscrição já foi paga.' });
+    const valor = Number(pre.valor_taxa);
+    if (!(valor > 0)) return res.status(400).json({ erro: 'Valor da taxa inválido para cobrança.' });
+
+    let txid = pre.mp_payment_id;
+    let copiaCola = pre.pix_copia_cola;
+    if (!txid || !copiaCola) {
+      txid = crypto.randomBytes(16).toString('hex'); // 32 caracteres alfanuméricos
+      const cob = await interCriarCob(txid, valor, `Taxa de matricula CEMIC ${pre.protocolo || ''}`.trim());
+      copiaCola = cob.pixCopiaECola;
+      await pool.query(`UPDATE pre_inscricoes SET mp_payment_id=$1, pix_copia_cola=$2 WHERE id=$3`, [txid, copiaCola, pre.id]);
+    }
+    res.json({ txid, copia_cola: copiaCola, valor, expiracao: 3600 });
+  } catch (e) { console.error('Erro gerar PIX Inter:', e); res.status(500).json({ erro: 'Não foi possível gerar o PIX agora. Tente novamente.' }); }
+});
+
+// Consulta de status (polling) — confirma na API do Inter antes de marcar pago
+app.get('/publico/pre-inscricao/:id/status', limiterPublico, async (req, res) => {
+  try {
+    const q = await pool.query(`SELECT id, protocolo, status, mp_payment_id FROM pre_inscricoes WHERE id = $1`, [req.params.id]);
+    if (!q.rows.length) return res.status(404).json({ erro: 'Pré-inscrição não encontrada.' });
+    const pre = q.rows[0];
+    if (['pago', 'efetivada'].includes(pre.status)) return res.json({ status: 'pago', protocolo: pre.protocolo });
+    if (interConfigurado() && pre.mp_payment_id) {
+      try {
+        const cob = await interConsultarCob(pre.mp_payment_id);
+        if (cob && cob.status === 'CONCLUIDA') { await marcarPreInscricaoPaga(pre.id); return res.json({ status: 'pago', protocolo: pre.protocolo }); }
+      } catch (e) { console.error('Status: erro consultar cob:', e.message); }
+    }
+    res.json({ status: pre.status });
+  } catch (e) { console.error('Erro status pré-inscrição:', e); res.status(500).json({ erro: 'Erro ao consultar o status.' }); }
+});
+
+// Webhook do Inter (sem rate limit; responde 200 rápido e confirma por consulta)
+app.post('/publico/pix/webhook', async (req, res) => {
+  try {
+    const corpo = req.body || {};
+    const lista = Array.isArray(corpo) ? corpo : (Array.isArray(corpo.pix) ? corpo.pix : []);
+    for (const p of lista) {
+      const txid = p && p.txid;
+      if (!txid) continue;
+      const q = await pool.query(`SELECT id, status FROM pre_inscricoes WHERE mp_payment_id = $1`, [txid]);
+      if (!q.rows.length || ['pago', 'efetivada'].includes(q.rows[0].status)) continue;
+      try {
+        const cob = await interConsultarCob(txid);
+        if (cob && cob.status === 'CONCLUIDA') await marcarPreInscricaoPaga(q.rows[0].id);
+      } catch (e) { console.error('Webhook: erro consultar cob:', e.message); }
+    }
+  } catch (e) { console.error('Erro webhook Inter:', e); }
+  res.status(200).json({ ok: true });
+});
+
+// Registro do webhook no Inter (operação única, feita pelo master)
+app.post('/admin/inter/webhook', autenticar, exigirPerfil('master'), async (req, res) => {
+  try {
+    if (!interConfigurado()) return res.status(503).json({ erro: 'Inter não configurado.' });
+    const url = String(req.body.url || '').trim();
+    if (!/^https:\/\//.test(url)) return res.status(400).json({ erro: 'Informe a URL HTTPS do webhook.' });
+    const token = await interToken();
+    await interHttp('PUT', `/pix/v2/webhook/${encodeURIComponent(INTER.chave)}`, { token, body: { webhookUrl: url } });
+    res.json({ mensagem: 'Webhook registrado no Inter.', url });
+  } catch (e) { console.error('Erro registrar webhook Inter:', e); res.status(500).json({ erro: 'Erro ao registrar webhook: ' + e.message }); }
+});
+
 app.use(express.static(PASTA_PUBLIC));
 app.get('/', (req, res) => {
   const arquivo = path.join(PASTA_PUBLIC, 'index.html');
@@ -1568,7 +1904,7 @@ app.get('/', (req, res) => {
 app.get('/health', async (req, res) => {
   try {
     await pool.query('SELECT 1');
-    res.json({ status: 'ok', sistema: 'CEMIC Gestão', versao: '3.8 (Fases 1 a 3 + Relatórios)' });
+    res.json({ status: 'ok', sistema: 'CEMIC Gestão', versao: '3.11 (Portal dos Pais + Pix Inter)' });
   } catch {
     res.status(500).json({ status: 'erro', detalhe: 'Banco de dados inacessível.' });
   }
@@ -1576,5 +1912,5 @@ app.get('/health', async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 initDB()
-  .then(() => app.listen(PORT, () => console.log(`CEMIC Gestão — backend v3.8 rodando na porta ${PORT}`)))
+  .then(() => app.listen(PORT, () => console.log(`CEMIC Gestão — backend v3.11 rodando na porta ${PORT}`)))
   .catch(e => { console.error('Falha ao inicializar o banco:', e); process.exit(1); });
