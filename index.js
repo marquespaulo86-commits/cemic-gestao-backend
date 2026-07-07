@@ -1,2042 +1,1963 @@
-// ═══════════════════════════════════════════════════════
-// LENGLISH — Backend v2.0
-// Node.js + Express + PostgreSQL + Resend (OTP)
-// Deploy: Railway (lenglish-server)
-// ═══════════════════════════════════════════════════════
+// ============================================================
+// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v3.12 (… + Portal dos Pais + Pix Inter)
+// Banco + Autenticação com perfis + Configurações + CRUDs
+// Stack: Node.js/Express + PostgreSQL (Railway)
+// ============================================================
 
-const express    = require('express');
-const { Pool }   = require('pg');
-const bcrypt     = require('bcryptjs');
-const jwt        = require('jsonwebtoken');
-const cors       = require('cors');
-const helmet     = require('helmet');
-const rateLimit  = require('express-rate-limit');
-const { Resend } = require('resend');
+const express = require('express');
+const path = require('path');
+const fs = require('fs');
+const https = require('https');
+const crypto = require('crypto');
+const { Pool } = require('pg');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const cors = require('cors');
+const rateLimit = require('express-rate-limit');
 
-const app    = express();
+const app = express();
 app.set('trust proxy', 1);
-const PORT   = process.env.PORT || 3000;
-const resend = new Resend(process.env.RESEND_API_KEY);
-
-// ── DB ───────────────────────────────────────────────
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
-  connectionTimeoutMillis: 10000,
-  idleTimeoutMillis: 30000,
-  max: 10,
-});
-
-// ── MIDDLEWARE ───────────────────────────────────────
-app.use(helmet());
-app.use(cors({
-  origin: function(origin, callback) {
-    // Permitir requisições sem origin (Postman, curl, etc.)
-    if (!origin) return callback(null, true);
-    const allowed = [
-      'https://lenglish.com.br',
-      'https://www.lenglish.com.br',
-      'http://localhost:3000',
-      'http://localhost:5500',
-    ];
-    if (allowed.includes(origin) || /\.netlify\.app$/.test(origin)) {
-      return callback(null, true);
-    }
-    // Permitir qualquer subpath do domínio lenglish
-    if (/^https?:\/\/(www\.)?lenglish\.com\.br/.test(origin)) {
-      return callback(null, true);
-    }
-    return callback(null, false);
-  },
-  credentials: true,
-}));
+app.use(cors());
 app.use(express.json({ limit: '2mb' }));
 
-app.use(rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 500,
-  message: { error: 'Muitas requisições. Tente novamente em 15 minutos.' },
-}));
+// ---------- Variáveis de ambiente obrigatórias ----------
+const { DATABASE_URL, JWT_SECRET } = process.env;
+if (!DATABASE_URL) { console.error('ERRO: DATABASE_URL não definida.'); process.exit(1); }
+if (!JWT_SECRET) { console.error('ERRO: JWT_SECRET não definida.'); process.exit(1); }
 
-const loginLimiter = rateLimit({
+const MASTER_CPF = process.env.MASTER_CPF || '00000000000';
+const MASTER_SENHA = process.env.MASTER_SENHA || null; // se ausente, master só é criado se já houver senha definida
+
+const pool = new Pool({
+  connectionString: DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
+});
+
+// ============================================================
+// 1. CRIAÇÃO DO BANCO (idempotente — CREATE IF NOT EXISTS)
+// ============================================================
+async function initDB() {
+  const ddl = `
+  -- ---------- Configurações e autenticação ----------
+  CREATE TABLE IF NOT EXISTS configuracoes (
+    id SERIAL PRIMARY KEY,
+    chave TEXT UNIQUE NOT NULL,
+    valor JSONB NOT NULL,
+    descricao TEXT,
+    atualizado_em TIMESTAMP DEFAULT NOW(),
+    atualizado_por INTEGER
+  );
+
+  CREATE TABLE IF NOT EXISTS usuarios (
+    id SERIAL PRIMARY KEY,
+    nome TEXT NOT NULL,
+    cpf TEXT UNIQUE NOT NULL,
+    email TEXT,
+    whatsapp TEXT,
+    senha_hash TEXT NOT NULL,
+    data_nascimento DATE,
+    perfil TEXT NOT NULL CHECK (perfil IN ('master','secretaria','professor','aluno','responsavel')),
+    referencia_id INTEGER,
+    status TEXT NOT NULL DEFAULT 'ativo' CHECK (status IN ('ativo','inativo')),
+    senha_provisoria BOOLEAN DEFAULT FALSE,
+    criado_em TIMESTAMP DEFAULT NOW(),
+    ultimo_acesso TIMESTAMP
+  );
+
+  -- ---------- Pessoas ----------
+  CREATE TABLE IF NOT EXISTS alunos (
+    id SERIAL PRIMARY KEY,
+    nome TEXT NOT NULL,
+    data_nascimento DATE,
+    email TEXT,
+    cpf TEXT UNIQUE,
+    whatsapp TEXT,
+    status TEXT NOT NULL DEFAULT 'ativo' CHECK (status IN ('ativo','inativo')),
+    modalidade TEXT NOT NULL DEFAULT 'pagante' CHECK (modalidade IN ('pagante','pagante_parcial','bolsista')),
+    desconto_percentual NUMERIC(5,2) NOT NULL DEFAULT 0,
+    data_cadastro DATE DEFAULT CURRENT_DATE,
+    observacoes TEXT
+  );
+
+  CREATE TABLE IF NOT EXISTS responsaveis (
+    id SERIAL PRIMARY KEY,
+    nome TEXT NOT NULL,
+    cpf TEXT UNIQUE NOT NULL,
+    email TEXT,
+    whatsapp TEXT
+  );
+
+  CREATE TABLE IF NOT EXISTS aluno_responsavel (
+    id SERIAL PRIMARY KEY,
+    aluno_id INTEGER NOT NULL REFERENCES alunos(id) ON DELETE CASCADE,
+    responsavel_id INTEGER NOT NULL REFERENCES responsaveis(id) ON DELETE CASCADE,
+    parentesco TEXT,
+    responsavel_financeiro BOOLEAN DEFAULT FALSE,
+    UNIQUE(aluno_id, responsavel_id)
+  );
+
+  CREATE TABLE IF NOT EXISTS professores (
+    id SERIAL PRIMARY KEY,
+    nome TEXT NOT NULL,
+    email TEXT,
+    formacao TEXT,
+    whatsapp TEXT,
+    data_nascimento DATE,
+    status TEXT NOT NULL DEFAULT 'ativo' CHECK (status IN ('ativo','inativo'))
+  );
+
+  -- ---------- Acadêmico ----------
+  CREATE TABLE IF NOT EXISTS cursos (
+    id SERIAL PRIMARY KEY,
+    nome TEXT UNIQUE NOT NULL,
+    status TEXT NOT NULL DEFAULT 'ativo' CHECK (status IN ('ativo','inativo'))
+  );
+
+  CREATE TABLE IF NOT EXISTS niveis (
+    id SERIAL PRIMARY KEY,
+    curso_id INTEGER NOT NULL REFERENCES cursos(id),
+    nome TEXT NOT NULL,
+    ordem INTEGER NOT NULL DEFAULT 1,
+    carga_horaria INTEGER,
+    UNIQUE(curso_id, nome)
+  );
+
+  CREATE TABLE IF NOT EXISTS turmas (
+    id SERIAL PRIMARY KEY,
+    nivel_id INTEGER NOT NULL REFERENCES niveis(id),
+    nome TEXT NOT NULL,
+    semestre TEXT NOT NULL,
+    turno TEXT,
+    horario TEXT,
+    professor_id INTEGER REFERENCES professores(id),
+    capacidade INTEGER NOT NULL DEFAULT 15,
+    status TEXT NOT NULL DEFAULT 'em_formacao' CHECK (status IN ('em_formacao','em_andamento','encerrada')),
+    UNIQUE(nome, semestre)
+  );
+
+  CREATE TABLE IF NOT EXISTS matriculas (
+    id SERIAL PRIMARY KEY,
+    aluno_id INTEGER NOT NULL REFERENCES alunos(id),
+    turma_id INTEGER NOT NULL REFERENCES turmas(id),
+    data_matricula DATE DEFAULT CURRENT_DATE,
+    valor_mensalidade NUMERIC(10,2) NOT NULL DEFAULT 0,
+    desconto_aplicado NUMERIC(5,2) NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'ativa' CHECK (status IN ('ativa','trancada','cancelada','concluida')),
+    resultado TEXT CHECK (resultado IN ('aprovado','reprovado')),
+    media_final NUMERIC(5,2),
+    frequencia_final NUMERIC(5,2),
+    UNIQUE(aluno_id, turma_id)
+  );
+
+  CREATE TABLE IF NOT EXISTS avaliacoes (
+    id SERIAL PRIMARY KEY,
+    turma_id INTEGER NOT NULL REFERENCES turmas(id) ON DELETE CASCADE,
+    nome TEXT NOT NULL,
+    peso NUMERIC(5,2) NOT NULL DEFAULT 1,
+    data DATE
+  );
+
+  CREATE TABLE IF NOT EXISTS notas (
+    id SERIAL PRIMARY KEY,
+    avaliacao_id INTEGER NOT NULL REFERENCES avaliacoes(id) ON DELETE CASCADE,
+    matricula_id INTEGER NOT NULL REFERENCES matriculas(id) ON DELETE CASCADE,
+    nota NUMERIC(5,2) NOT NULL,
+    lancada_por INTEGER REFERENCES usuarios(id),
+    lancada_em TIMESTAMP DEFAULT NOW(),
+    UNIQUE(avaliacao_id, matricula_id)
+  );
+
+  CREATE TABLE IF NOT EXISTS aulas (
+    id SERIAL PRIMARY KEY,
+    turma_id INTEGER NOT NULL REFERENCES turmas(id) ON DELETE CASCADE,
+    data DATE NOT NULL,
+    conteudo TEXT
+  );
+
+  CREATE TABLE IF NOT EXISTS frequencias (
+    id SERIAL PRIMARY KEY,
+    aula_id INTEGER NOT NULL REFERENCES aulas(id) ON DELETE CASCADE,
+    matricula_id INTEGER NOT NULL REFERENCES matriculas(id) ON DELETE CASCADE,
+    presente BOOLEAN NOT NULL DEFAULT TRUE,
+    justificativa TEXT,
+    UNIQUE(aula_id, matricula_id)
+  );
+
+  -- ---------- Financeiro ----------
+  CREATE TABLE IF NOT EXISTS fornecedores (
+    id SERIAL PRIMARY KEY,
+    nome TEXT NOT NULL,
+    cpf_cnpj TEXT,
+    email TEXT,
+    whatsapp TEXT,
+    categoria TEXT,
+    observacoes TEXT,
+    status TEXT NOT NULL DEFAULT 'ativo' CHECK (status IN ('ativo','inativo'))
+  );
+
+  CREATE TABLE IF NOT EXISTS contas_pagar (
+    id SERIAL PRIMARY KEY,
+    fornecedor_id INTEGER REFERENCES fornecedores(id),
+    descricao TEXT NOT NULL,
+    categoria TEXT,
+    valor NUMERIC(10,2) NOT NULL,
+    vencimento DATE NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pendente' CHECK (status IN ('pendente','paga','atrasada','cancelada')),
+    data_pagamento DATE,
+    forma_pagamento TEXT,
+    comprovante_url TEXT,
+    criado_por INTEGER REFERENCES usuarios(id),
+    criado_em TIMESTAMP DEFAULT NOW()
+  );
+
+  CREATE TABLE IF NOT EXISTS contas_receber (
+    id SERIAL PRIMARY KEY,
+    aluno_id INTEGER NOT NULL REFERENCES alunos(id),
+    matricula_id INTEGER REFERENCES matriculas(id),
+    descricao TEXT NOT NULL,
+    competencia TEXT,
+    valor_original NUMERIC(10,2) NOT NULL,
+    desconto NUMERIC(10,2) NOT NULL DEFAULT 0,
+    valor_final NUMERIC(10,2) NOT NULL,
+    vencimento DATE NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pendente' CHECK (status IN ('pendente','paga','atrasada','cancelada')),
+    data_pagamento DATE,
+    forma_pagamento TEXT,
+    recebido_por INTEGER REFERENCES usuarios(id),
+    criado_em TIMESTAMP DEFAULT NOW()
+  );
+
+  -- ---------- Comunicação ----------
+  CREATE TABLE IF NOT EXISTS avisos (
+    id SERIAL PRIMARY KEY,
+    autor_id INTEGER REFERENCES usuarios(id),
+    escopo TEXT NOT NULL DEFAULT 'geral' CHECK (escopo IN ('geral','turma','aluno')),
+    turma_id INTEGER REFERENCES turmas(id) ON DELETE CASCADE,
+    aluno_id INTEGER REFERENCES alunos(id) ON DELETE CASCADE,
+    titulo TEXT NOT NULL,
+    mensagem TEXT NOT NULL,
+    criado_em TIMESTAMP DEFAULT NOW()
+  );
+  `;
+  await pool.query(ddl);
+  // Migrações (idempotentes): desconto em R$ e pontualidade
+  await pool.query(`ALTER TABLE alunos ADD COLUMN IF NOT EXISTS desconto_valor NUMERIC(10,2) NOT NULL DEFAULT 0`);
+  await pool.query(`ALTER TABLE matriculas ALTER COLUMN desconto_aplicado TYPE NUMERIC(10,2)`);
+  await pool.query(`ALTER TABLE contas_receber ADD COLUMN IF NOT EXISTS desconto_pontualidade NUMERIC(10,2) NOT NULL DEFAULT 0`);
+
+  // ---------- Migrações — Módulo Financeiro v3.9 ----------
+  // Código de identificação por entidade (determinístico a partir do id) + backfill dos existentes
+  await pool.query(`ALTER TABLE alunos       ADD COLUMN IF NOT EXISTS codigo TEXT`);
+  await pool.query(`ALTER TABLE professores  ADD COLUMN IF NOT EXISTS codigo TEXT`);
+  await pool.query(`ALTER TABLE usuarios     ADD COLUMN IF NOT EXISTS codigo TEXT`);
+  await pool.query(`ALTER TABLE fornecedores ADD COLUMN IF NOT EXISTS codigo TEXT`);
+  await pool.query(`UPDATE alunos       SET codigo = 'ALU-' || lpad(id::text, 4, '0') WHERE codigo IS NULL`);
+  await pool.query(`UPDATE professores  SET codigo = 'PRF-' || lpad(id::text, 4, '0') WHERE codigo IS NULL`);
+  await pool.query(`UPDATE usuarios     SET codigo = 'USR-' || lpad(id::text, 4, '0') WHERE codigo IS NULL`);
+  await pool.query(`UPDATE fornecedores SET codigo = 'FRN-' || lpad(id::text, 4, '0') WHERE codigo IS NULL`);
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_alunos_codigo       ON alunos(codigo)`);
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_professores_codigo  ON professores(codigo)`);
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_usuarios_codigo     ON usuarios(codigo)`);
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_fornecedores_codigo ON fornecedores(codigo)`);
+
+  // Contas a Receber: documento, juros, valor recebido e cliente livre; aluno_id passa a ser opcional (avulsa)
+  await pool.query(`ALTER TABLE contas_receber ADD COLUMN IF NOT EXISTS numero_documento TEXT`);
+  await pool.query(`ALTER TABLE contas_receber ADD COLUMN IF NOT EXISTS juros NUMERIC(10,2) NOT NULL DEFAULT 0`);
+  await pool.query(`ALTER TABLE contas_receber ADD COLUMN IF NOT EXISTS valor_recebido NUMERIC(10,2)`);
+  await pool.query(`ALTER TABLE contas_receber ADD COLUMN IF NOT EXISTS cliente_nome TEXT`);
+  await pool.query(`ALTER TABLE contas_receber ALTER COLUMN aluno_id DROP NOT NULL`);
+  await pool.query(`UPDATE contas_receber SET numero_documento = 'CR-' || to_char(COALESCE(criado_em, NOW()), 'YYYY') || '-' || lpad(id::text, 6, '0') WHERE numero_documento IS NULL`);
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_contas_receber_documento ON contas_receber(numero_documento)`);
+
+  // Geração automática de código/documento em novas inserções.
+  // AFTER INSERT + UPDATE: o NEW.id é garantido nesse ponto, sem depender da ordem
+  // de avaliação de DEFAULT em BEFORE INSERT — abordagem à prova de falhas.
+  await pool.query(`CREATE OR REPLACE FUNCTION gera_codigo() RETURNS trigger AS $func$
+    BEGIN
+      IF NEW.codigo IS NULL THEN
+        EXECUTE format('UPDATE %I SET codigo = $1 WHERE id = $2', TG_TABLE_NAME)
+          USING TG_ARGV[0] || lpad(NEW.id::text, 4, '0'), NEW.id;
+      END IF;
+      RETURN NULL;
+    END; $func$ LANGUAGE plpgsql`);
+  await pool.query(`CREATE OR REPLACE FUNCTION gera_documento_cr() RETURNS trigger AS $func$
+    BEGIN
+      IF NEW.numero_documento IS NULL THEN
+        UPDATE contas_receber
+          SET numero_documento = 'CR-' || to_char(COALESCE(NEW.criado_em, NOW()), 'YYYY') || '-' || lpad(NEW.id::text, 6, '0')
+          WHERE id = NEW.id;
+      END IF;
+      RETURN NULL;
+    END; $func$ LANGUAGE plpgsql`);
+  for (const [tab, pref] of [['alunos', 'ALU-'], ['professores', 'PRF-'], ['usuarios', 'USR-'], ['fornecedores', 'FRN-']]) {
+    await pool.query(`DROP TRIGGER IF EXISTS trg_codigo_${tab} ON ${tab}`);
+    await pool.query(`CREATE TRIGGER trg_codigo_${tab} AFTER INSERT ON ${tab} FOR EACH ROW EXECUTE FUNCTION gera_codigo('${pref}')`);
+  }
+  await pool.query(`DROP TRIGGER IF EXISTS trg_documento_cr ON contas_receber`);
+  await pool.query(`CREATE TRIGGER trg_documento_cr AFTER INSERT ON contas_receber FOR EACH ROW EXECUTE FUNCTION gera_documento_cr()`);
+
+  // ---------- Portal dos Pais — Pré-inscrições (v3.10) ----------
+  await pool.query(`CREATE TABLE IF NOT EXISTS pre_inscricoes (
+    id SERIAL PRIMARY KEY,
+    protocolo TEXT,
+    aluno_nome TEXT NOT NULL,
+    aluno_data_nascimento DATE,
+    aluno_cpf TEXT,
+    programa TEXT,
+    turno TEXT,
+    responsavel_nome TEXT NOT NULL,
+    responsavel_cpf TEXT,
+    responsavel_whatsapp TEXT,
+    responsavel_email TEXT,
+    parentesco TEXT,
+    valor_taxa NUMERIC(10,2) NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'aguardando_pagamento'
+      CHECK (status IN ('aguardando_pagamento','pago','cancelada','efetivada')),
+    mp_payment_id TEXT,
+    pix_qr TEXT,
+    pix_copia_cola TEXT,
+    aluno_id INTEGER REFERENCES alunos(id),
+    matricula_id INTEGER REFERENCES matriculas(id),
+    observacoes TEXT,
+    criado_em TIMESTAMPTZ DEFAULT NOW(),
+    pago_em TIMESTAMPTZ
+  )`);
+  await pool.query(`ALTER TABLE pre_inscricoes ADD COLUMN IF NOT EXISTS semestre TEXT`);
+  await pool.query(`ALTER TABLE pre_inscricoes ADD COLUMN IF NOT EXISTS tipo TEXT NOT NULL DEFAULT 'pre_inscricao'`);
+  await seedConfiguracoes();
+  await seedCursosNiveis();
+  await seedMaster();
+  console.log('Banco verificado/criado com sucesso.');
+}
+
+// ---------- Seeds de configurações padrão ----------
+async function seedConfiguracoes() {
+  const padroes = [
+    ['semestre_vigente', JSON.stringify('2026.2'), 'Semestre letivo vigente (formato AAAA.S)'],
+    ['capacidade_padrao_turma', JSON.stringify(15), 'Capacidade padrão de alunos por turma (ajustável por turma)'],
+    ['media_aprovacao', JSON.stringify(7), 'Média mínima para aprovação (0 a 10)'],
+    ['frequencia_minima', JSON.stringify(75), 'Frequência mínima para aprovação (%)'],
+    ['parcelas_semestre', JSON.stringify(6), 'Quantidade de mensalidades geradas por matrícula no semestre'],
+    ['dia_vencimento', JSON.stringify(10), 'Dia padrão de vencimento das mensalidades'],
+    ['taxa_matricula', JSON.stringify(0), 'Valor padrão da taxa de matrícula (R$) — ajustável no ato, paga sempre no ato'],
+    ['valor_plataforma', JSON.stringify(25), 'Valor da Taxa da Plataforma Acadêmica (R$) — lançada 1x por semestre'],
+    ['desconto_pontualidade', JSON.stringify(0), 'Desconto de pontualidade (R$) abatido da mensalidade paga até o vencimento'],
+    ['multa_atraso', JSON.stringify({ ativa: false, multa_percentual: 2, juros_dia_percentual: 0.033 }), 'Multa e juros por atraso (aplicados quando ativa = true)'],
+    ['descontos_disponiveis', JSON.stringify([25, 50, 100]), 'Percentuais de desconto disponíveis para Pagante Parcial (bolsista = 100)'],
+    ['mensalidades', JSON.stringify({ 'Inglês': 0, 'Espanhol': 0 }), 'Valor da mensalidade integral por curso (R$) — definir antes das matrículas'],
+    ['formas_pagamento', JSON.stringify(['PIX', 'DINHEIRO', 'CARTÃO DE CRÉDITO', 'CARTÃO DE DÉBITO', 'TRANSFERÊNCIA', 'MISTO']), 'Formas de pagamento aceitas'],
+    ['categorias_contas_pagar', JSON.stringify(['Aluguel', 'Energia', 'Água/Internet', 'Salários', 'Material Didático', 'Manutenção', 'Outros']), 'Categorias de contas a pagar'],
+    ['categorias_contas_receber', JSON.stringify(['Mensalidade', 'Matrícula', 'Material', 'Evento', 'Outros']), 'Categorias de contas a receber'],
+    ['dados_instituicao', JSON.stringify({
+      nome: 'CEMIC — Centro Maranhense de Idiomas e Culturas',
+      cnpj: '', endereco: 'São Luís - MA', telefone: '', email: '', logo_url: ''
+    }), 'Dados institucionais usados em documentos e PDFs'],
+    ['modelo_boletim', JSON.stringify({ titulo: 'Boletim de Desempenho', exibir_frequencia: true, exibir_observacoes: true, rodape: 'Documento emitido pelo CEMIC.' }), 'Modelo do boletim do aluno'],
+    ['modelo_historico', JSON.stringify({ titulo: 'Histórico Escolar', exibir_carga_horaria: true, rodape: 'Documento emitido pelo CEMIC.' }), 'Modelo do histórico do aluno']
+  ];
+  for (const [chave, valor, descricao] of padroes) {
+    await pool.query(
+      `INSERT INTO configuracoes (chave, valor, descricao) VALUES ($1, $2, $3) ON CONFLICT (chave) DO NOTHING`,
+      [chave, valor, descricao]
+    );
+  }
+}
+
+// ---------- Seeds de cursos e níveis ----------
+async function seedCursosNiveis() {
+  const cursos = ['Inglês', 'Espanhol'];
+  const niveis = ['Kids', 'Basic', 'Pre-Intermediate', 'Intermediate', 'Advanced'];
+  for (const nomeCurso of cursos) {
+    const c = await pool.query(
+      `INSERT INTO cursos (nome) VALUES ($1) ON CONFLICT (nome) DO UPDATE SET nome = EXCLUDED.nome RETURNING id`,
+      [nomeCurso]
+    );
+    const cursoId = c.rows[0].id;
+    for (let i = 0; i < niveis.length; i++) {
+      await pool.query(
+        `INSERT INTO niveis (curso_id, nome, ordem) VALUES ($1, $2, $3) ON CONFLICT (curso_id, nome) DO NOTHING`,
+        [cursoId, niveis[i], i + 1]
+      );
+    }
+  }
+}
+
+// ---------- Bootstrap do usuário master ----------
+async function seedMaster() {
+  const existe = await pool.query(`SELECT id FROM usuarios WHERE perfil = 'master' LIMIT 1`);
+  if (existe.rows.length > 0) return;
+  if (!MASTER_SENHA) {
+    console.warn('AVISO: nenhum usuário master existe e MASTER_SENHA não foi definida. Defina MASTER_CPF e MASTER_SENHA nas variáveis do Railway e reinicie.');
+    return;
+  }
+  const hash = await bcrypt.hash(MASTER_SENHA, 10);
+  await pool.query(
+    `INSERT INTO usuarios (nome, cpf, senha_hash, perfil, status) VALUES ($1, $2, $3, 'master', 'ativo')`,
+    ['Paulo (Master)', MASTER_CPF, hash]
+  );
+  console.log('Usuário master criado a partir das variáveis de ambiente.');
+}
+
+// ============================================================
+// 2. AUTENTICAÇÃO E MIDDLEWARES
+// ============================================================
+const limiterLogin = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 10,
-  message: { error: 'Muitas tentativas. Tente novamente em 15 minutos.' },
+  message: { erro: 'Muitas tentativas de login. Aguarde 15 minutos.' }
 });
 
-const otpLimiter = rateLimit({
-  windowMs: 10 * 60 * 1000,
-  max: 20,
-  message: { error: 'Muitos envios de código. Aguarde 10 minutos.' },
+const limiterPublico = rateLimit({
+  windowMs: 60 * 1000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { erro: 'Muitas requisições. Aguarde alguns instantes e tente novamente.' }
 });
 
-// ── AUTH MIDDLEWARE ──────────────────────────────────
-function authMiddleware(req, res, next) {
-  const header = req.headers.authorization;
-  if (!header) return res.status(401).json({ error: 'Token não fornecido.' });
-  const token = header.replace('Bearer ', '');
+function autenticar(req, res, next) {
+  const header = req.headers.authorization || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7) : null;
+  if (!token) return res.status(401).json({ erro: 'Token não fornecido.' });
   try {
-    req.user = jwt.verify(token, process.env.JWT_SECRET);
+    req.usuario = jwt.verify(token, JWT_SECRET);
     next();
   } catch {
-    return res.status(401).json({ error: 'Token inválido ou expirado.' });
+    return res.status(401).json({ erro: 'Token inválido ou expirado.' });
   }
 }
 
-function masterMiddleware(req, res, next) {
-  const token = req.headers['x-master-token'] || req.headers['authorization']?.replace('Bearer ','');
-  const masterToken = process.env.MASTER_TOKEN;
-  console.log('[MASTER] token recebido:', token ? token.substring(0,8)+'...' : 'NENHUM');
-  console.log('[MASTER] MASTER_TOKEN configurado:', masterToken ? 'SIM' : 'NÃO');
-  if (!masterToken) {
-    return res.status(500).json({ error: 'MASTER_TOKEN não configurado no servidor.' });
-  }
-  if (token !== masterToken) {
-    return res.status(403).json({ error: 'Acesso negado. Token inválido.' });
-  }
-  next();
-}
-
-// ── HEALTH CHECK ─────────────────────────────────────
-app.get('/', (req, res) => {
-  res.json({ status: 'ok', app: 'Lenglish API', version: '2.0' });
-});
-
-// ═══════════════════════════════════════════════════════
-// OTP — CONFIRMAÇÃO DE EMAIL
-// ═══════════════════════════════════════════════════════
-
-// Gera código OTP numérico de 6 dígitos
-function gerarOTP() {
-  return Math.floor(100000 + Math.random() * 900000).toString();
-}
-
-// POST /auth/enviar-codigo
-// Gera e envia um OTP de 6 dígitos para o email informado
-app.post('/auth/enviar-codigo', otpLimiter, async (req, res) => {
-  const { email } = req.body;
-  if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-    return res.status(400).json({ error: 'E-mail inválido.' });
-  }
-
-  // Verificar se email já está cadastrado
-  const existe = await pool.query('SELECT id FROM usuarios WHERE email = $1', [email]);
-  if (existe.rows.length > 0) {
-    return res.status(409).json({ error: 'Este e-mail já está cadastrado. Faça login.' });
-  }
-
-  const codigo = gerarOTP();
-  const expira = new Date(Date.now() + 10 * 60 * 1000); // 10 minutos
-
-  // Salvar OTP temporário na tabela otp_pendentes
-  await pool.query(
-    `INSERT INTO otp_pendentes (email, codigo, expira_em)
-     VALUES ($1, $2, $3)
-     ON CONFLICT (email) DO UPDATE SET codigo = $2, expira_em = $3, tentativas = 0`,
-    [email, codigo, expira]
-  );
-
-  // Enviar email via Resend
-  console.log(`[OTP] Enviando código para: ${email} | FROM: ${process.env.RESEND_FROM_EMAIL}`);
-  try {
-    const sendResult = await resend.emails.send({
-      from: process.env.RESEND_FROM_EMAIL || 'noreply@lenglish.com.br',
-      to: email,
-      subject: `${codigo} — Código de confirmação Lenglish`,
-      html: `
-<!DOCTYPE html>
-<html>
-<head><meta charset="UTF-8">
-<style>
-  body { font-family: 'Helvetica Neue', Arial, sans-serif; background: #F7F6F2; margin: 0; padding: 0; }
-  .wrap { max-width: 480px; margin: 40px auto; background: #fff; border-radius: 16px; overflow: hidden; box-shadow: 0 4px 24px rgba(0,0,0,.08); }
-  .hd { background: linear-gradient(135deg, #0F2D5E 0%, #1A3A6E 100%); padding: 32px; text-align: center; }
-  .logo { font-size: 36px; font-weight: 900; color: #fff; letter-spacing: -1px; }
-  .logo em { color: #C8942A; font-style: normal; }
-  .body { padding: 32px; text-align: center; }
-  .otp { font-size: 48px; font-weight: 900; letter-spacing: 12px; color: #0F2D5E; background: #F0F4FA; border-radius: 12px; padding: 18px 24px; display: inline-block; margin: 20px 0; font-family: monospace; }
-  .note { font-size: 13px; color: #78766E; line-height: 1.65; margin-top: 12px; }
-  .ft { background: #F7F6F2; padding: 18px; text-align: center; font-size: 11px; color: #B0AEA6; }
-</style>
-</head>
-<body>
-<div class="wrap">
-  <div class="hd"><div class="logo">Leng<em>lish</em></div></div>
-  <div class="body">
-    <p style="font-size:16px;font-weight:700;color:#0F2D5E;margin-bottom:4px">Confirme seu cadastro</p>
-    <p style="font-size:14px;color:#78766E">Use este código para verificar seu e-mail:</p>
-    <div class="otp">${codigo}</div>
-    <div class="note">
-      Este código é válido por <strong>10 minutos</strong>.<br>
-      Se você não solicitou este cadastro, ignore este e-mail.
-    </div>
-  </div>
-  <div class="ft">
-    Centro Maranhense de Idiomas e Culturas · São Luís, MA<br>
-    lenglish.com.br
-  </div>
-</div>
-</body>
-</html>`,
-    });
-    console.log('[OTP] Resend resultado:', JSON.stringify(sendResult));
-    res.json({ ok: true, message: 'Código enviado.' });
-  } catch (err) {
-    console.error('[OTP] Erro Resend completo:', JSON.stringify(err), err.message);
-    res.status(500).json({ error: 'Erro ao enviar e-mail. Verifique o endereço e tente novamente.' });
-  }
-});
-
-// ═══════════════════════════════════════════════════════
-// AUTH — CADASTRO E LOGIN
-// ═══════════════════════════════════════════════════════
-
-// Gera código único de aluno (LG-XXXX-XXXX)
-function gerarCodigo() {
-  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-  let code = 'LG-';
-  for (let i = 0; i < 8; i++) {
-    if (i === 4) code += '-';
-    code += chars[Math.floor(Math.random() * chars.length)];
-  }
-  return code;
-}
-
-// POST /auth/registro — agora exige codigo_confirmacao (OTP)
-app.post('/auth/registro', async (req, res) => {
-  const { nome, sobrenome, email, senha, data_nascimento,
-          instituicao, nivel, foto, whatsapp, codigo_confirmacao } = req.body;
-
-  if (!nome || !sobrenome || !senha || senha.length < 6) {
-    return res.status(400).json({ error: 'Nome, sobrenome e senha (mín. 6 caracteres) são obrigatórios.' });
-  }
-  if (!email) {
-    return res.status(400).json({ error: 'E-mail obrigatório.' });
-  }
-  if (!codigo_confirmacao || codigo_confirmacao.length !== 6) {
-    return res.status(400).json({ error: 'Código de confirmação de 6 dígitos é obrigatório.' });
-  }
-
-  // Validar OTP
-  const otpResult = await pool.query(
-    `SELECT codigo, expira_em, tentativas FROM otp_pendentes WHERE email = $1`,
-    [email]
-  );
-
-  if (otpResult.rows.length === 0) {
-    return res.status(400).json({ error: 'Nenhum código encontrado para este e-mail. Solicite um novo.' });
-  }
-
-  const otp = otpResult.rows[0];
-  if (new Date() > new Date(otp.expira_em)) {
-    await pool.query('DELETE FROM otp_pendentes WHERE email = $1', [email]);
-    return res.status(400).json({ error: 'Código expirado. Solicite um novo código.' });
-  }
-  if (otp.tentativas >= 5) {
-    return res.status(400).json({ error: 'Muitas tentativas incorretas. Solicite um novo código.' });
-  }
-  if (otp.codigo !== codigo_confirmacao) {
-    await pool.query(
-      'UPDATE otp_pendentes SET tentativas = tentativas + 1 WHERE email = $1', [email]
-    );
-    return res.status(400).json({ error: 'Código incorreto. Verifique e tente novamente.' });
-  }
-
-  // OTP válido — limpar OTP e criar conta
-  await pool.query('DELETE FROM otp_pendentes WHERE email = $1', [email]);
-
-  // Validar idade mínima
-  if (data_nascimento) {
-    const idade = Math.floor((Date.now() - new Date(data_nascimento)) / (365.25 * 86400000));
-    if (idade < 12) return res.status(400).json({ error: 'Idade mínima: 12 anos.' });
-  }
-
-  // Verificar email duplicado
-  const existe = await pool.query('SELECT id FROM usuarios WHERE email = $1', [email]);
-  if (existe.rows.length > 0) {
-    return res.status(409).json({ error: 'E-mail já cadastrado.' });
-  }
-
-  try {
-    const senhaHash = await bcrypt.hash(senha, 10);
-    const codigo    = gerarCodigo();
-    const fotoUrl   = foto || null;
-
-    const result = await pool.query(
-      `INSERT INTO usuarios
-         (nome, sobrenome, email, senha_hash, data_nascimento, instituicao,
-          nivel, codigo, foto_url, whatsapp, email_confirmado, data_inicio)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,true,NOW())
-       RETURNING id, nome, sobrenome, codigo, nivel`,
-      [nome, sobrenome, email, senhaHash,
-       data_nascimento || null,
-       instituicao || 'Centro Maranhense de Idiomas e Culturas',
-       nivel || 'basic', codigo, fotoUrl, whatsapp || null]
-    );
-
-    const usuario = result.rows[0];
-    await inicializarProgresso(usuario.id);
-    // Atualizar ultimo_acesso
-    pool.query('UPDATE usuarios SET ultimo_acesso = NOW() WHERE id = $1', [usuario.id]).catch(()=>{});
-    const token = jwt.sign({ id: usuario.id, codigo: usuario.codigo }, process.env.JWT_SECRET, { expiresIn: '30d' });
-
-    // Email de boas-vindas
-    resend.emails.send({
-      from: process.env.RESEND_FROM_EMAIL || 'noreply@lenglish.com.br',
-      to: email,
-      subject: 'Bem-vindo à Lenglish! 🎓',
-      html: `
-<div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;padding:32px 24px">
-  <h1 style="color:#0F2D5E;font-size:28px;margin-bottom:4px">Leng<span style="color:#C8942A">lish</span></h1>
-  <p style="color:#78766E;font-size:13px;margin-bottom:24px">Centro Maranhense de Idiomas e Culturas</p>
-  <p style="font-size:15px;color:#1C1C1A">Olá, <strong>${nome}</strong>! Seu cadastro foi confirmado com sucesso.</p>
-  <p style="font-size:14px;color:#78766E">Seu código de aluno:</p>
-  <div style="font-size:22px;font-weight:900;letter-spacing:4px;color:#0F2D5E;background:#F0F4FA;border-radius:8px;padding:12px 20px;display:inline-block;font-family:monospace">${codigo}</div>
-  <p style="font-size:13px;color:#78766E;margin-top:16px">Guarde este código — você precisará dele para acessar a plataforma.</p>
-  <p style="font-size:13px;color:#78766E">Bons estudos! 🚀</p>
-</div>`,
-    }).catch(err => console.error('Erro email boas-vindas:', err));
-
-    res.status(201).json({ token, usuario });
-  } catch (err) {
-    console.error('Erro no cadastro:', err);
-    res.status(500).json({ error: 'Erro interno ao criar conta.' });
-  }
-});
-
-// POST /auth/login
-app.post('/auth/login', loginLimiter, async (req, res) => {
-  const { codigo, senha } = req.body;
-  if (!codigo || !senha) return res.status(400).json({ error: 'Código e senha são obrigatórios.' });
-
-  try {
-    const result = await pool.query(
-      'SELECT * FROM usuarios WHERE codigo = $1',
-      [codigo.toUpperCase()]
-    );
-    if (result.rows.length === 0) return res.status(401).json({ error: 'Código ou senha incorretos.' });
-
-    const usuario = result.rows[0];
-    const senhaOk = await bcrypt.compare(senha, usuario.senha_hash);
-    if (!senhaOk) return res.status(401).json({ error: 'Código ou senha incorretos.' });
-
-    // Verificar status de aprovação
-    if (usuario.status_cadastro === 'pendente') {
-      return res.status(403).json({
-        error: 'Seu cadastro ainda está aguardando aprovação do professor. Você receberá um e-mail quando for aprovado.',
-        status: 'pendente'
-      });
+function exigirPerfil(...perfis) {
+  return (req, res, next) => {
+    if (!perfis.includes(req.usuario.perfil)) {
+      return res.status(403).json({ erro: 'Acesso negado para o seu perfil.' });
     }
-    if (usuario.status_cadastro === 'rejeitado') {
-      return res.status(403).json({
-        error: 'Seu cadastro foi recusado. Entre em contato com a instituição para mais informações.',
-        status: 'rejeitado'
-      });
-    }
+    next();
+  };
+}
 
-    // Atualizar ultimo_acesso
-    pool.query('UPDATE usuarios SET ultimo_acesso = NOW() WHERE id = $1', [usuario.id]).catch(()=>{});
-    const token = jwt.sign({ id: usuario.id, codigo: usuario.codigo }, process.env.JWT_SECRET, { expiresIn: '30d' });
+const somenteGestao = exigirPerfil('master', 'secretaria');
 
+function obrigatorios(body, campos) {
+  const faltando = campos.filter(c => body[c] === undefined || body[c] === null || body[c] === '');
+  return faltando.length ? `Campos obrigatórios ausentes: ${faltando.join(', ')}` : null;
+}
+
+const soDigitos = (s) => String(s || '').replace(/\D/g, '');
+
+// Validação matemática de CPF (dígitos verificadores)
+function cpfValido(cpf) {
+  cpf = soDigitos(cpf);
+  if (cpf.length !== 11 || /^(\d)\1{10}$/.test(cpf)) return false;
+  let s = 0;
+  for (let i = 0; i < 9; i++) s += Number(cpf[i]) * (10 - i);
+  if ((s * 10) % 11 % 10 !== Number(cpf[9])) return false;
+  s = 0;
+  for (let i = 0; i < 10; i++) s += Number(cpf[i]) * (11 - i);
+  return (s * 10) % 11 % 10 === Number(cpf[10]);
+}
+
+// ---------- POST /auth/login ----------
+app.post('/auth/login', limiterLogin, async (req, res) => {
+  try {
+    const erro = obrigatorios(req.body, ['cpf', 'senha']);
+    if (erro) return res.status(400).json({ erro });
+    const cpf = soDigitos(req.body.cpf);
+    const r = await pool.query(`SELECT * FROM usuarios WHERE cpf = $1`, [cpf]);
+    const u = r.rows[0];
+    if (!u || u.status !== 'ativo') return res.status(401).json({ erro: 'CPF ou senha inválidos.' });
+    const ok = await bcrypt.compare(req.body.senha, u.senha_hash);
+    if (!ok) return res.status(401).json({ erro: 'CPF ou senha inválidos.' });
+    await pool.query(`UPDATE usuarios SET ultimo_acesso = NOW() WHERE id = $1`, [u.id]);
+    const token = jwt.sign(
+      { id: u.id, nome: u.nome, perfil: u.perfil, referencia_id: u.referencia_id },
+      JWT_SECRET,
+      { expiresIn: '8h' }
+    );
     res.json({
       token,
-      usuario: {
-        id:           usuario.id,
-        nome:         usuario.nome,
-        sobrenome:    usuario.sobrenome,
-        email:        usuario.email,
-        codigo:       usuario.codigo,
-        nivel:        usuario.nivel,
-        instituicao:  usuario.instituicao,
-        foto_url:     usuario.foto_url,
-        data_inicio:  usuario.data_inicio,
-      }
+      usuario: { id: u.id, nome: u.nome, perfil: u.perfil, senha_provisoria: u.senha_provisoria }
     });
-  } catch (err) {
-    console.error('Erro no login:', err);
-    res.status(500).json({ error: 'Erro interno.' });
+  } catch (e) {
+    console.error('Erro /auth/login:', e);
+    res.status(500).json({ erro: 'Erro interno no login.' });
   }
 });
 
-
-// ═══════════════════════════════════════════════════════
-// PERFIL
-// ═══════════════════════════════════════════════════════
-
-// GET /perfil
-app.get('/perfil', authMiddleware, async (req, res) => {
+// ---------- POST /auth/trocar-senha ----------
+app.post('/auth/trocar-senha', autenticar, async (req, res) => {
   try {
-    const result = await pool.query(
-      `SELECT id, nome, sobrenome, email, codigo, nivel, instituicao, foto_url, data_inicio
-       FROM usuarios WHERE id = $1`,
-      [req.user.id]
-    );
-    if (result.rows.length === 0) return res.status(404).json({ error: 'Usuário não encontrado.' });
-    res.json(result.rows[0]);
-  } catch (err) {
-    res.status(500).json({ error: 'Erro interno.' });
-  }
-});
-
-// PATCH /perfil
-app.patch('/perfil', authMiddleware, async (req, res) => {
-  const { nome, sobrenome, foto_url, instituicao } = req.body;
-  try {
-    await pool.query(
-      `UPDATE usuarios SET
-         nome        = COALESCE($1, nome),
-         sobrenome   = COALESCE($2, sobrenome),
-         foto_url    = COALESCE($3, foto_url),
-         instituicao = COALESCE($4, instituicao)
-       WHERE id = $5`,
-      [nome, sobrenome, foto_url, instituicao, req.user.id]
-    );
-    res.json({ ok: true });
-  } catch (err) {
-    res.status(500).json({ error: 'Erro ao atualizar perfil.' });
-  }
-});
-
-// PATCH /perfil/senha
-app.patch('/perfil/senha', authMiddleware, async (req, res) => {
-  const { senha_atual, senha_nova } = req.body;
-  if (!senha_atual || !senha_nova || senha_nova.length < 6) {
-    return res.status(400).json({ error: 'Senha nova deve ter mínimo 6 caracteres.' });
-  }
-  try {
-    const result = await pool.query('SELECT senha_hash FROM usuarios WHERE id = $1', [req.user.id]);
-    const ok = await bcrypt.compare(senha_atual, result.rows[0].senha_hash);
-    if (!ok) return res.status(401).json({ error: 'Senha atual incorreta.' });
-    const novaHash = await bcrypt.hash(senha_nova, 10);
-    await pool.query('UPDATE usuarios SET senha_hash = $1 WHERE id = $2', [novaHash, req.user.id]);
-    res.json({ ok: true });
-  } catch (err) {
-    res.status(500).json({ error: 'Erro ao alterar senha.' });
-  }
-});
-
-// ═══════════════════════════════════════════════════════
-// PROGRESSO — SEMANAS E HABILIDADES
-// ═══════════════════════════════════════════════════════
-
-// GET /progresso — retorna todo o progresso do aluno
-app.get('/progresso', authMiddleware, async (req, res) => {
-  try {
-    const result = await pool.query(
-      `SELECT semana, habilidade, concluido, concluido_em
-       FROM progresso
-       WHERE usuario_id = $1
-       ORDER BY semana, habilidade`,
-      [req.user.id]
-    );
-
-    // Buscar data de início do aluno
-    const user = await pool.query('SELECT data_inicio, nivel FROM usuarios WHERE id = $1', [req.user.id]);
-    const { data_inicio, nivel } = user.rows[0];
-
-    res.json({
-      data_inicio,
-      nivel,
-      progresso: result.rows,
-    });
-  } catch (err) {
-    res.status(500).json({ error: 'Erro ao buscar progresso.' });
-  }
-});
-
-// POST /progresso/concluir — marca uma habilidade como concluída
-app.post('/progresso/concluir', authMiddleware, async (req, res) => {
-  const { semana, habilidade } = req.body;
-  const habilidades = ['listening', 'reading', 'speaking', 'writing'];
-
-  if (semana < 0 || semana > 15 || !habilidades.includes(habilidade)) {
-    return res.status(400).json({ error: 'Semana (0-15) ou habilidade inválida.' });
-  }
-
-  try {
-    // Verificar se a semana está desbloqueada
-    const desbloqueada = await semanaDesbloqueada(req.user.id, semana);
-    if (!desbloqueada) {
-      return res.status(403).json({ error: 'Semana bloqueada. Conclua a semana anterior primeiro.' });
+    const erro = obrigatorios(req.body, ['senha_atual', 'senha_nova']);
+    if (erro) return res.status(400).json({ erro });
+    if (String(req.body.senha_nova).length < 8) {
+      return res.status(400).json({ erro: 'A nova senha deve ter ao menos 8 caracteres.' });
     }
-
-    await pool.query(
-      `UPDATE progresso SET concluido = true, concluido_em = NOW()
-       WHERE usuario_id = $1 AND semana = $2 AND habilidade = $3`,
-      [req.user.id, semana, habilidade]
-    );
-
-    // Verificar se a semana inteira foi concluída
-    const semanaOk = await semanaConcluida(req.user.id, semana);
-
-    res.json({ ok: true, semana_concluida: semanaOk });
-  } catch (err) {
-    res.status(500).json({ error: 'Erro ao salvar progresso.' });
+    const r = await pool.query(`SELECT senha_hash FROM usuarios WHERE id = $1`, [req.usuario.id]);
+    const ok = await bcrypt.compare(req.body.senha_atual, r.rows[0].senha_hash);
+    if (!ok) return res.status(401).json({ erro: 'Senha atual incorreta.' });
+    const hash = await bcrypt.hash(req.body.senha_nova, 10);
+    await pool.query(`UPDATE usuarios SET senha_hash = $1, senha_provisoria = FALSE WHERE id = $2`, [hash, req.usuario.id]);
+    res.json({ mensagem: 'Senha alterada com sucesso.' });
+  } catch (e) {
+    console.error('Erro /auth/trocar-senha:', e);
+    res.status(500).json({ erro: 'Erro interno ao trocar senha.' });
   }
 });
 
-// POST /progresso/passo — salva o passo atual dentro de uma habilidade
-app.post('/progresso/passo', authMiddleware, async (req, res) => {
-  const { semana, habilidade, passo, respostas } = req.body;
+// ============================================================
+// 3. CONFIGURAÇÕES
+// ============================================================
+app.get('/admin/configuracoes', autenticar, somenteGestao, async (req, res) => {
   try {
-    await pool.query(
-      `INSERT INTO progresso_detalhe (usuario_id, semana, habilidade, passo, respostas, atualizado_em)
-       VALUES ($1,$2,$3,$4,$5,NOW())
-       ON CONFLICT (usuario_id, semana, habilidade)
-       DO UPDATE SET passo = $4, respostas = $5, atualizado_em = NOW()`,
-      [req.user.id, semana, habilidade, passo, JSON.stringify(respostas || {})]
-    );
-    res.json({ ok: true });
-  } catch (err) {
-    res.status(500).json({ error: 'Erro ao salvar passo.' });
+    const r = await pool.query(`SELECT chave, valor, descricao, atualizado_em FROM configuracoes ORDER BY chave`);
+    res.json(r.rows);
+  } catch (e) {
+    console.error('Erro GET configuracoes:', e);
+    res.status(500).json({ erro: 'Erro ao listar configurações.' });
   }
 });
 
-// GET /progresso/passo/:semana/:habilidade — recupera passo salvo
-app.get('/progresso/passo/:semana/:habilidade', authMiddleware, async (req, res) => {
-  const { semana, habilidade } = req.params;
+app.put('/admin/configuracoes/:chave', autenticar, exigirPerfil('master'), async (req, res) => {
   try {
-    const result = await pool.query(
-      `SELECT passo, respostas FROM progresso_detalhe
-       WHERE usuario_id = $1 AND semana = $2 AND habilidade = $3`,
-      [req.user.id, parseInt(semana), habilidade]
+    if (req.body.valor === undefined) return res.status(400).json({ erro: 'Campo "valor" é obrigatório.' });
+    const r = await pool.query(
+      `UPDATE configuracoes SET valor = $1, atualizado_em = NOW(), atualizado_por = $2 WHERE chave = $3 RETURNING chave, valor`,
+      [JSON.stringify(req.body.valor), req.usuario.id, req.params.chave]
     );
-    if (result.rows.length === 0) return res.json({ passo: 0, respostas: {} });
-    const row = result.rows[0];
-    res.json({ passo: row.passo, respostas: row.respostas });
-  } catch (err) {
-    res.status(500).json({ error: 'Erro ao buscar passo.' });
+    if (!r.rows.length) return res.status(404).json({ erro: 'Configuração não encontrada.' });
+    res.json({ mensagem: 'Configuração atualizada.', configuracao: r.rows[0] });
+  } catch (e) {
+    console.error('Erro PUT configuracoes:', e);
+    res.status(500).json({ erro: 'Erro ao atualizar configuração.' });
   }
 });
 
-// ═══════════════════════════════════════════════════════
-// PAINEL MASTER
-// ═══════════════════════════════════════════════════════
-
-// GET /master/alunos
-app.get('/master/alunos', masterMiddleware, async (req, res) => {
-  try {
-    const result = await pool.query(
-      `SELECT
-         u.id, u.nome, u.sobrenome, u.email, u.codigo, u.nivel,
-         u.instituicao, u.data_inicio,
-         COUNT(p.id) FILTER (WHERE p.concluido = true) AS habilidades_concluidas,
-         (SELECT COUNT(*) FROM progresso WHERE usuario_id = u.id) AS total_habilidades
-       FROM usuarios u
-       LEFT JOIN progresso p ON p.usuario_id = u.id
-       GROUP BY u.id
-       ORDER BY u.data_inicio DESC`
-    );
-    res.json(result.rows);
-  } catch (err) {
-    res.status(500).json({ error: 'Erro ao listar alunos.' });
-  }
-});
-
-// GET /master/aluno/:id
-app.get('/master/aluno/:id', masterMiddleware, async (req, res) => {
-  try {
-    const usuario = await pool.query(
-      'SELECT id, nome, sobrenome, email, codigo, nivel, instituicao, data_inicio, foto_url FROM usuarios WHERE id = $1',
-      [req.params.id]
-    );
-    if (usuario.rows.length === 0) return res.status(404).json({ error: 'Aluno não encontrado.' });
-
-    const progresso = await pool.query(
-      `SELECT semana, habilidade, concluido, concluido_em
-       FROM progresso WHERE usuario_id = $1 ORDER BY semana, habilidade`,
-      [req.params.id]
-    );
-
-    // Estatísticas agregadas por semana
-    const semanas = {};
-    progresso.rows.forEach(p => {
-      if (!semanas[p.semana]) semanas[p.semana] = { concluidas: 0, total: 0, habilidades: {} };
-      semanas[p.semana].total++;
-      semanas[p.semana].habilidades[p.habilidade] = {
-        concluido: p.concluido,
-        concluido_em: p.concluido_em
-      };
-      if (p.concluido) semanas[p.semana].concluidas++;
-    });
-
-    const total_concluidas = progresso.rows.filter(p => p.concluido).length;
-    const semanas_completas = Object.values(semanas).filter(s => s.concluidas === 4).length;
-
-    res.json({
-      usuario: usuario.rows[0],
-      progresso: progresso.rows,
-      stats: {
-        total_habilidades: progresso.rows.length,
-        total_concluidas,
-        semanas_completas,
-        percentual: Math.round(semanas_completas / 16 * 100)
-      },
-      semanas
-    });
-  } catch (err) {
-    res.status(500).json({ error: 'Erro ao buscar aluno.' });
-  }
-});
-
-// GET /master/stats
-app.get('/master/stats', masterMiddleware, async (req, res) => {
-  try {
-    const [total, porNivel, concluidos] = await Promise.all([
-      pool.query('SELECT COUNT(*) FROM usuarios'),
-      pool.query('SELECT nivel, COUNT(*) FROM usuarios GROUP BY nivel'),
-      pool.query(`SELECT COUNT(DISTINCT usuario_id) FROM progresso
-                  WHERE semana = 15 AND habilidade = 'writing' AND concluido = true`),
-    ]);
-    res.json({
-      total_alunos:    parseInt(total.rows[0].count),
-      por_nivel:       porNivel.rows,
-      cursos_concluidos: parseInt(concluidos.rows[0].count),
-    });
-  } catch (err) {
-    res.status(500).json({ error: 'Erro ao buscar estatísticas.' });
-  }
-});
-
-// ═══════════════════════════════════════════════════════
-// HELPERS
-// ═══════════════════════════════════════════════════════
-
-function gerarCodigo() {
-  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-  let code = 'LG-';
-  for (let i = 0; i < 8; i++) {
-    if (i === 4) code += '-';
-    code += chars[Math.floor(Math.random() * chars.length)];
-  }
-  return code; // ex: LG-ABCD-EFGH
+async function marcarAtrasados() {
+  await pool.query(`UPDATE contas_receber SET status='atrasada' WHERE status='pendente' AND vencimento < CURRENT_DATE`);
+  await pool.query(`UPDATE contas_pagar SET status='atrasada' WHERE status='pendente' AND vencimento < CURRENT_DATE`);
 }
 
-async function inicializarProgresso(usuarioId) {
-  const habilidades = ['listening', 'reading', 'speaking', 'writing'];
-  const valores = [];
-  const params = [];
-  let idx = 1;
-  for (let s = 0; s < 16; s++) {
-    for (const h of habilidades) {
-      valores.push(`($${idx++}, $${idx++}, $${idx++})`);
-      params.push(usuarioId, s, h);
-    }
-  }
-  await pool.query(
-    `INSERT INTO progresso (usuario_id, semana, habilidade) VALUES ${valores.join(',')}
-     ON CONFLICT DO NOTHING`,
-    params
-  );
+async function getConfig(chave, padrao = null) {
+  const r = await pool.query(`SELECT valor FROM configuracoes WHERE chave = $1`, [chave]);
+  return r.rows.length ? r.rows[0].valor : padrao;
 }
 
-async function semanaConcluida(usuarioId, semana) {
-  const result = await pool.query(
-    `SELECT COUNT(*) FROM progresso
-     WHERE usuario_id = $1 AND semana = $2 AND concluido = true`,
-    [usuarioId, semana]
-  );
-  return parseInt(result.rows[0].count) === 4;
-}
-
-async function semanaDesbloqueada(usuarioId, semana) {
-  if (semana === 0) return true;
-
-  // Verificar data
-  const user = await pool.query('SELECT data_inicio FROM usuarios WHERE id = $1', [usuarioId]);
-  const inicio = new Date(user.rows[0].data_inicio);
-  const dataLiberacao = new Date(inicio.getTime() + semana * 7 * 24 * 3600 * 1000);
-  if (new Date() < dataLiberacao) return false;
-
-  // Verificar semana anterior concluída
-  return await semanaConcluida(usuarioId, semana - 1);
-}
-
-// ── INICIALIZAR BANCO ────────────────────────────────
-async function initDB() {
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS usuarios (
-      id              SERIAL PRIMARY KEY,
-      nome            TEXT NOT NULL,
-      sobrenome       TEXT NOT NULL,
-      email           TEXT UNIQUE,
-      senha_hash      TEXT NOT NULL,
-      codigo          TEXT UNIQUE NOT NULL,
-      nivel           TEXT NOT NULL DEFAULT 'basic',
-      instituicao     TEXT,
-      foto_url        TEXT,
-      data_nascimento DATE,
-      data_inicio     TIMESTAMP DEFAULT NOW(),
-      criado_em       TIMESTAMP DEFAULT NOW(),
-      whatsapp        TEXT,
-      email_confirmado BOOLEAN DEFAULT FALSE
-    );
-
-    CREATE TABLE IF NOT EXISTS otp_pendentes (
-      email       TEXT PRIMARY KEY,
-      codigo      TEXT NOT NULL,
-      expira_em   TIMESTAMP NOT NULL,
-      tentativas  INTEGER DEFAULT 0,
-      criado_em   TIMESTAMP DEFAULT NOW()
-    );
-
-    CREATE TABLE IF NOT EXISTS progresso (
-      id          SERIAL PRIMARY KEY,
-      usuario_id  INTEGER REFERENCES usuarios(id) ON DELETE CASCADE,
-      semana      INTEGER NOT NULL CHECK (semana >= 0 AND semana <= 15),
-      habilidade  TEXT NOT NULL CHECK (habilidade IN ('listening','reading','speaking','writing')),
-      concluido   BOOLEAN DEFAULT FALSE,
-      concluido_em TIMESTAMP,
-      UNIQUE (usuario_id, semana, habilidade)
-    );
-
-    CREATE TABLE IF NOT EXISTS progresso_detalhe (
-      id          SERIAL PRIMARY KEY,
-      usuario_id  INTEGER REFERENCES usuarios(id) ON DELETE CASCADE,
-      semana      INTEGER NOT NULL,
-      habilidade  TEXT NOT NULL,
-      passo       INTEGER DEFAULT 0,
-      respostas   JSONB DEFAULT '{}',
-      atualizado_em TIMESTAMP DEFAULT NOW(),
-      UNIQUE (usuario_id, semana, habilidade)
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_progresso_usuario ON progresso(usuario_id);
-    CREATE INDEX IF NOT EXISTS idx_detalhe_usuario ON progresso_detalhe(usuario_id);
-    CREATE INDEX IF NOT EXISTS idx_usuarios_codigo ON usuarios(codigo);
-    CREATE INDEX IF NOT EXISTS idx_otp_email ON otp_pendentes(email);
-
-    -- Adicionar status_cadastro se não existir
-    DO $$ BEGIN
-      IF NOT EXISTS (SELECT 1 FROM information_schema.columns
-                     WHERE table_name='usuarios' AND column_name='status_cadastro') THEN
-        ALTER TABLE usuarios ADD COLUMN status_cadastro TEXT DEFAULT 'pendente'
-          CHECK (status_cadastro IN ('pendente','aprovado','rejeitado'));
-      END IF;
-    END $$;
-
-    CREATE TABLE IF NOT EXISTS sessoes (
-      id           SERIAL PRIMARY KEY,
-      usuario_id   INTEGER REFERENCES usuarios(id) ON DELETE CASCADE,
-      ultimo_acesso TIMESTAMP DEFAULT NOW(),
-      dispositivo  TEXT,
-      UNIQUE(usuario_id)
-    );
-
-    CREATE TABLE IF NOT EXISTS mensagens (
-      id              SERIAL PRIMARY KEY,
-      usuario_id      INTEGER REFERENCES usuarios(id) ON DELETE CASCADE,
-      remetente_id    INTEGER REFERENCES usuarios(id) ON DELETE SET NULL,
-      remetente_tipo  TEXT NOT NULL CHECK (remetente_tipo IN ('aluno','professor')),
-      conteudo        TEXT NOT NULL,
-      lida            BOOLEAN DEFAULT FALSE,
-      criado_em       TIMESTAMP DEFAULT NOW()
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_mensagens_usuario ON mensagens(usuario_id);
-    CREATE INDEX IF NOT EXISTS idx_mensagens_nao_lidas ON mensagens(usuario_id, remetente_tipo, lida);
-
-    -- Adicionar ultimo_acesso em usuarios se não existir
-    DO $$ BEGIN
-      IF NOT EXISTS (SELECT 1 FROM information_schema.columns
-                     WHERE table_name='usuarios' AND column_name='ultimo_acesso') THEN
-        ALTER TABLE usuarios ADD COLUMN ultimo_acesso TIMESTAMP;
-      END IF;
-    END $$;
-    -- Adicionar colunas novas se não existirem (migração segura)
-    DO $$ BEGIN
-      IF NOT EXISTS (SELECT 1 FROM information_schema.columns
-                     WHERE table_name='usuarios' AND column_name='whatsapp') THEN
-        ALTER TABLE usuarios ADD COLUMN whatsapp TEXT;
-      END IF;
-    END $$;
-
-    DO $$ BEGIN
-      IF NOT EXISTS (SELECT 1 FROM information_schema.columns
-                     WHERE table_name='usuarios' AND column_name='email_confirmado') THEN
-        ALTER TABLE usuarios ADD COLUMN email_confirmado BOOLEAN DEFAULT FALSE;
-      END IF;
-    END $$;
-
-  `);
-  console.log('✅ Banco de dados inicializado.');
-}
-
-// ── START ────────────────────────────────────────────
-// Iniciar servidor imediatamente — initDB em background
-app.listen(PORT, () => {
-  console.log('🚀 Lenglish API rodando na porta ' + PORT);
-});
-
-// Inicializar banco em background (não bloqueia o servidor)
-initDB().then(() => {
-
-// GET /master/criar-teste — cria usuário de teste com status aprovado
-app.get('/master/criar-teste', masterMiddleware, async (req, res) => {
+// ============================================================
+// 4. CRUD — ALUNOS
+// ============================================================
+app.get('/admin/alunos', autenticar, somenteGestao, async (req, res) => {
   try {
-    const bcrypt = require('bcryptjs');
-    const senhaHash = await bcrypt.hash('3040@86', 10);
-    
-    // Verificar se já existe
-    const existe = await pool.query(
-      'SELECT id, codigo FROM usuarios WHERE email = $1',
-      ['marquespaulo86@gmail.com']
-    );
-    
-    if (existe.rows.length > 0) {
-      // Atualizar status para aprovado e senha
-      await pool.query(
-        `UPDATE usuarios SET 
-           senha_hash = $1,
-           status_cadastro = 'aprovado',
-           nivel = 'basic'
-         WHERE email = $2`,
-        [senhaHash, 'marquespaulo86@gmail.com']
-      );
-      return res.json({ 
-        ok: true, 
-        action: 'updated',
-        codigo: existe.rows[0].codigo,
-        email: 'marquespaulo86@gmail.com',
-        senha: '3040@86'
-      });
-    }
-    
-    // Criar novo
-    function gerarCodigo() {
-      const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-      let code = 'LG-';
-      for (let i = 0; i < 8; i++) {
-        if (i === 4) code += '-';
-        code += chars[Math.floor(Math.random() * chars.length)];
-      }
-      return code;
-    }
-    const codigo = gerarCodigo();
-    
-    const result = await pool.query(
-      `INSERT INTO usuarios 
-         (nome, sobrenome, email, senha_hash, codigo, nivel, 
-          instituicao, status_cadastro, email_confirmado, data_inicio)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,'aprovado',true,NOW())
-       RETURNING id, codigo`,
-      ['Paulo', 'Marques', 'marquespaulo86@gmail.com', 
-       senhaHash, codigo, 'basic',
-       'Centro Maranhense de Idiomas e Culturas - CEMIC']
-    );
-    
-    const usuario = result.rows[0];
-    
-    // Inicializar progresso
-    const habilidades = ['listening','reading','speaking','writing'];
-    const valores = [];
+    const { busca, status, modalidade } = req.query;
+    const cond = [];
     const params = [];
-    let idx = 1;
-    for (let s = 0; s < 16; s++) {
-      for (const h of habilidades) {
-        valores.push(`($${idx++},$${idx++},$${idx++})`);
-        params.push(usuario.id, s, h);
-      }
-    }
-    await pool.query(
-      `INSERT INTO progresso (usuario_id,semana,habilidade) 
-       VALUES ${valores.join(',')} ON CONFLICT DO NOTHING`,
-      params
-    );
-    
-    res.json({ 
-      ok: true, 
-      action: 'created',
-      codigo: usuario.codigo,
-      email: 'marquespaulo86@gmail.com',
-      senha: '3040@86'
-    });
-  } catch (err) {
-    console.error('Erro criar teste:', err);
-    res.status(500).json({ error: err.message });
+    if (busca) { params.push(`%${busca}%`); cond.push(`(a.nome ILIKE $${params.length} OR a.cpf ILIKE $${params.length})`); }
+    if (status) { params.push(status); cond.push(`a.status = $${params.length}`); }
+    if (modalidade) { params.push(modalidade); cond.push(`a.modalidade = $${params.length}`); }
+    const where = cond.length ? `WHERE ${cond.join(' AND ')}` : '';
+    const r = await pool.query(`SELECT a.* FROM alunos a ${where} ORDER BY a.nome`, params);
+    res.json(r.rows);
+  } catch (e) {
+    console.error('Erro GET alunos:', e);
+    res.status(500).json({ erro: 'Erro ao listar alunos.' });
   }
 });
 
-
-// DELETE /master/reset-progresso/:email — zera progresso de um usuário
-app.delete('/master/reset-progresso/:email', masterMiddleware, async (req, res) => {
+app.get('/admin/alunos/:id', autenticar, somenteGestao, async (req, res) => {
   try {
-    const email = decodeURIComponent(req.params.email);
-    // Buscar usuário
-    const user = await pool.query(
-      'SELECT id, nome, codigo FROM usuarios WHERE email = $1',
-      [email]
+    const a = await pool.query(`SELECT * FROM alunos WHERE id = $1`, [req.params.id]);
+    if (!a.rows.length) return res.status(404).json({ erro: 'Aluno não encontrado.' });
+    const resp = await pool.query(
+      `SELECT ar.id AS vinculo_id, r.id, r.nome, r.cpf, r.whatsapp, r.email, ar.parentesco, ar.responsavel_financeiro
+       FROM aluno_responsavel ar JOIN responsaveis r ON r.id = ar.responsavel_id
+       WHERE ar.aluno_id = $1`, [req.params.id]
     );
-    if(user.rows.length === 0){
-      return res.status(404).json({ error: 'Usuário não encontrado.' });
-    }
-    const u = user.rows[0];
-    // Zerar progresso
-    await pool.query(
-      'UPDATE progresso SET concluido = false, concluido_em = NULL WHERE usuario_id = $1',
-      [u.id]
-    );
-    // Zerar progresso detalhe
-    await pool.query(
-      'DELETE FROM progresso_detalhe WHERE usuario_id = $1',
-      [u.id]
-    );
-    res.json({ ok: true, message: `Progresso de ${u.nome} (${u.codigo}) zerado com sucesso.` });
-  } catch(err) {
-    console.error('Erro reset progresso:', err);
-    res.status(500).json({ error: err.message });
+    res.json({ ...a.rows[0], responsaveis: resp.rows });
+  } catch (e) {
+    console.error('Erro GET aluno:', e);
+    res.status(500).json({ erro: 'Erro ao buscar aluno.' });
   }
 });
 
-
-// POST /dict — dicionário bilíngue inglês-português via OpenAI
-app.post('/dict', authMiddleware, (req, res) => {
-  const { word } = req.body;
-  if (!word || !word.trim()) return res.status(400).json({ error: 'Palavra obrigatória.' });
-  if (!process.env.OPENAI_API_KEY) return res.status(500).json({ error: 'API não configurada.' });
-
-  const https = require('https');
-  const w = word.trim();
-  const prompt = 'You are a bilingual EN-PT dictionary for Brazilian students. For the English word "' + w + '" reply ONLY with this JSON and nothing else: {"word":"' + w + '","phonetic":"IPA pronunciation","translation":"traducao em portugues","example":"example sentence in English","example_pt":"traducao do exemplo em portugues"}';
-
-  const bodyData = JSON.stringify({
-    model: 'gpt-4o-mini',
-    max_tokens: 300,
-    temperature: 0,
-    messages: [{ role: 'user', content: prompt }]
-  });
-
-  const options = {
-    hostname: 'api.openai.com',
-    path: '/v1/chat/completions',
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': 'Bearer ' + process.env.OPENAI_API_KEY,
-      'Content-Length': Buffer.byteLength(bodyData)
-    },
-    timeout: 15000
-  };
-
-  const chunks = [];
-  const req2 = https.request(options, (r2) => {
-    r2.on('data', c => chunks.push(c));
-    r2.on('end', () => {
-      try {
-        const raw = JSON.parse(Buffer.concat(chunks).toString());
-        const txt = (raw.choices && raw.choices[0] && raw.choices[0].message && raw.choices[0].message.content) || '';
-        console.log('[DICT] resposta OpenAI:', txt.substring(0, 100));
-        let entry;
-        try { entry = JSON.parse(txt.trim()); }
-        catch(_) {
-          const m = txt.match(/\{[\s\S]+\}/);
-          if (m) { entry = JSON.parse(m[0]); }
-          else { throw new Error('no json: ' + txt.substring(0, 80)); }
-        }
-        res.json(entry);
-      } catch(e) {
-        console.error('[DICT] parse:', e.message);
-        res.status(500).json({ error: 'Erro ao processar.' });
-      }
-    });
-  });
-  req2.on('error', e => { console.error('[DICT] net:', e.message); res.status(500).json({ error: 'Erro de rede.' }); });
-  req2.on('timeout', () => { req2.destroy(); res.status(504).json({ error: 'Timeout.' }); });
-  req2.write(bodyData);
-  req2.end();
-});
-
-
-// GET /master/relatorio/:id — dados completos para PDF de desempenho
-app.get('/master/relatorio/:id', masterMiddleware, async (req, res) => {
+app.post('/admin/alunos', autenticar, somenteGestao, async (req, res) => {
   try {
-    const u = await pool.query(
-      'SELECT id, nome, sobrenome, email, codigo, nivel, instituicao, data_inicio FROM usuarios WHERE id = $1',
-      [req.params.id]
+    const erro = obrigatorios(req.body, ['nome', 'modalidade']);
+    if (erro) return res.status(400).json({ erro });
+    const { nome, data_nascimento, email, whatsapp, modalidade, observacoes } = req.body;
+    const cpf = req.body.cpf ? soDigitos(req.body.cpf) : null;
+    if (cpf && !cpfValido(cpf)) return res.status(400).json({ erro: 'CPF do aluno inválido — confira os dígitos.' });
+
+    // Desconto fixo em R$ na mensalidade (apenas Pagante Parcial; bolsista é isento; taxa de matrícula nunca tem desconto)
+    let desconto = Number(req.body.desconto_valor || 0);
+    if (modalidade !== 'pagante_parcial' || isNaN(desconto) || desconto < 0) desconto = 0;
+
+    const r = await pool.query(
+      `INSERT INTO alunos (nome, data_nascimento, email, cpf, whatsapp, modalidade, desconto_valor, observacoes)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
+      [nome, data_nascimento || null, email || null, cpf, whatsapp || null, modalidade, desconto, observacoes || null]
     );
-    if (u.rows.length === 0) return res.status(404).json({ error: 'Aluno não encontrado.' });
-
-    const prog = await pool.query(
-      `SELECT semana, habilidade, concluido, concluido_em
-       FROM progresso WHERE usuario_id = $1 ORDER BY semana, habilidade`,
-      [req.params.id]
-    );
-
-    const NIVEL = { basic: 'Basic (A1→A2)', pre: 'Pre-intermediate (A2→B1)', inter: 'Intermediate (B1→B2)', adv: 'Advanced (B2→C1)' };
-    const SKILLS = ['listening', 'reading', 'speaking', 'writing'];
-
-    // Montar relatório semana a semana
-    const semanas = [];
-    for (let s = 0; s < 16; s++) {
-      const hab = {};
-      SKILLS.forEach(sk => {
-        const row = prog.rows.find(p => parseInt(p.semana) === s && p.habilidade === sk);
-        hab[sk] = row ? { concluido: row.concluido, data: row.concluido_em } : { concluido: false, data: null };
-      });
-      const concluidas = SKILLS.filter(sk => hab[sk].concluido).length;
-      semanas.push({ semana: s + 1, habilidades: hab, concluidas, completa: concluidas === 4 });
-    }
-
-    const total_completas = semanas.filter(s => s.completa).length;
-
-    res.json({
-      aluno: {
-        ...u.rows[0],
-        nivel_nome: NIVEL[u.rows[0].nivel] || u.rows[0].nivel,
-        data_inicio_fmt: u.rows[0].data_inicio ? new Date(u.rows[0].data_inicio).toLocaleDateString('pt-BR') : '—'
-      },
-      semanas,
-      resumo: {
-        semanas_completas: total_completas,
-        percentual_geral: Math.round(total_completas / 16 * 100),
-        habilidades_concluidas: prog.rows.filter(p => p.concluido).length,
-        total_habilidades: prog.rows.length
-      }
-    });
-  } catch (err) {
-    console.error('[RELATORIO]', err);
-    res.status(500).json({ error: 'Erro ao gerar relatório.' });
+    res.status(201).json(r.rows[0]);
+  } catch (e) {
+    if (e.code === '23505') return res.status(409).json({ erro: 'Já existe aluno com este CPF.' });
+    console.error('Erro POST aluno:', e);
+    res.status(500).json({ erro: 'Erro ao cadastrar aluno.' });
   }
 });
 
-
-// POST /asst — assistente de dúvidas bilíngue
-app.post('/asst', authMiddleware, (req, res) => {
-  const { question, context } = req.body;
-  if (!question || !question.trim()) return res.status(400).json({ error: 'Pergunta obrigatória.' });
-  if (!process.env.ANTHROPIC_API_KEY) return res.status(500).json({ error: 'API não configurada.' });
-
-  const https = require('https');
-  const prompt = 'You are a bilingual English/Portuguese teaching assistant for Brazilian students learning English.'
-    + ' Context: ' + (context || 'CEFR A1-A2 English learner.')
-    + ' The student asks: "' + question.trim() + '".'
-    + ' Respond in BILINGUAL format: explain in Portuguese first, then give English examples.'
-    + ' Be friendly, concise and encouraging. Max 120 words.';
-
-  const bodyData = JSON.stringify({
-    model: 'claude-haiku-4-5-20251001',
-    max_tokens: 400,
-    messages: [{ role: 'user', content: prompt }]
-  });
-
-  const options = {
-    hostname: 'api.anthropic.com',
-    path: '/v1/messages',
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'x-api-key': process.env.ANTHROPIC_API_KEY,
-      'anthropic-version': '2023-06-01',
-      'Content-Length': Buffer.byteLength(bodyData)
-    },
-    timeout: 20000
-  };
-
-  const chunks = [];
-  const req2 = https.request(options, (r2) => {
-    r2.on('data', c => chunks.push(c));
-    r2.on('end', () => {
-      try {
-        const raw = JSON.parse(Buffer.concat(chunks).toString());
-        const text = (raw.content && raw.content[0] && raw.content[0].text) || '';
-        res.json({ text });
-      } catch(e) {
-        res.status(500).json({ error: 'Erro ao processar resposta.' });
-      }
-    });
-  });
-  req2.on('error', () => res.status(500).json({ error: 'Erro de rede.' }));
-  req2.on('timeout', () => { req2.destroy(); res.status(504).json({ error: 'Timeout.' }); });
-  req2.write(bodyData);
-  req2.end();
-});
-
-// POST /speaking-fb — feedback de speaking via IA
-app.post('/speaking-fb', authMiddleware, (req, res) => {
-  const { transcript, prompts, cefr } = req.body;
-  if (!transcript || !transcript.trim()) return res.status(400).json({ error: 'Transcrição obrigatória.' });
-  if (!process.env.ANTHROPIC_API_KEY) return res.status(500).json({ error: 'API não configurada.' });
-
-  const https = require('https');
-  const prompt = 'You are an encouraging English speaking coach for Brazilian students at CEFR level ' + (cefr || 'A1-A2') + '.'
-    + ' The student was asked to speak about: "' + (prompts || '') + '".'
-    + ' Their spoken response (transcribed): "' + transcript.trim() + '".'
-    + ' Give feedback in BILINGUAL format (Portuguese + English examples).'
-    + ' Structure: 1) O que foi bom (2 points) 2) O que melhorar (2 points) 3) Uma frase modelo em inglês.'
-    + ' Be encouraging. Max 150 words.';
-
-  const bodyData = JSON.stringify({
-    model: 'claude-haiku-4-5-20251001',
-    max_tokens: 500,
-    messages: [{ role: 'user', content: prompt }]
-  });
-
-  const options = {
-    hostname: 'api.anthropic.com',
-    path: '/v1/messages',
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'x-api-key': process.env.ANTHROPIC_API_KEY,
-      'anthropic-version': '2023-06-01',
-      'Content-Length': Buffer.byteLength(bodyData)
-    },
-    timeout: 30000
-  };
-
-  const chunks = [];
-  const req2 = https.request(options, (r2) => {
-    r2.on('data', c => chunks.push(c));
-    r2.on('end', () => {
-      try {
-        const raw = JSON.parse(Buffer.concat(chunks).toString());
-        const text = (raw.content && raw.content[0] && raw.content[0].text) || '';
-        res.json({ text });
-      } catch(e) {
-        res.status(500).json({ error: 'Erro ao processar resposta.' });
-      }
-    });
-  });
-  req2.on('error', () => res.status(500).json({ error: 'Erro de rede.' }));
-  req2.on('timeout', () => { req2.destroy(); res.status(504).json({ error: 'Timeout.' }); });
-  req2.write(bodyData);
-  req2.end();
-});
-
-
-// GET /master/relatorio-detalhado/:id — relatório pedagógico completo
-app.get('/master/relatorio-detalhado/:id', masterMiddleware, async (req, res) => {
+app.put('/admin/alunos/:id', autenticar, somenteGestao, async (req, res) => {
   try {
-    const uid = req.params.id;
-
-    const u = await pool.query(
-      `SELECT id, nome, sobrenome, email, codigo, nivel, instituicao,
-              data_inicio, ultimo_acesso
-       FROM usuarios WHERE id = $1`,
-      [uid]
+    const atual = await pool.query(`SELECT * FROM alunos WHERE id = $1`, [req.params.id]);
+    if (!atual.rows.length) return res.status(404).json({ erro: 'Aluno não encontrado.' });
+    const a = atual.rows[0];
+    const modalidade = req.body.modalidade || a.modalidade;
+    let desconto = req.body.desconto_valor !== undefined ? Number(req.body.desconto_valor) : Number(a.desconto_valor || 0);
+    if (modalidade !== 'pagante_parcial' || isNaN(desconto) || desconto < 0) desconto = 0;
+    if (req.body.cpf !== undefined && soDigitos(req.body.cpf) && !cpfValido(soDigitos(req.body.cpf))) {
+      return res.status(400).json({ erro: 'CPF do aluno inválido — confira os dígitos.' });
+    }
+    const r = await pool.query(
+      `UPDATE alunos SET nome=$1, data_nascimento=$2, email=$3, cpf=$4, whatsapp=$5, status=$6, modalidade=$7, desconto_valor=$8, observacoes=$9
+       WHERE id=$10 RETURNING *`,
+      [
+        req.body.nome ?? a.nome,
+        req.body.data_nascimento ?? a.data_nascimento,
+        req.body.email ?? a.email,
+        req.body.cpf !== undefined ? soDigitos(req.body.cpf) : a.cpf,
+        req.body.whatsapp ?? a.whatsapp,
+        req.body.status ?? a.status,
+        modalidade, desconto,
+        req.body.observacoes ?? a.observacoes,
+        req.params.id
+      ]
     );
-    if (u.rows.length === 0) return res.status(404).json({ error: 'Aluno não encontrado.' });
+    res.json(r.rows[0]);
+  } catch (e) {
+    if (e.code === '23505') return res.status(409).json({ erro: 'Já existe aluno com este CPF.' });
+    console.error('Erro PUT aluno:', e);
+    res.status(500).json({ erro: 'Erro ao atualizar aluno.' });
+  }
+});
 
-    const prog = await pool.query(
-      `SELECT semana, habilidade, concluido, concluido_em
-       FROM progresso WHERE usuario_id = $1 ORDER BY semana, habilidade`,
-      [uid]
+app.delete('/admin/alunos/:id', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const m = await pool.query(`SELECT COUNT(*)::int AS n FROM matriculas WHERE aluno_id = $1`, [req.params.id]);
+    if (m.rows[0].n > 0) {
+      return res.status(409).json({ erro: 'Aluno possui matrículas registradas. Para preservar o histórico, altere o status para "inativo" em vez de excluir.' });
+    }
+    const r = await pool.query(`DELETE FROM alunos WHERE id = $1 RETURNING id`, [req.params.id]);
+    if (!r.rows.length) return res.status(404).json({ erro: 'Aluno não encontrado.' });
+    res.json({ mensagem: 'Aluno excluído.' });
+  } catch (e) {
+    console.error('Erro DELETE aluno:', e);
+    res.status(500).json({ erro: 'Erro ao excluir aluno.' });
+  }
+});
+
+// ---------- Vínculo aluno ↔ responsável ----------
+app.post('/admin/alunos/:id/responsaveis', autenticar, somenteGestao, async (req, res) => {
+  try {
+    // Aceita responsavel_id (vínculo direto) OU dados do responsável (nome + cpf),
+    // com upsert por CPF: se já existe, atualiza contato e apenas vincula.
+    let respId = req.body.responsavel_id || null;
+    if (!respId) {
+      const erro = obrigatorios(req.body, ['nome', 'cpf']);
+      if (erro) return res.status(400).json({ erro });
+      const cpf = soDigitos(req.body.cpf);
+      if (!cpfValido(cpf)) return res.status(400).json({ erro: 'CPF do responsável inválido — confira os dígitos.' });
+      const existe = await pool.query(`SELECT id FROM responsaveis WHERE cpf = $1`, [cpf]);
+      if (existe.rows.length) {
+        respId = existe.rows[0].id;
+        await pool.query(
+          `UPDATE responsaveis SET nome=$1, email=COALESCE(NULLIF($2,''), email), whatsapp=COALESCE(NULLIF($3,''), whatsapp) WHERE id=$4`,
+          [req.body.nome, req.body.email || '', req.body.whatsapp || '', respId]
+        );
+      } else {
+        const novo = await pool.query(
+          `INSERT INTO responsaveis (nome, cpf, email, whatsapp) VALUES ($1,$2,$3,$4) RETURNING id`,
+          [req.body.nome, cpf, req.body.email || null, req.body.whatsapp || null]
+        );
+        respId = novo.rows[0].id;
+      }
+    }
+    const r = await pool.query(
+      `INSERT INTO aluno_responsavel (aluno_id, responsavel_id, parentesco, responsavel_financeiro)
+       VALUES ($1,$2,$3,$4) RETURNING *`,
+      [req.params.id, respId, req.body.parentesco || null, !!req.body.responsavel_financeiro]
     );
+    res.status(201).json(r.rows[0]);
+  } catch (e) {
+    if (e.code === '23505') return res.status(409).json({ erro: 'Este responsável já está vinculado ao aluno.' });
+    if (e.code === '23503') return res.status(400).json({ erro: 'Aluno ou responsável inexistente.' });
+    console.error('Erro vínculo responsável:', e);
+    res.status(500).json({ erro: 'Erro ao vincular responsável.' });
+  }
+});
 
-    const det = await pool.query(
-      `SELECT semana, habilidade, passo, respostas, atualizado_em
-       FROM progresso_detalhe WHERE usuario_id = $1 ORDER BY semana, habilidade`,
-      [uid]
+app.delete('/admin/alunos/:id/responsaveis/:vinculoId', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const r = await pool.query(
+      `DELETE FROM aluno_responsavel WHERE id = $1 AND aluno_id = $2 RETURNING id`,
+      [req.params.vinculoId, req.params.id]
     );
+    if (!r.rows.length) return res.status(404).json({ erro: 'Vínculo não encontrado.' });
+    res.json({ mensagem: 'Vínculo removido.' });
+  } catch (e) {
+    console.error('Erro remover vínculo:', e);
+    res.status(500).json({ erro: 'Erro ao remover vínculo.' });
+  }
+});
 
-    const NIVEL = {
-      basic: 'Basic (A1→A2)', pre: 'Pre-intermediate (A2→B1)',
-      inter: 'Intermediate (B1→B2)', adv: 'Advanced (B2→C1)'
-    };
-    const SKILLS = ['listening', 'reading', 'speaking', 'writing'];
+// ============================================================
+// 5. CRUD — RESPONSÁVEIS
+// ============================================================
+app.get('/admin/responsaveis', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const { busca } = req.query;
+    const params = [];
+    let where = '';
+    if (busca) { params.push(`%${busca}%`); where = `WHERE nome ILIKE $1 OR cpf ILIKE $1`; }
+    const r = await pool.query(`SELECT * FROM responsaveis ${where} ORDER BY nome`, params);
+    res.json(r.rows);
+  } catch (e) {
+    console.error('Erro GET responsaveis:', e);
+    res.status(500).json({ erro: 'Erro ao listar responsáveis.' });
+  }
+});
 
-    // Helper: verifica se uma entrada de resposta está correta,
-    // suportando tanto o formato novo (objeto com .correct) quanto o legado (boolean)
-    function isCorrect(entry) {
-      if (entry && typeof entry === 'object' && 'correct' in entry) return entry.correct === true;
-      return entry === true || entry === 'correct';
+app.post('/admin/responsaveis', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const erro = obrigatorios(req.body, ['nome', 'cpf']);
+    if (erro) return res.status(400).json({ erro });
+    if (!cpfValido(soDigitos(req.body.cpf))) return res.status(400).json({ erro: 'CPF do responsável inválido — confira os dígitos.' });
+    const r = await pool.query(
+      `INSERT INTO responsaveis (nome, cpf, email, whatsapp) VALUES ($1,$2,$3,$4) RETURNING *`,
+      [req.body.nome, soDigitos(req.body.cpf), req.body.email || null, req.body.whatsapp || null]
+    );
+    res.status(201).json(r.rows[0]);
+  } catch (e) {
+    if (e.code === '23505') return res.status(409).json({ erro: 'Já existe responsável com este CPF.' });
+    console.error('Erro POST responsavel:', e);
+    res.status(500).json({ erro: 'Erro ao cadastrar responsável.' });
+  }
+});
+
+app.put('/admin/responsaveis/:id', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const atual = await pool.query(`SELECT * FROM responsaveis WHERE id = $1`, [req.params.id]);
+    if (!atual.rows.length) return res.status(404).json({ erro: 'Responsável não encontrado.' });
+    const x = atual.rows[0];
+    const r = await pool.query(
+      `UPDATE responsaveis SET nome=$1, cpf=$2, email=$3, whatsapp=$4 WHERE id=$5 RETURNING *`,
+      [
+        req.body.nome ?? x.nome,
+        req.body.cpf !== undefined ? soDigitos(req.body.cpf) : x.cpf,
+        req.body.email ?? x.email,
+        req.body.whatsapp ?? x.whatsapp,
+        req.params.id
+      ]
+    );
+    res.json(r.rows[0]);
+  } catch (e) {
+    if (e.code === '23505') return res.status(409).json({ erro: 'Já existe responsável com este CPF.' });
+    console.error('Erro PUT responsavel:', e);
+    res.status(500).json({ erro: 'Erro ao atualizar responsável.' });
+  }
+});
+
+app.delete('/admin/responsaveis/:id', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const r = await pool.query(`DELETE FROM responsaveis WHERE id = $1 RETURNING id`, [req.params.id]);
+    if (!r.rows.length) return res.status(404).json({ erro: 'Responsável não encontrado.' });
+    res.json({ mensagem: 'Responsável excluído (vínculos com alunos removidos automaticamente).' });
+  } catch (e) {
+    console.error('Erro DELETE responsavel:', e);
+    res.status(500).json({ erro: 'Erro ao excluir responsável.' });
+  }
+});
+
+// ============================================================
+// 6. CRUD — PROFESSORES
+// ============================================================
+app.get('/admin/professores', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const r = await pool.query(`SELECT * FROM professores ORDER BY nome`);
+    res.json(r.rows);
+  } catch (e) {
+    console.error('Erro GET professores:', e);
+    res.status(500).json({ erro: 'Erro ao listar professores.' });
+  }
+});
+
+app.post('/admin/professores', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const erro = obrigatorios(req.body, ['nome']);
+    if (erro) return res.status(400).json({ erro });
+    const r = await pool.query(
+      `INSERT INTO professores (nome, email, formacao, whatsapp, data_nascimento) VALUES ($1,$2,$3,$4,$5) RETURNING *`,
+      [req.body.nome, req.body.email || null, req.body.formacao || null, req.body.whatsapp || null, req.body.data_nascimento || null]
+    );
+    res.status(201).json(r.rows[0]);
+  } catch (e) {
+    console.error('Erro POST professor:', e);
+    res.status(500).json({ erro: 'Erro ao cadastrar professor.' });
+  }
+});
+
+app.put('/admin/professores/:id', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const atual = await pool.query(`SELECT * FROM professores WHERE id = $1`, [req.params.id]);
+    if (!atual.rows.length) return res.status(404).json({ erro: 'Professor não encontrado.' });
+    const x = atual.rows[0];
+    const r = await pool.query(
+      `UPDATE professores SET nome=$1, email=$2, formacao=$3, whatsapp=$4, data_nascimento=$5, status=$6 WHERE id=$7 RETURNING *`,
+      [
+        req.body.nome ?? x.nome, req.body.email ?? x.email, req.body.formacao ?? x.formacao,
+        req.body.whatsapp ?? x.whatsapp, req.body.data_nascimento ?? x.data_nascimento,
+        req.body.status ?? x.status, req.params.id
+      ]
+    );
+    res.json(r.rows[0]);
+  } catch (e) {
+    console.error('Erro PUT professor:', e);
+    res.status(500).json({ erro: 'Erro ao atualizar professor.' });
+  }
+});
+
+app.delete('/admin/professores/:id', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const t = await pool.query(`SELECT COUNT(*)::int AS n FROM turmas WHERE professor_id = $1`, [req.params.id]);
+    if (t.rows[0].n > 0) {
+      return res.status(409).json({ erro: 'Professor vinculado a turmas. Altere o status para "inativo" ou troque o professor das turmas antes de excluir.' });
+    }
+    const r = await pool.query(`DELETE FROM professores WHERE id = $1 RETURNING id`, [req.params.id]);
+    if (!r.rows.length) return res.status(404).json({ erro: 'Professor não encontrado.' });
+    res.json({ mensagem: 'Professor excluído.' });
+  } catch (e) {
+    console.error('Erro DELETE professor:', e);
+    res.status(500).json({ erro: 'Erro ao excluir professor.' });
+  }
+});
+
+// ============================================================
+// 7. CRUD — CURSOS E NÍVEIS
+// ============================================================
+app.get('/admin/cursos', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const cursos = await pool.query(`SELECT * FROM cursos ORDER BY nome`);
+    const niveis = await pool.query(`SELECT * FROM niveis ORDER BY curso_id, ordem`);
+    res.json(cursos.rows.map(c => ({ ...c, niveis: niveis.rows.filter(n => n.curso_id === c.id) })));
+  } catch (e) {
+    console.error('Erro GET cursos:', e);
+    res.status(500).json({ erro: 'Erro ao listar cursos.' });
+  }
+});
+
+app.post('/admin/cursos', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const erro = obrigatorios(req.body, ['nome']);
+    if (erro) return res.status(400).json({ erro });
+    const r = await pool.query(`INSERT INTO cursos (nome) VALUES ($1) RETURNING *`, [req.body.nome]);
+    res.status(201).json(r.rows[0]);
+  } catch (e) {
+    if (e.code === '23505') return res.status(409).json({ erro: 'Já existe curso com este nome.' });
+    console.error('Erro POST curso:', e);
+    res.status(500).json({ erro: 'Erro ao cadastrar curso.' });
+  }
+});
+
+app.post('/admin/niveis', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const erro = obrigatorios(req.body, ['curso_id', 'nome', 'ordem']);
+    if (erro) return res.status(400).json({ erro });
+    const r = await pool.query(
+      `INSERT INTO niveis (curso_id, nome, ordem, carga_horaria) VALUES ($1,$2,$3,$4) RETURNING *`,
+      [req.body.curso_id, req.body.nome, req.body.ordem, req.body.carga_horaria || null]
+    );
+    res.status(201).json(r.rows[0]);
+  } catch (e) {
+    if (e.code === '23505') return res.status(409).json({ erro: 'Já existe nível com este nome neste curso.' });
+    if (e.code === '23503') return res.status(400).json({ erro: 'Curso inexistente.' });
+    console.error('Erro POST nivel:', e);
+    res.status(500).json({ erro: 'Erro ao cadastrar nível.' });
+  }
+});
+
+app.put('/admin/niveis/:id', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const atual = await pool.query(`SELECT * FROM niveis WHERE id = $1`, [req.params.id]);
+    if (!atual.rows.length) return res.status(404).json({ erro: 'Nível não encontrado.' });
+    const x = atual.rows[0];
+    const r = await pool.query(
+      `UPDATE niveis SET nome=$1, ordem=$2, carga_horaria=$3 WHERE id=$4 RETURNING *`,
+      [req.body.nome ?? x.nome, req.body.ordem ?? x.ordem, req.body.carga_horaria ?? x.carga_horaria, req.params.id]
+    );
+    res.json(r.rows[0]);
+  } catch (e) {
+    console.error('Erro PUT nivel:', e);
+    res.status(500).json({ erro: 'Erro ao atualizar nível.' });
+  }
+});
+
+app.delete('/admin/niveis/:id', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const t = await pool.query(`SELECT COUNT(*)::int AS n FROM turmas WHERE nivel_id = $1`, [req.params.id]);
+    if (t.rows[0].n > 0) return res.status(409).json({ erro: 'Nível vinculado a turmas existentes. Exclusão bloqueada para preservar o histórico.' });
+    const r = await pool.query(`DELETE FROM niveis WHERE id = $1 RETURNING id`, [req.params.id]);
+    if (!r.rows.length) return res.status(404).json({ erro: 'Nível não encontrado.' });
+    res.json({ mensagem: 'Nível excluído.' });
+  } catch (e) {
+    console.error('Erro DELETE nivel:', e);
+    res.status(500).json({ erro: 'Erro ao excluir nível.' });
+  }
+});
+
+// ============================================================
+// 8. CRUD — TURMAS
+// ============================================================
+app.get('/admin/turmas', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const { semestre, status } = req.query;
+    const cond = []; const params = [];
+    if (semestre) { params.push(semestre); cond.push(`t.semestre = $${params.length}`); }
+    if (status) { params.push(status); cond.push(`t.status = $${params.length}`); }
+    const where = cond.length ? `WHERE ${cond.join(' AND ')}` : '';
+    const r = await pool.query(
+      `SELECT t.*, n.nome AS nivel_nome, c.nome AS curso_nome, p.nome AS professor_nome,
+              (SELECT COUNT(*)::int FROM matriculas m WHERE m.turma_id = t.id AND m.status = 'ativa') AS matriculados
+       FROM turmas t
+       JOIN niveis n ON n.id = t.nivel_id
+       JOIN cursos c ON c.id = n.curso_id
+       LEFT JOIN professores p ON p.id = t.professor_id
+       ${where}
+       ORDER BY t.semestre DESC, c.nome, n.ordem, t.nome`, params
+    );
+    res.json(r.rows);
+  } catch (e) {
+    console.error('Erro GET turmas:', e);
+    res.status(500).json({ erro: 'Erro ao listar turmas.' });
+  }
+});
+
+app.post('/admin/turmas', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const erro = obrigatorios(req.body, ['nivel_id', 'nome', 'semestre']);
+    if (erro) return res.status(400).json({ erro });
+    let capacidade = req.body.capacidade;
+    if (capacidade === undefined || capacidade === null || capacidade === '') {
+      capacidade = (await getConfig('capacidade_padrao_turma', 15)) || 15;
+    }
+    const r = await pool.query(
+      `INSERT INTO turmas (nivel_id, nome, semestre, turno, horario, professor_id, capacidade)
+       VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
+      [req.body.nivel_id, req.body.nome, req.body.semestre, req.body.turno || null,
+       req.body.horario || null, req.body.professor_id || null, Number(capacidade)]
+    );
+    res.status(201).json(r.rows[0]);
+  } catch (e) {
+    if (e.code === '23505') return res.status(409).json({ erro: 'Já existe turma com este nome neste semestre.' });
+    if (e.code === '23503') return res.status(400).json({ erro: 'Nível ou professor inexistente.' });
+    console.error('Erro POST turma:', e);
+    res.status(500).json({ erro: 'Erro ao cadastrar turma.' });
+  }
+});
+
+app.put('/admin/turmas/:id', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const atual = await pool.query(`SELECT * FROM turmas WHERE id = $1`, [req.params.id]);
+    if (!atual.rows.length) return res.status(404).json({ erro: 'Turma não encontrada.' });
+    const x = atual.rows[0];
+    const r = await pool.query(
+      `UPDATE turmas SET nivel_id=$1, nome=$2, semestre=$3, turno=$4, horario=$5, professor_id=$6, capacidade=$7, status=$8
+       WHERE id=$9 RETURNING *`,
+      [
+        req.body.nivel_id ?? x.nivel_id, req.body.nome ?? x.nome, req.body.semestre ?? x.semestre,
+        req.body.turno ?? x.turno, req.body.horario ?? x.horario,
+        req.body.professor_id !== undefined ? req.body.professor_id : x.professor_id,
+        req.body.capacidade ?? x.capacidade, req.body.status ?? x.status, req.params.id
+      ]
+    );
+    res.json(r.rows[0]);
+  } catch (e) {
+    if (e.code === '23505') return res.status(409).json({ erro: 'Já existe turma com este nome neste semestre.' });
+    console.error('Erro PUT turma:', e);
+    res.status(500).json({ erro: 'Erro ao atualizar turma.' });
+  }
+});
+
+app.delete('/admin/turmas/:id', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const m = await pool.query(`SELECT COUNT(*)::int AS n FROM matriculas WHERE turma_id = $1`, [req.params.id]);
+    if (m.rows[0].n > 0) return res.status(409).json({ erro: 'Turma possui matrículas. Altere o status para "encerrada" em vez de excluir.' });
+    const r = await pool.query(`DELETE FROM turmas WHERE id = $1 RETURNING id`, [req.params.id]);
+    if (!r.rows.length) return res.status(404).json({ erro: 'Turma não encontrada.' });
+    res.json({ mensagem: 'Turma excluída.' });
+  } catch (e) {
+    console.error('Erro DELETE turma:', e);
+    res.status(500).json({ erro: 'Erro ao excluir turma.' });
+  }
+});
+
+// ============================================================
+// 8B. MATRÍCULAS (Fase 2) — vaga validada, valores congelados,
+//     mensalidades geradas automaticamente (R$ 0 para bolsistas)
+// ============================================================
+app.get('/admin/turmas/:id', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const t = await pool.query(
+      `SELECT t.*, n.nome AS nivel_nome, c.nome AS curso_nome, p.nome AS professor_nome
+       FROM turmas t JOIN niveis n ON n.id = t.nivel_id JOIN cursos c ON c.id = n.curso_id
+       LEFT JOIN professores p ON p.id = t.professor_id WHERE t.id = $1`, [req.params.id]);
+    if (!t.rows.length) return res.status(404).json({ erro: 'Turma não encontrada.' });
+    const m = await pool.query(
+      `SELECT m.*, a.nome AS aluno_nome, a.modalidade
+       FROM matriculas m JOIN alunos a ON a.id = m.aluno_id
+       WHERE m.turma_id = $1 ORDER BY a.nome`, [req.params.id]);
+    res.json({ ...t.rows[0], matriculas: m.rows });
+  } catch (e) { console.error('Erro GET turma:', e); res.status(500).json({ erro: 'Erro ao buscar turma.' }); }
+});
+
+app.get('/admin/matriculas', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const cond = []; const params = [];
+    if (req.query.aluno_id) { params.push(req.query.aluno_id); cond.push(`m.aluno_id = $${params.length}`); }
+    if (req.query.turma_id) { params.push(req.query.turma_id); cond.push(`m.turma_id = $${params.length}`); }
+    const where = cond.length ? `WHERE ${cond.join(' AND ')}` : '';
+    const r = await pool.query(
+      `SELECT m.*, a.nome AS aluno_nome, t.nome AS turma_nome, t.semestre, t.turno, t.horario,
+              n.nome AS nivel_nome, c.nome AS curso_nome
+       FROM matriculas m
+       JOIN alunos a ON a.id = m.aluno_id
+       JOIN turmas t ON t.id = m.turma_id
+       JOIN niveis n ON n.id = t.nivel_id
+       JOIN cursos c ON c.id = n.curso_id
+       ${where} ORDER BY t.semestre DESC, a.nome`, params);
+    res.json(r.rows);
+  } catch (e) { console.error('Erro GET matriculas:', e); res.status(500).json({ erro: 'Erro ao listar matrículas.' }); }
+});
+
+app.delete('/admin/contas-receber/:id', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const r = await pool.query(`DELETE FROM contas_receber WHERE id = $1 RETURNING id`, [req.params.id]);
+    if (!r.rows.length) return res.status(404).json({ erro: 'Parcela não encontrada.' });
+    res.json({ mensagem: 'Parcela excluída.' });
+  } catch (e) { console.error('Erro DELETE contas-receber:', e); res.status(500).json({ erro: 'Erro ao excluir a parcela.' }); }
+});
+
+app.post('/admin/turmas/:id/encerrar', autenticar, somenteGestao, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const t = await client.query(`UPDATE turmas SET status='encerrada' WHERE id = $1 RETURNING id, nome`, [req.params.id]);
+    if (!t.rows.length) { await client.query('ROLLBACK'); client.release(); return res.status(404).json({ erro: 'Turma não encontrada.' }); }
+    const m = await client.query(`UPDATE matriculas SET status='concluida' WHERE turma_id = $1 AND status = 'ativa' RETURNING id`, [req.params.id]);
+    await client.query('COMMIT'); client.release();
+    res.json({ mensagem: 'Turma encerrada.', matriculas_concluidas: m.rows.length });
+  } catch (e) {
+    try { await client.query('ROLLBACK'); } catch {}
+    client.release();
+    console.error('Erro encerrar turma:', e);
+    res.status(500).json({ erro: 'Erro ao encerrar a turma.' });
+  }
+});
+
+app.post('/admin/matriculas', autenticar, somenteGestao, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const erro = obrigatorios(req.body, ['aluno_id', 'turma_id']);
+    if (erro) { client.release(); return res.status(400).json({ erro }); }
+
+    await client.query('BEGIN');
+    const tq = await client.query(
+      `SELECT t.*, n.nome AS nivel_nome, c.nome AS curso_nome
+       FROM turmas t JOIN niveis n ON n.id = t.nivel_id JOIN cursos c ON c.id = n.curso_id
+       WHERE t.id = $1 FOR UPDATE OF t`, [req.body.turma_id]);
+    if (!tq.rows.length) { await client.query('ROLLBACK'); client.release(); return res.status(404).json({ erro: 'Turma não encontrada.' }); }
+    const turma = tq.rows[0];
+    if (turma.status === 'encerrada') { await client.query('ROLLBACK'); client.release(); return res.status(409).json({ erro: 'Turma encerrada não recebe matrículas.' }); }
+
+    const aq = await client.query(`SELECT * FROM alunos WHERE id = $1`, [req.body.aluno_id]);
+    if (!aq.rows.length) { await client.query('ROLLBACK'); client.release(); return res.status(404).json({ erro: 'Aluno não encontrado.' }); }
+    const aluno = aq.rows[0];
+    if (aluno.status !== 'ativo') { await client.query('ROLLBACK'); client.release(); return res.status(409).json({ erro: 'Aluno inativo não pode ser matriculado. Reative o cadastro primeiro.' }); }
+
+    const ocup = await client.query(`SELECT COUNT(*)::int AS n FROM matriculas WHERE turma_id = $1 AND status = 'ativa'`, [turma.id]);
+    if (ocup.rows[0].n >= turma.capacidade) {
+      await client.query('ROLLBACK'); client.release();
+      return res.status(409).json({ erro: `Turma lotada — capacidade de ${turma.capacidade} alunos atingida.` });
     }
 
-    // Helper: extrai detalhe de erro legível (questão, escolha do aluno, resposta certa)
-    function extractErroDetalhe(key, qi, entry, tipo) {
-      if (!entry || typeof entry !== 'object' || !('chosen_text' in entry)) return null;
-      return {
-        tipo,
-        pergunta: entry.question || entry.sentence || ('Questão ' + (parseInt(qi) + 1)),
-        resposta_aluno: entry.chosen_text || '—',
-        resposta_correta: entry.correct_text || '—',
+    const bolsista = aluno.modalidade === 'bolsista';
+    const hoje = new Date();
+    const diaVenc = Math.min(Number(await getConfig('dia_vencimento', 10)) || 10, 28);
+
+    // Esquema de lançamento financeiro escolhido no ato:
+    // '1' = 1º semestre (fev–jun) · '2' = 2º semestre (ago–dez) · 'sem' = sem financeiro (bolsista)
+    let semLanc = String(req.body.semestre_lancamento || '').trim();
+    if (!['1', '2', 'sem'].includes(semLanc)) {
+      semLanc = bolsista ? 'sem' : (String(turma.semestre || '').endsWith('.1') ? '1' : '2');
+    }
+    const anoBase = parseInt(String(turma.semestre || '').split('.')[0], 10) || hoje.getFullYear();
+    const mesesSem = semLanc === '1' ? [1, 2, 3, 4, 5] : semLanc === '2' ? [7, 8, 9, 10, 11] : [];
+
+    // Valor da mensalidade (necessário apenas quando há lançamento de parcelas)
+    const tabela = (await getConfig('mensalidades', {})) || {};
+    const valor = Number(tabela[turma.curso_nome] || 0);
+    if (mesesSem.length && !valor) {
+      await client.query('ROLLBACK'); client.release();
+      return res.status(400).json({ erro: `Defina o valor da mensalidade do curso ${turma.curso_nome} em Configurações antes de matricular.` });
+    }
+    const descontoAluno = Number(aluno.desconto_valor || 0);
+    const vDesc = bolsista ? valor : +Math.min(descontoAluno, valor).toFixed(2);
+    const vFinal = +(valor - vDesc).toFixed(2);
+
+    // Taxa de matrícula: geral, paga sempre no ato (bolsista também paga)
+    const taxa = req.body.taxa_matricula !== undefined
+      ? Number(req.body.taxa_matricula) || 0
+      : Number(await getConfig('taxa_matricula', 0)) || 0;
+    const formaTaxa = String(req.body.forma_pagamento_taxa || '').trim();
+    if (taxa > 0 && !formaTaxa) {
+      await client.query('ROLLBACK'); client.release();
+      return res.status(400).json({ erro: 'A taxa de matrícula é paga no ato — informe a forma de pagamento.' });
+    }
+
+    const mIns = await client.query(
+      `INSERT INTO matriculas (aluno_id, turma_id, valor_mensalidade, desconto_aplicado)
+       VALUES ($1,$2,$3,$4) RETURNING *`, [aluno.id, turma.id, valor, vDesc]);
+    const matricula = mIns.rows[0];
+
+    // Mensalidades do semestre escolhido (5 parcelas; bolsista usa "sem financeiro")
+    for (const mes of mesesSem) {
+      const venc = new Date(anoBase, mes, diaVenc);
+      const comp = `${anoBase}-${String(mes + 1).padStart(2, '0')}`;
+      await client.query(
+        `INSERT INTO contas_receber
+           (aluno_id, matricula_id, descricao, competencia, valor_original, desconto, valor_final,
+            vencimento, status, data_pagamento, forma_pagamento, recebido_por)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+        [aluno.id, matricula.id,
+         `Mensalidade ${String(mes + 1).padStart(2, '0')}/${anoBase} — ${turma.curso_nome} ${turma.nivel_nome}`,
+         comp, valor, vDesc, vFinal, venc,
+         bolsista ? 'paga' : 'pendente',
+         bolsista ? hoje : null,
+         bolsista ? 'Bolsa integral' : null,
+         bolsista ? req.usuario.id : null]);
+    }
+    const parcelas = mesesSem.length;
+
+    // Taxa da Plataforma Acadêmica (campo separado): 01/02, 01/08 ou bolsista (não lançar)
+    let plataformaLancada = false;
+    let platMes = String(req.body.plataforma_mes || '').trim(); // '2' | '8' | 'sem'
+    if (!['2', '8', 'sem'].includes(platMes)) {
+      const querPlat = req.body.plataforma === true || req.body.plataforma === 'true';
+      platMes = querPlat && semLanc !== 'sem' ? (semLanc === '1' ? '2' : '8') : 'sem';
+    }
+    if (platMes === '2' || platMes === '8') {
+      const valorPlat = Number(req.body.valor_plataforma) || Number(await getConfig('valor_plataforma', 25)) || 25;
+      const mesPlat = platMes === '2' ? 1 : 7;
+      const vencPlat = new Date(anoBase, mesPlat, 1);
+      const compPlat = `${anoBase}-${String(mesPlat + 1).padStart(2, '0')}`;
+      await client.query(
+        `INSERT INTO contas_receber
+           (aluno_id, matricula_id, descricao, competencia, valor_original, desconto, valor_final,
+            vencimento, status, data_pagamento, forma_pagamento, recebido_por)
+         VALUES ($1,$2,$3,$4,$5,0,$5,$6,'pendente',NULL,NULL,NULL)`,
+        [aluno.id, matricula.id,
+         `Taxa da Plataforma Acadêmica — ${turma.curso_nome} ${turma.nivel_nome}`,
+         compPlat, valorPlat, vencPlat]);
+      plataformaLancada = true;
+    }
+
+    // Lançamento da taxa (já quitada) + dados do recibo automático
+    let recibo = null;
+    if (taxa > 0) {
+      const comp0 = `${hoje.getFullYear()}-${String(hoje.getMonth() + 1).padStart(2, '0')}`;
+      const tIns = await client.query(
+        `INSERT INTO contas_receber
+           (aluno_id, matricula_id, descricao, competencia, valor_original, desconto, valor_final,
+            vencimento, status, data_pagamento, forma_pagamento, recebido_por)
+         VALUES ($1,$2,$3,$4,$5,0,$5,$6,'paga',$6,$7,$8) RETURNING id`,
+        [aluno.id, matricula.id,
+         `Taxa de Matrícula — ${turma.curso_nome} ${turma.nivel_nome} (${turma.nome})`,
+         comp0, taxa, hoje, formaTaxa, req.usuario.id]);
+      recibo = {
+        numero: tIns.rows[0].id, aluno_nome: aluno.nome,
+        curso: turma.curso_nome, nivel: turma.nivel_nome, turma: turma.nome,
+        turno: turma.turno, horario: turma.horario, semestre: turma.semestre,
+        valor: taxa, forma: formaTaxa, data: hoje
       };
     }
+    await client.query('COMMIT'); client.release();
+    res.status(201).json({ matricula, mensalidades_geradas: parcelas, plataforma_lancada: plataformaLancada, bolsista, recibo });
+  } catch (e) {
+    try { await client.query('ROLLBACK'); } catch {}
+    client.release();
+    if (e.code === '23505') return res.status(409).json({ erro: 'Este aluno já está matriculado nesta turma.' });
+    console.error('Erro POST matricula:', e);
+    res.status(500).json({ erro: 'Erro ao efetivar matrícula.' });
+  }
+});
 
-    const semanas = [];
-    for (let s = 0; s < 16; s++) {
-      const habilidades = {};
-      SKILLS.forEach(sk => {
-        const row = prog.rows.find(p => parseInt(p.semana) === s && p.habilidade === sk);
-        const detRow = det.rows.find(d => parseInt(d.semana) === s && d.habilidade === sk);
-        let respostas = {};
-        try { respostas = detRow && detRow.respostas ? (typeof detRow.respostas === 'string' ? JSON.parse(detRow.respostas) : detRow.respostas) : {}; }
-        catch(_) { respostas = {}; }
+app.put('/admin/matriculas/:id', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const novo = req.body.status;
+    if (!['ativa', 'trancada', 'cancelada'].includes(novo)) return res.status(400).json({ erro: 'Status inválido.' });
+    const r = await pool.query(
+      `UPDATE matriculas SET status = $1 WHERE id = $2 AND status <> 'concluida' RETURNING *`,
+      [novo, req.params.id]);
+    if (!r.rows.length) return res.status(404).json({ erro: 'Matrícula não encontrada (ou já concluída).' });
+    if (novo === 'cancelada' || novo === 'trancada') {
+      await pool.query(`UPDATE contas_receber SET status = 'cancelada' WHERE matricula_id = $1 AND status = 'pendente'`, [req.params.id]);
+    }
+    res.json({ mensagem: 'Matrícula atualizada.', matricula: r.rows[0] });
+  } catch (e) { console.error('Erro PUT matricula:', e); res.status(500).json({ erro: 'Erro ao atualizar matrícula.' }); }
+});
 
-        let acertos = 0, total_q = 0;
-        let erros = []; // lista de erros específicos para análise pedagógica
+// ============================================================
+// 8C. CONTAS A RECEBER — extrato e baixa com pontualidade (Fase 3)
+// ============================================================
+app.get('/admin/contas-receber', autenticar, somenteGestao, async (req, res) => {
+  try {
+    await marcarAtrasados();
+    const cond = []; const params = [];
+    if (req.query.aluno_id) { params.push(req.query.aluno_id); cond.push(`cr.aluno_id = $${params.length}`); }
+    if (req.query.status) { params.push(req.query.status); cond.push(`cr.status = $${params.length}`); }
+    if (req.query.competencia) { params.push(req.query.competencia); cond.push(`cr.competencia = $${params.length}`); }
+    if (req.query.busca) {
+      params.push(`%${req.query.busca}%`);
+      cond.push(`(a.nome ILIKE $${params.length} OR cr.cliente_nome ILIKE $${params.length} OR cr.numero_documento ILIKE $${params.length} OR EXISTS (
+        SELECT 1 FROM aluno_responsavel arb JOIN responsaveis rb ON rb.id = arb.responsavel_id
+        WHERE arb.aluno_id = cr.aluno_id AND rb.nome ILIKE $${params.length}))`);
+    }
+    const where = cond.length ? `WHERE ${cond.join(' AND ')}` : '';
+    const r = await pool.query(
+      `SELECT cr.*, COALESCE(a.nome, cr.cliente_nome) AS aluno_nome, t.nome AS turma_nome, t.turno, t.horario, t.semestre,
+              n.nome AS nivel_nome, c.nome AS curso_nome, pgt.nome AS pagante_nome
+       FROM contas_receber cr
+       LEFT JOIN alunos a ON a.id = cr.aluno_id
+       LEFT JOIN matriculas m ON m.id = cr.matricula_id
+       LEFT JOIN turmas t ON t.id = m.turma_id
+       LEFT JOIN niveis n ON n.id = t.nivel_id
+       LEFT JOIN cursos c ON c.id = n.curso_id
+       LEFT JOIN LATERAL (
+         SELECT r2.nome FROM aluno_responsavel ar2
+         JOIN responsaveis r2 ON r2.id = ar2.responsavel_id
+         WHERE ar2.aluno_id = cr.aluno_id AND ar2.responsavel_financeiro = TRUE
+         ORDER BY ar2.id LIMIT 1
+       ) pgt ON TRUE
+       ${where} ORDER BY cr.vencimento, cr.id`, params);
+    res.json(r.rows);
+  } catch (e) { console.error('Erro GET contas-receber:', e); res.status(500).json({ erro: 'Erro ao listar cobranças.' }); }
+});
 
-        Object.keys(respostas).forEach(key => {
-          const isQuestionBlock = ['mc_','tf_','grammar_','vocab_'].some(p => key.startsWith(p));
-          if (!isQuestionBlock) return;
-          const bloco = respostas[key];
-          if (!bloco || typeof bloco !== 'object') return;
+app.post('/admin/contas-receber', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const descricao = String(req.body.descricao || '').trim();
+    const valor = Number(req.body.valor || 0);
+    const vencimento = String(req.body.vencimento || '').trim();
+    if (!descricao) return res.status(400).json({ erro: 'Informe a descrição da cobrança.' });
+    if (!(valor > 0)) return res.status(400).json({ erro: 'Informe um valor maior que zero.' });
+    if (!vencimento) return res.status(400).json({ erro: 'Informe o vencimento.' });
+    const alunoId = req.body.aluno_id ? Number(req.body.aluno_id) : null;
+    const clienteNome = String(req.body.cliente_nome || '').trim() || null;
+    if (!alunoId && !clienteNome) return res.status(400).json({ erro: 'Informe um aluno ou o nome do cliente.' });
+    const competencia = String(req.body.competencia || '').trim() || vencimento.slice(0, 7);
+    const r = await pool.query(
+      `INSERT INTO contas_receber
+         (aluno_id, matricula_id, descricao, competencia, valor_original, desconto, valor_final, vencimento, status, cliente_nome)
+       VALUES ($1, NULL, $2, $3, $4, 0, $4, $5, 'pendente', $6) RETURNING *`,
+      [alunoId, descricao, competencia, valor, vencimento, clienteNome]);
+    res.status(201).json(r.rows[0]);
+  } catch (e) { console.error('Erro POST conta avulsa:', e); res.status(500).json({ erro: 'Erro ao lançar a conta a receber.' }); }
+});
 
-          const tipo = key.startsWith('mc_') ? 'Múltipla escolha'
-                     : key.startsWith('tf_') ? 'Verdadeiro/Falso'
-                     : key.startsWith('grammar_') ? 'Gramática'
-                     : 'Vocabulário';
+app.post('/admin/contas-receber/:id/baixa', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const forma = String(req.body.forma_pagamento || '').trim();
+    if (!forma) return res.status(400).json({ erro: 'Informe a forma de pagamento.' });
 
-          Object.keys(bloco).forEach(qi => {
-            total_q++;
-            const entry = bloco[qi];
-            const ok = isCorrect(entry);
-            if (ok) {
-              acertos++;
-            } else {
-              const detalhe = extractErroDetalhe(key, qi, entry, tipo);
-              if (detalhe) erros.push(detalhe);
-            }
-          });
-        });
-
-        habilidades[sk] = {
-          concluido:    row ? row.concluido : false,
-          concluido_em: row ? row.concluido_em : null,
-          passo_atual:  detRow ? detRow.passo : 0,
-          atualizado_em: detRow ? detRow.atualizado_em : null,
-          acertos,
-          total_questoes: total_q,
-          pct_acerto: total_q > 0 ? Math.round(acertos / total_q * 100) : null,
-          erros: erros.slice(0, 8), // limitar para não sobrecarregar o prompt
-          respostas,
-        };
-      });
-
-      const concluidas = SKILLS.filter(sk => habilidades[sk].concluido).length;
-      semanas.push({
-        semana: s + 1,
-        habilidades,
-        concluidas,
-        completa: concluidas === 4,
-      });
+    const cq = await pool.query(
+      `SELECT cr.*, COALESCE(a.nome, cr.cliente_nome) AS aluno_nome, t.nome AS turma_nome, t.turno, t.horario, t.semestre,
+              n.nome AS nivel_nome, c.nome AS curso_nome
+       FROM contas_receber cr
+       LEFT JOIN alunos a ON a.id = cr.aluno_id
+       LEFT JOIN matriculas m ON m.id = cr.matricula_id
+       LEFT JOIN turmas t ON t.id = m.turma_id
+       LEFT JOIN niveis n ON n.id = t.nivel_id
+       LEFT JOIN cursos c ON c.id = n.curso_id
+       WHERE cr.id = $1`, [req.params.id]);
+    if (!cq.rows.length) return res.status(404).json({ erro: 'Cobrança não encontrada.' });
+    const conta = cq.rows[0];
+    if (!['pendente', 'atrasada'].includes(conta.status)) {
+      return res.status(409).json({ erro: `Esta cobrança já está ${conta.status}.` });
     }
 
-    const total_completas = semanas.filter(s => s.completa).length;
-    const total_hab_concluidas = semanas.reduce((acc, s) =>
-      acc + SKILLS.filter(sk => s.habilidades[sk].concluido).length, 0);
+    const dataPg = req.body.data_pagamento
+      ? new Date(req.body.data_pagamento + 'T12:00:00') : new Date();
+    const valorFinal = Number(conta.valor_final);
 
-    let total_acertos = 0, total_questoes = 0;
-    semanas.forEach(s => {
-      SKILLS.forEach(sk => {
-        total_acertos  += s.habilidades[sk].acertos || 0;
-        total_questoes += s.habilidades[sk].total_questoes || 0;
-      });
-    });
+    // Desconto: usa o informado na baixa; se ausente, sugere a pontualidade (mensalidade paga até o vencimento)
+    const ehMensalidade = String(conta.descricao || '').startsWith('Mensalidade');
+    const pontual = dataPg.toISOString().slice(0, 10) <= new Date(conta.vencimento).toISOString().slice(0, 10);
+    const descCfg = Number(await getConfig('desconto_pontualidade', 0)) || 0;
+    const sugestao = (ehMensalidade && pontual) ? Math.min(descCfg, valorFinal) : 0;
+    let desconto = req.body.desconto !== undefined ? Number(req.body.desconto) || 0 : sugestao;
+    desconto = +Math.max(0, Math.min(desconto, valorFinal)).toFixed(2);
+    const juros = +Math.max(0, Number(req.body.juros || 0)).toFixed(2);
+    let valorRecebido = req.body.valor_recebido !== undefined
+      ? Number(req.body.valor_recebido) || 0
+      : +(valorFinal - desconto + juros).toFixed(2);
+    valorRecebido = +Math.max(0, valorRecebido).toFixed(2);
+
+    await pool.query(
+      `UPDATE contas_receber SET status='paga', data_pagamento=$1, forma_pagamento=$2,
+              desconto_pontualidade=$3, juros=$4, valor_recebido=$5, recebido_por=$6 WHERE id=$7`,
+      [dataPg, forma, desconto, juros, valorRecebido, req.usuario.id, req.params.id]);
 
     res.json({
-      aluno: {
-        ...u.rows[0],
-        nivel_nome: NIVEL[u.rows[0].nivel] || u.rows[0].nivel,
-        data_inicio_fmt: u.rows[0].data_inicio
-          ? new Date(u.rows[0].data_inicio).toLocaleDateString('pt-BR') : '—',
-        ultimo_acesso_fmt: u.rows[0].ultimo_acesso
-          ? new Date(u.rows[0].ultimo_acesso).toLocaleString('pt-BR') : '—',
-      },
-      semanas,
-      resumo: {
-        semanas_completas:     total_completas,
-        percentual_geral:      Math.round(total_completas / 16 * 100),
-        habilidades_concluidas: total_hab_concluidas,
-        total_habilidades:     prog.rows.length,
-        media_acertos:         total_questoes > 0 ? Math.round(total_acertos / total_questoes * 100) : null,
-        total_acertos,
-        total_questoes,
+      mensagem: 'Pagamento registrado.',
+      recibo: {
+        numero: conta.numero_documento, aluno_nome: conta.aluno_nome,
+        referente: conta.descricao + (conta.semestre ? ` · Semestre ${conta.semestre}` : ''),
+        turma: conta.turma_nome, turno: conta.turno, horario: conta.horario,
+        valor_base: valorFinal, desconto, juros, desconto_pontualidade: desconto,
+        valor: valorRecebido, forma, data: dataPg
       }
     });
-  } catch (err) {
-    console.error('[REL-DET]', err);
-    res.status(500).json({ error: 'Erro ao gerar relatório detalhado.' });
+  } catch (e) { console.error('Erro baixa contas-receber:', e); res.status(500).json({ erro: 'Erro ao registrar o pagamento.' }); }
+});
+
+// ============================================================
+// 9. CRUD — FORNECEDORES
+// ============================================================
+app.get('/admin/fornecedores', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const r = await pool.query(`SELECT * FROM fornecedores ORDER BY nome`);
+    res.json(r.rows);
+  } catch (e) {
+    console.error('Erro GET fornecedores:', e);
+    res.status(500).json({ erro: 'Erro ao listar fornecedores.' });
   }
 });
 
-
-// POST /master/relatorio-pedagogico/:id — análise descritiva por IA
-app.post('/master/relatorio-pedagogico/:id', masterMiddleware, async (req, res) => {
-  if (!process.env.ANTHROPIC_API_KEY) return res.status(500).json({ error: 'API não configurada.' });
-
+app.post('/admin/fornecedores', autenticar, somenteGestao, async (req, res) => {
   try {
-    const uid = req.params.id;
-    const { semanas_data, aluno_info } = req.body;
+    const erro = obrigatorios(req.body, ['nome']);
+    if (erro) return res.status(400).json({ erro });
+    const r = await pool.query(
+      `INSERT INTO fornecedores (nome, cpf_cnpj, email, whatsapp, categoria, observacoes)
+       VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
+      [req.body.nome, req.body.cpf_cnpj || null, req.body.email || null,
+       req.body.whatsapp || null, req.body.categoria || null, req.body.observacoes || null]
+    );
+    res.status(201).json(r.rows[0]);
+  } catch (e) {
+    console.error('Erro POST fornecedor:', e);
+    res.status(500).json({ erro: 'Erro ao cadastrar fornecedor.' });
+  }
+});
 
-    const nomeAluno   = (aluno_info && aluno_info.nome)             || 'o aluno';
-    const nivel       = (aluno_info && aluno_info.nivel)            || 'basic';
-    const semComp     = (aluno_info && aluno_info.semanas_completas) || 0;
-    const pctGeral    = (aluno_info && aluno_info.pct_geral)        || 0;
+app.put('/admin/fornecedores/:id', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const atual = await pool.query(`SELECT * FROM fornecedores WHERE id = $1`, [req.params.id]);
+    if (!atual.rows.length) return res.status(404).json({ erro: 'Fornecedor não encontrado.' });
+    const x = atual.rows[0];
+    const r = await pool.query(
+      `UPDATE fornecedores SET nome=$1, cpf_cnpj=$2, email=$3, whatsapp=$4, categoria=$5, observacoes=$6, status=$7
+       WHERE id=$8 RETURNING *`,
+      [
+        req.body.nome ?? x.nome, req.body.cpf_cnpj ?? x.cpf_cnpj, req.body.email ?? x.email,
+        req.body.whatsapp ?? x.whatsapp, req.body.categoria ?? x.categoria,
+        req.body.observacoes ?? x.observacoes, req.body.status ?? x.status, req.params.id
+      ]
+    );
+    res.json(r.rows[0]);
+  } catch (e) {
+    console.error('Erro PUT fornecedor:', e);
+    res.status(500).json({ erro: 'Erro ao atualizar fornecedor.' });
+  }
+});
 
-    // ── Mapa pedagógico fixo das semanas (do activities.js) ──────────────
-    const SEMANAS_CONTEUDO = {
-      1: {
-        tema: "Diagnostic Week — First Day at the Language Centre",
-        topicos: ["Apresentacao pessoal","Verbo TO BE","Pronomes pessoais e possessivos","Numeros, nacionalidades, profissoes"],
-        grammar: "Verbo TO BE — presente simples (afirmativa, negativa, interrogativa)",
-        writing_min: 60,
-        reading_text: "Tres perfis: Tom, Fatima, Lucas — identidade, rotinas e preferencias",
-        speaking_context: "Apresentacao pessoal e perguntas sobre identidade"
-      },
-      2: {
-        tema: "Daily Routines — A Morning at Home",
-        topicos: ["Vocabulario de rotina diaria","Adverbios de frequencia (always, usually, often, sometimes, never)","Expressoes de tempo (first, then, after that, finally)","Present Simple — habitos"],
-        grammar: "Adverbios de frequencia — posicao na frase (antes do verbo principal, depois do TO BE)",
-        writing_min: 80,
-        reading_text: "Rotinas de Hana (Toquio), Pedro (Buenos Aires), Amina (Nairobi)",
-        speaking_context: "Descricao de rotina matinal com expressoes de tempo"
-      },
-      3: {
-        tema: "At School — Subjects and Timetables",
-        topicos: ["Vocabulario escolar (subject, timetable, break, classmate, homework)","Question words (What, When, Where, Who, How)","Present Simple — perguntas e negativas (do/does, dont/doesnt)"],
-        grammar: "Present Simple — questions e negatives com DO/DOES (base verb sem -s depois de does)",
-        writing_min: 90,
-        reading_text: "Tom (Londres), Yuki (Osaka), Marco (Sao Paulo) descrevem rotina escolar",
-        speaking_context: "Perguntas e respostas sobre vida escolar com question words"
-      },
-      4: {
-        tema: "Free Time and Hobbies",
-        topicos: ["Vocabulario de hobbies e tempo livre","Modal CAN para habilidade (I can play, she cant swim)","Comparacao de hobbies entre culturas","Conectores: although, however, but"],
-        grammar: "CAN / CANT — habilidade (mesma forma para todos os sujeitos, sem -s; base verb depois)",
-        writing_min: 100,
-        reading_text: "Elena (Espanha/flamenco), Daniel (Africa do Sul/fotografia), Mei (Taiwan/selos), Tomas (Portugal/skate)",
-        speaking_context: "Descrever hobbies e habilidades usando can e cant com exemplos pessoais"
-      },
-      5: {
-        tema: "Food and Health — What Do You Usually Eat?",
-        topicos: ["Vocabulario de alimentos e refeicoes","There is/are + some (afirmativas) / any (negativas e perguntas)","Much/many com contaveis e incontaveis","Habitos alimentares e saude"],
-        grammar: "There is/There are + some/any (some em positivas, any em negativas e perguntas)",
-        writing_min: 110,
-        reading_text: "Carlos (Mexico), Fatima (Marrocos), Kenji (Japao), Sofia (Sao Paulo) — habitos alimentares",
-        speaking_context: "Descrever comida em casa usando there is/are some/any em contexto real"
-      },
-      6: {
-        tema: "A Memorable Trip — Travelling and Past Events",
-        topicos: ["Vocabulario de viagem (historic, spectacular, steep, stunning, nostalgic)","Past Simple — verbos regulares (-ed) e irregulares (go/went, fly/flew, wake/woke, eat/ate, take/took, feel/felt)","Negative: didnt + base verb","Questions: Did + subject + base verb?","Sequencing connectors: first, then, after that, on the second day, finally"],
-        grammar: "Past Simple — regulares (+ed) e irregulares: go/went, fly/flew, wake/woke, eat/ate, take/took, feel/felt, find/found, meet/met, see/saw. Negative: didnt + base verb. Question: Did + base verb?",
-        writing_min: 120,
-        reading_text: "Isabela (Brasil/Dublin), Marcus (Africa do Sul/Sudeste Asiatico), Yuki (Japao/competicao de robotica) — viagens marcantes",
-        speaking_context: "Narrar uma viagem memoravel usando Past Simple e conectores de sequencia (first, then, finally)"
-      }
-    };
+app.delete('/admin/fornecedores/:id', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const c = await pool.query(`SELECT COUNT(*)::int AS n FROM contas_pagar WHERE fornecedor_id = $1`, [req.params.id]);
+    if (c.rows[0].n > 0) return res.status(409).json({ erro: 'Fornecedor possui contas registradas. Altere o status para "inativo" em vez de excluir.' });
+    const r = await pool.query(`DELETE FROM fornecedores WHERE id = $1 RETURNING id`, [req.params.id]);
+    if (!r.rows.length) return res.status(404).json({ erro: 'Fornecedor não encontrado.' });
+    res.json({ mensagem: 'Fornecedor excluído.' });
+  } catch (e) {
+    console.error('Erro DELETE fornecedor:', e);
+    res.status(500).json({ erro: 'Erro ao excluir fornecedor.' });
+  }
+});
 
-    // ── Construir dados de desempenho por semana/habilidade ───────────────
-    let dadosPorSemana = [];
-    let totalAcertos = 0, totalQuestoes = 0;
-    let habConcluidas = { listening:0, reading:0, speaking:0, writing:0 };
-    let semanasFeitas = 0;
+// ============================================================
+// 9B. CONTAS A PAGAR (Fase 3) + marcação automática de atrasados
+// ============================================================
+app.get('/admin/contas-pagar', autenticar, somenteGestao, async (req, res) => {
+  try {
+    await marcarAtrasados();
+    const cond = []; const params = [];
+    if (req.query.status) { params.push(req.query.status); cond.push(`cp.status = $${params.length}`); }
+    if (req.query.categoria) { params.push(req.query.categoria); cond.push(`cp.categoria = $${params.length}`); }
+    if (req.query.busca) { params.push(`%${req.query.busca}%`); cond.push(`(cp.descricao ILIKE $${params.length} OR f.nome ILIKE $${params.length})`); }
+    const where = cond.length ? `WHERE ${cond.join(' AND ')}` : '';
+    const r = await pool.query(
+      `SELECT cp.*, f.nome AS fornecedor_nome
+       FROM contas_pagar cp LEFT JOIN fornecedores f ON f.id = cp.fornecedor_id
+       ${where} ORDER BY cp.vencimento, cp.id`, params);
+    res.json(r.rows);
+  } catch (e) { console.error('Erro GET contas-pagar:', e); res.status(500).json({ erro: 'Erro ao listar contas a pagar.' }); }
+});
 
-    if (semanas_data && semanas_data.length) {
-      semanas_data.forEach(s => {
-        const habsDone = Object.keys(s.habilidades || {})
-          .filter(sk => s.habilidades[sk] && s.habilidades[sk].concluido);
-        if (!habsDone.length) return;
-        semanasFeitas++;
+app.post('/admin/contas-pagar', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const erro = obrigatorios(req.body, ['descricao', 'valor', 'vencimento']);
+    if (erro) return res.status(400).json({ erro });
+    const r = await pool.query(
+      `INSERT INTO contas_pagar (fornecedor_id, descricao, categoria, valor, vencimento, criado_por)
+       VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
+      [req.body.fornecedor_id || null, req.body.descricao, req.body.categoria || null,
+       Number(req.body.valor), req.body.vencimento, req.usuario.id]);
+    res.status(201).json(r.rows[0]);
+  } catch (e) { console.error('Erro POST contas-pagar:', e); res.status(500).json({ erro: 'Erro ao cadastrar conta a pagar.' }); }
+});
 
-        const conteudo = SEMANAS_CONTEUDO[s.semana] || {};
-        const semInfo = {
-          semana: s.semana,
-          tema: conteudo.tema || `Semana ${s.semana}`,
-          completa: s.completa,
-          habilidades: {}
-        };
+app.put('/admin/contas-pagar/:id', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const atual = await pool.query(`SELECT * FROM contas_pagar WHERE id = $1`, [req.params.id]);
+    if (!atual.rows.length) return res.status(404).json({ erro: 'Conta não encontrada.' });
+    const x = atual.rows[0];
+    const r = await pool.query(
+      `UPDATE contas_pagar SET fornecedor_id=$1, descricao=$2, categoria=$3, valor=$4, vencimento=$5 WHERE id=$6 RETURNING *`,
+      [req.body.fornecedor_id !== undefined ? req.body.fornecedor_id : x.fornecedor_id,
+       req.body.descricao ?? x.descricao, req.body.categoria ?? x.categoria,
+       req.body.valor !== undefined ? Number(req.body.valor) : x.valor,
+       req.body.vencimento ?? x.vencimento, req.params.id]);
+    res.json(r.rows[0]);
+  } catch (e) { console.error('Erro PUT contas-pagar:', e); res.status(500).json({ erro: 'Erro ao atualizar conta a pagar.' }); }
+});
 
-        habsDone.forEach(sk => {
-          habConcluidas[sk]++;
-          const h = s.habilidades[sk];
-          let ac = 0, tot = 0;
-          let textoEscrito = '';
-          let falasTranscrita = '';
+app.post('/admin/contas-pagar/:id/baixa', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const forma = String(req.body.forma_pagamento || '').trim();
+    if (!forma) return res.status(400).json({ erro: 'Informe a forma de pagamento.' });
+    const dataPg = req.body.data_pagamento ? new Date(req.body.data_pagamento + 'T12:00:00') : new Date();
+    const r = await pool.query(
+      `UPDATE contas_pagar SET status='paga', data_pagamento=$1, forma_pagamento=$2 WHERE id=$3 AND status <> 'cancelada' RETURNING *`,
+      [dataPg, forma, req.params.id]);
+    if (!r.rows.length) return res.status(404).json({ erro: 'Conta não encontrada (ou cancelada).' });
+    res.json({ mensagem: 'Conta paga.', conta: r.rows[0] });
+  } catch (e) { console.error('Erro baixa contas-pagar:', e); res.status(500).json({ erro: 'Erro ao pagar a conta.' }); }
+});
 
-          if (h.respostas) {
-            Object.keys(h.respostas).forEach(key => {
-              if (['mc_','tf_','grammar_','vocab_'].some(p => key.startsWith(p))) {
-                const bloco = h.respostas[key];
-                if (bloco && typeof bloco === 'object') {
-                  Object.keys(bloco).forEach(qi => {
-                    tot++; if (bloco[qi] === true) ac++;
-                  });
-                }
-              }
-            });
-            if (h.respostas.write_text) textoEscrito = String(h.respostas.write_text).substring(0,400);
-            if (h.respostas.speaking_transcript) falasTranscrita = String(h.respostas.speaking_transcript).substring(0,300);
-          }
+app.delete('/admin/contas-pagar/:id', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const r = await pool.query(`DELETE FROM contas_pagar WHERE id = $1 RETURNING id`, [req.params.id]);
+    if (!r.rows.length) return res.status(404).json({ erro: 'Conta não encontrada.' });
+    res.json({ mensagem: 'Conta a pagar excluída.' });
+  } catch (e) { console.error('Erro DELETE contas-pagar:', e); res.status(500).json({ erro: 'Erro ao excluir conta a pagar.' }); }
+});
 
-          totalAcertos  += ac;
-          totalQuestoes += tot;
+// ============================================================
+// 9C. RELATÓRIOS (Fase 5 — núcleo financeiro e de turmas)
+// ============================================================
+app.get('/admin/relatorios/financeiro', autenticar, somenteGestao, async (req, res) => {
+  try {
+    await marcarAtrasados();
+    const hoje = new Date();
+    const ini = req.query.inicio || `${hoje.getFullYear()}-${String(hoje.getMonth() + 1).padStart(2, '0')}-01`;
+    const fim = req.query.fim || hoje.toISOString().slice(0, 10);
 
-          semInfo.habilidades[sk] = {
-            pct: h.pct_acerto !== null && h.pct_acerto !== undefined ? h.pct_acerto : (tot > 0 ? Math.round(ac/tot*100) : null),
-            acertos: ac, total: tot,
-            data: h.concluido_em ? new Date(h.concluido_em).toLocaleDateString('pt-BR') : null,
-            texto: textoEscrito,
-            fala: falasTranscrita,
-            erros: h.erros || [],
-          };
-        });
-        dadosPorSemana.push(semInfo);
-      });
-    }
+    const recebido = await pool.query(
+      `SELECT COALESCE(SUM(COALESCE(valor_recebido, valor_final - desconto_pontualidade)),0)::numeric AS total, COUNT(*)::int AS qtd
+       FROM contas_receber WHERE status='paga' AND data_pagamento::date BETWEEN $1 AND $2`, [ini, fim]);
+    const porForma = await pool.query(
+      `SELECT forma_pagamento, COALESCE(SUM(COALESCE(valor_recebido, valor_final - desconto_pontualidade)),0)::numeric AS total, COUNT(*)::int AS qtd
+       FROM contas_receber WHERE status='paga' AND data_pagamento::date BETWEEN $1 AND $2
+       GROUP BY forma_pagamento ORDER BY total DESC`, [ini, fim]);
+    const aberto = await pool.query(
+      `SELECT COALESCE(SUM(valor_final),0)::numeric AS total, COUNT(*)::int AS qtd,
+              COALESCE(SUM(valor_final) FILTER (WHERE status='atrasada'),0)::numeric AS total_atrasado,
+              COUNT(*) FILTER (WHERE status='atrasada')::int AS qtd_atrasado
+       FROM contas_receber WHERE status IN ('pendente','atrasada')`);
+    const pontualidade = await pool.query(
+      `SELECT COALESCE(SUM(desconto_pontualidade),0)::numeric AS total
+       FROM contas_receber WHERE status='paga' AND data_pagamento::date BETWEEN $1 AND $2`, [ini, fim]);
+    const bolsas = await pool.query(
+      `SELECT COALESCE(SUM(valor_original),0)::numeric AS total, COUNT(*)::int AS qtd
+       FROM contas_receber WHERE forma_pagamento='Bolsa integral' AND data_pagamento::date BETWEEN $1 AND $2`, [ini, fim]);
+    const pago = await pool.query(
+      `SELECT COALESCE(SUM(valor),0)::numeric AS total, COUNT(*)::int AS qtd
+       FROM contas_pagar WHERE status='paga' AND data_pagamento::date BETWEEN $1 AND $2`, [ini, fim]);
+    const aPagar = await pool.query(
+      `SELECT COALESCE(SUM(valor),0)::numeric AS total, COUNT(*)::int AS qtd,
+              COALESCE(SUM(valor) FILTER (WHERE status='atrasada'),0)::numeric AS total_atrasado
+       FROM contas_pagar WHERE status IN ('pendente','atrasada')`);
 
-    // ── Montar bloco de dados para o prompt ───────────────────────────────
-    let blocoDesempenho = '';
-    dadosPorSemana.forEach(s => {
-      const c = SEMANAS_CONTEUDO[s.semana] || {};
-      blocoDesempenho += `\n\n═══ SEMANA ${s.semana}: ${s.tema} ${s.completa ? '[COMPLETA]' : '[PARCIAL]'} ═══`;
-      blocoDesempenho += `\nConteúdo trabalhado: ${(c.topicos||[]).join(' | ')}`;
-      blocoDesempenho += `\nFoco gramatical: ${c.grammar || 'N/D'}`;
-
-      const SKILL_LABEL = {listening:'LISTENING',reading:'READING',speaking:'SPEAKING',writing:'WRITING'};
-      Object.entries(s.habilidades).forEach(([sk, h]) => {
-        blocoDesempenho += `\n\n  [${SKILL_LABEL[sk]}]`;
-        if (h.pct !== null) {
-          blocoDesempenho += ` — ${h.pct}% de acerto`;
-          if (h.total > 0) blocoDesempenho += ` (${h.acertos}/${h.total} questões)`;
-          if (h.data) blocoDesempenho += ` — concluído em ${h.data}`;
-        } else {
-          blocoDesempenho += ` — concluído (sem registro de questões individuais)`;
-        }
-        if (sk === 'writing' && c.writing_min) {
-          blocoDesempenho += `\n  Tarefa de escrita: produção mínima de ${c.writing_min} palavras | tema: ${c.tema || 'N/D'}`;
-        }
-        if (sk === 'reading' && c.reading_text) {
-          blocoDesempenho += `\n  Textos lidos: ${c.reading_text}`;
-        }
-        if (sk === 'speaking' && c.speaking_context) {
-          blocoDesempenho += `\n  Contexto oral: ${c.speaking_context}`;
-        }
-        if (h.texto) blocoDesempenho += `\n  Amostra de escrita: "${h.texto}"`;
-        if (h.fala)  blocoDesempenho += `\n  Transcrição de fala: "${h.fala}"`;
-        if (h.erros && h.erros.length) {
-          blocoDesempenho += `\n  Erros específicos registrados:`;
-          h.erros.forEach(e => {
-            blocoDesempenho += `\n    • [${e.tipo}] "${e.pergunta}" — aluno respondeu "${e.resposta_aluno}", correto era "${e.resposta_correta}"`;
-          });
-        }
-      });
+    res.json({
+      periodo: { inicio: ini, fim },
+      recebido: recebido.rows[0], por_forma: porForma.rows, a_receber: aberto.rows[0],
+      pontualidade_concedida: pontualidade.rows[0].total, bolsas: bolsas.rows[0],
+      pago: pago.rows[0], a_pagar: aPagar.rows[0]
     });
-
-    if (!blocoDesempenho) {
-      blocoDesempenho = '\nNenhuma atividade concluída registrada no sistema. O aluno está no início do programa.';
-    }
-
-    const mediaAcertos = totalQuestoes > 0 ? Math.round(totalAcertos/totalQuestoes*100) : null;
-    const perfilEstatistico = `Semanas completas: ${semComp}/16 (${pctGeral}%) | Habilidades: L=${habConcluidas.listening} R=${habConcluidas.reading} S=${habConcluidas.speaking} W=${habConcluidas.writing} | Média de acertos: ${mediaAcertos !== null ? mediaAcertos+'%' : 'sem dados'}`;
-
-    // ── Prompt pedagógico ─────────────────────────────────────────────────
-    const prompt = `Você é um especialista em avaliação de inglês como língua estrangeira (EFL), com sólida formação em descritores CEFR A1-A2 e experiência em ensino comunicativo de idiomas.
-
-Produza um RELATÓRIO PEDAGÓGICO INDIVIDUAL completo, em português brasileiro, para o professor responsável pela turma.
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-ALUNO: ${nomeAluno}
-Nível: Basic (A1→A2) | Programa: 16 semanas
-${perfilEstatistico}
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-DADOS DE DESEMPENHO (extraídos da plataforma Lenglish):
-${blocoDesempenho}
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-ESTRUTURA OBRIGATÓRIA DO RELATÓRIO:
-
-**LISTENING — Compreensão Oral**
-Descreva o desempenho do aluno nas atividades de compreensão oral realizadas. Inclua: nível demonstrado, capacidade de identificar informações específicas, reconhecimento de vocabulário em contexto auditivo. Se há dados de acertos, interprete-os pedagogicamente. Cite o conteúdo trabalhado.
-
-**READING — Compreensão Leitora**
-Analise o desempenho nas leituras. Inclua: capacidade de localizar informação, inferência, compreensão de vocabulário contextual e habilidade de reflexão escrita (reflection). Cite os textos trabalhados.
-
-**SPEAKING — Produção Oral**
-Avalie a habilidade oral com base nas atividades de pronúncia, diálogo e produção livre. Inclua: fluência esperada para o nível, capacidade de interação, uso de expressões-alvo. Se há transcrição, analise-a.
-
-**WRITING — Produção Escrita**
-Analise a produção escrita. Inclua: domínio gramatical (especialmente o foco gramatical da semana), organização textual, vocabulário utilizado, atendimento ao mínimo de palavras. Se há amostra de texto, analise-a diretamente.
-
-**SÍNTESE DO PERFIL DE APRENDIZAGEM**
-Integre as quatro competências numa visão holística do aluno. Identifique pontos fortes, padrões de dificuldade e ritmo de aprendizagem.
-
-**RECOMENDAÇÕES PEDAGÓGICAS**
-Liste 4 a 6 ações concretas e específicas para o professor: atividades complementares, foco de atenção nas próximas semanas, estratégias de intervenção personalizadas para este aluno.
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-DIRETRIZES:
-- Use linguagem técnica mas acessível
-- Seja específico: cite conteúdos, gramática e atividades pelo nome
-- NÃO use termos genéricos como "o aluno demonstrou bom desempenho" sem fundamento nos dados
-- Se os dados forem limitados, baseie a análise no descritor CEFR A1 e no conteúdo trabalhado nas semanas concluídas
-- Quando houver "Erros específicos registrados", analise o PADRÃO dos erros (ex: confusão entre tempos verbais, vocabulário específico, falsos cognatos) — não apenas reporte o percentual
-- Use os erros específicos para fundamentar recomendações pedagógicas concretas e individualizadas
-- Tamanho mínimo: 600 palavras`;
-
-    const https = require('https');
-    const bodyData = JSON.stringify({
-      model: 'claude-sonnet-4-6',
-      max_tokens: 2000,
-      messages: [{ role: 'user', content: prompt }]
-    });
-
-    const options = {
-      hostname: 'api.anthropic.com',
-      path: '/v1/messages',
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': process.env.ANTHROPIC_API_KEY,
-        'anthropic-version': '2023-06-01',
-        'Content-Length': Buffer.byteLength(bodyData)
-      },
-      timeout: 60000
-    };
-
-    const chunks = [];
-    const req2 = https.request(options, (r2) => {
-      r2.on('data', c => chunks.push(c));
-      r2.on('end', () => {
-        try {
-          const raw = JSON.parse(Buffer.concat(chunks).toString());
-          if (raw.error) {
-            console.error('[PED] API error:', JSON.stringify(raw.error));
-            return res.status(500).json({ error: 'Erro da API: ' + (raw.error.message || JSON.stringify(raw.error)) });
-          }
-          const text = (raw.content && raw.content[0] && raw.content[0].text) || '';
-          if (!text) {
-            console.error('[PED] Texto vazio. stop_reason:', raw.stop_reason, '| usage:', JSON.stringify(raw.usage));
-            return res.status(500).json({ error: 'Resposta vazia da IA.' });
-          }
-          res.json({ analise: text });
-        } catch(e) {
-          console.error('[PED] Parse:', e.message);
-          res.status(500).json({ error: 'Erro ao processar.' });
-        }
-      });
-    });
-    req2.on('error', e => { console.error('[PED] Net:', e.message); res.status(500).json({ error: 'Erro de rede.' }); });
-    req2.on('timeout', () => { req2.destroy(); res.status(504).json({ error: 'Timeout.' }); });
-    req2.write(bodyData);
-    req2.end();
-
-  } catch (err) {
-    console.error('[PED]', err);
-    res.status(500).json({ error: 'Erro interno.' });
-  }
+  } catch (e) { console.error('Erro relatório financeiro:', e); res.status(500).json({ erro: 'Erro ao gerar relatório financeiro.' }); }
 });
 
-
-
-// GET /master/progresso-geral — resumo de progresso de todos os alunos aprovados (uma só chamada)
-app.get('/master/progresso-geral', masterMiddleware, async (req, res) => {
+app.get('/admin/relatorios/turmas', autenticar, somenteGestao, async (req, res) => {
   try {
-    const result = await pool.query(
-      `SELECT
-         u.id, u.nome, u.sobrenome, u.codigo, u.nivel, u.instituicao,
-         u.data_inicio, u.ultimo_acesso,
-         COUNT(p.id) FILTER (WHERE p.concluido = true) AS hab_concluidas,
-         COUNT(p.id) AS hab_total,
-         COUNT(DISTINCT p.semana) FILTER (
-           WHERE p.concluido = true AND (
-             SELECT COUNT(*) FROM progresso p2
-             WHERE p2.usuario_id = u.id AND p2.semana = p.semana AND p2.concluido = true
-           ) = 4
-         ) AS semanas_completas
-       FROM usuarios u
-       LEFT JOIN progresso p ON p.usuario_id = u.id
-       WHERE u.status_cadastro = 'aprovado'
-       GROUP BY u.id
-       ORDER BY u.data_inicio DESC`
-    );
+    const cond = []; const params = [];
+    if (req.query.semestre) { params.push(req.query.semestre); cond.push(`t.semestre = $${params.length}`); }
+    const where = cond.length ? `WHERE ${cond.join(' AND ')}` : '';
+    const r = await pool.query(
+      `SELECT t.id, t.nome, t.semestre, t.turno, t.horario, t.capacidade, t.status,
+              c.nome AS curso_nome, n.nome AS nivel_nome, p.nome AS professor_nome,
+              (SELECT COUNT(*)::int FROM matriculas m WHERE m.turma_id=t.id AND m.status='ativa') AS matriculados,
+              (SELECT COUNT(*)::int FROM matriculas m JOIN alunos a ON a.id=m.aluno_id WHERE m.turma_id=t.id AND m.status='ativa' AND a.modalidade='bolsista') AS bolsistas
+       FROM turmas t JOIN niveis n ON n.id=t.nivel_id JOIN cursos c ON c.id=n.curso_id
+       LEFT JOIN professores p ON p.id=t.professor_id
+       ${where} ORDER BY t.semestre DESC, c.nome, n.ordem, t.nome`, params);
+    res.json(r.rows);
+  } catch (e) { console.error('Erro relatório turmas:', e); res.status(500).json({ erro: 'Erro ao gerar relatório de turmas.' });
 
-    const alunos = result.rows.map(r => ({
-      id:                parseInt(r.id),
-      nome:              r.nome,
-      sobrenome:         r.sobrenome,
-      codigo:            r.codigo,
-      nivel:             r.nivel,
-      instituicao:       r.instituicao,
-      data_inicio:       r.data_inicio,
-      ultimo_acesso:     r.ultimo_acesso,
-      hab_concluidas:    parseInt(r.hab_concluidas) || 0,
-      hab_total:         parseInt(r.hab_total) || 64,
-      semanas_completas: parseInt(r.semanas_completas) || 0,
-      percentual:        Math.round((parseInt(r.semanas_completas) || 0) / 16 * 100),
-    }));
-
-    res.json({ alunos });
-  } catch (err) {
-    console.error('[PROG-GERAL]', err);
-    res.status(500).json({ error: 'Erro ao buscar progresso geral.' });
-  }
-});
-
-
-// PATCH /master/aluno/:id/resetar-senha — professor define nova senha para o aluno
-app.patch('/master/aluno/:id/resetar-senha', masterMiddleware, async (req, res) => {
-  const { senha_nova } = req.body;
-  if (!senha_nova || senha_nova.length < 6) {
-    return res.status(400).json({ error: 'Senha nova deve ter mínimo 6 caracteres.' });
-  }
+app.get('/admin/relatorios/financeiro-detalhado', autenticar, somenteGestao, async (req, res) => {
   try {
-    const u = await pool.query(
-      'SELECT nome, email, codigo FROM usuarios WHERE id = $1',
-      [req.params.id]
-    );
-    if (u.rows.length === 0) return res.status(404).json({ error: 'Aluno não encontrado.' });
+    await marcarAtrasados();
+    const hoje = new Date();
+    const ini = req.query.inicio || `${hoje.getFullYear()}-${String(hoje.getMonth() + 1).padStart(2, '0')}-01`;
+    const fim = req.query.fim || hoje.toISOString().slice(0, 10);
 
-    const novaHash = await bcrypt.hash(senha_nova, 10);
-    await pool.query('UPDATE usuarios SET senha_hash = $1 WHERE id = $2', [novaHash, req.params.id]);
+    const SELECT = `
+      SELECT cr.id, cr.descricao, cr.competencia, cr.vencimento, cr.valor_final, cr.desconto_pontualidade,
+             cr.data_pagamento, cr.forma_pagamento, cr.status,
+             COALESCE(a.nome, cr.cliente_nome) AS aluno_nome, pgt.nome AS pagante_nome,
+             CASE WHEN cr.descricao LIKE 'Mensalidade%' THEN
+               (SELECT COUNT(*) FROM contas_receber x WHERE x.matricula_id = cr.matricula_id
+                 AND x.descricao LIKE 'Mensalidade%' AND x.vencimento <= cr.vencimento) END AS parcela_num,
+             CASE WHEN cr.descricao LIKE 'Mensalidade%' THEN
+               (SELECT COUNT(*) FROM contas_receber x WHERE x.matricula_id = cr.matricula_id
+                 AND x.descricao LIKE 'Mensalidade%') END AS parcela_total
+      FROM contas_receber cr
+      LEFT JOIN alunos a ON a.id = cr.aluno_id
+      LEFT JOIN LATERAL (
+        SELECT r2.nome FROM aluno_responsavel ar2 JOIN responsaveis r2 ON r2.id = ar2.responsavel_id
+        WHERE ar2.aluno_id = cr.aluno_id AND ar2.responsavel_financeiro = TRUE ORDER BY ar2.id LIMIT 1
+      ) pgt ON TRUE `;
 
-    const aluno = u.rows[0];
+    const recebidas = await pool.query(
+      `${SELECT} WHERE cr.status='paga' AND cr.data_pagamento::date BETWEEN $1 AND $2
+       ORDER BY cr.data_pagamento, pgt.nome NULLS LAST, a.nome`, [ini, fim]);
+    const aReceber = await pool.query(
+      `${SELECT} WHERE cr.status='pendente' AND cr.vencimento BETWEEN $1 AND $2
+       ORDER BY cr.vencimento, pgt.nome NULLS LAST, a.nome`, [ini, fim]);
+    const vencidas = await pool.query(
+      `${SELECT} WHERE cr.status='atrasada' AND cr.vencimento <= $1
+       ORDER BY cr.vencimento, pgt.nome NULLS LAST, a.nome`, [fim]);
 
-    // Notificar o aluno por e-mail (best-effort, não bloqueia a resposta)
-    if (aluno.email) {
-      resend.emails.send({
-        from: process.env.RESEND_FROM_EMAIL || 'noreply@lenglish.com.br',
-        to: aluno.email,
-        subject: 'Sua senha foi redefinida — Lenglish',
-        html: `
-          <div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;padding:32px 24px">
-            <h1 style="color:#0033A0;font-size:28px;margin-bottom:4px">Leng<span style="color:#CC0000">lish</span></h1>
-            <p style="color:#78766E;font-size:13px;margin-bottom:24px">English Learning Platform</p>
-            <p style="font-size:15px;color:#1C1C1A">Olá, <strong>${aluno.nome}</strong>!</p>
-            <p style="font-size:14px;color:#78766E">
-              Sua senha de acesso à plataforma foi redefinida pelo professor.
-            </p>
-            <p style="font-size:13px;color:#78766E;margin-top:12px">
-              Use seu código de acesso (<strong style="font-family:monospace">${aluno.codigo}</strong>)
-              junto com a nova senha fornecida pelo professor para entrar em
-              <a href="https://lenglish.com.br" style="color:#0033A0">lenglish.com.br</a>.
-            </p>
-            <p style="font-size:12px;color:#B0AEA6;margin-top:24px">
-              Se você não esperava esta alteração, contate sua instituição imediatamente.
-            </p>
-          </div>
-        `
-      }).catch(err => console.error('Erro email reset senha:', err));
-    }
-
-    res.json({ ok: true, message: `Senha de ${aluno.nome} redefinida com sucesso.` });
-  } catch (err) {
-    console.error('[RESET-SENHA]', err);
-    res.status(500).json({ error: 'Erro ao redefinir senha.' });
-  }
-});
-
-// Rota de versão — confirma qual código está rodando
-app.get('/version', (req, res) => {
-  res.json({
-    version: '3.0',
-    routes: [
-      '/auth/enviar-codigo','/auth/registro','/auth/login','/auth/recuperar-codigo',
-      '/perfil','/perfil/senha',
-      '/progresso','/progresso/concluir','/progresso/passo',
-      '/tts','/tts-test','/dict','/asst','/speaking-fb',
-      '/mensagens','/mensagens/professor','/mensagens/nao-lidas','/mensagens/marcar-lidas',
-      '/master/cadastros','/master/cadastros/:id/aprovar','/master/cadastros/:id/rejeitar',
-      '/master/alunos','/master/aluno/:id','/master/stats',
-      '/master/relatorio/:id','/master/relatorio-detalhado/:id','/master/mensagens','/master/mensagens/:usuario_id',
-      '/master/criar-teste','/master/reset-progresso/:email','/master/aluno/:id/resetar-senha'
-    ],
-    timestamp: new Date().toISOString()
-  });
-});
-
-// POST /auth/recuperar-codigo — envia o código do aluno por email
-app.post('/auth/recuperar-codigo', otpLimiter, async (req, res) => {
-  const { email } = req.body;
-  if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-    return res.status(400).json({ error: 'E-mail inválido.' });
-  }
-  try {
-    const result = await pool.query(
-      'SELECT nome, codigo FROM usuarios WHERE email = $1',
-      [email]
-    );
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'E-mail não encontrado.' });
-    }
-    const { nome, codigo } = result.rows[0];
-    await resend.emails.send({
-      from: process.env.RESEND_FROM_EMAIL || 'noreply@lenglish.com.br',
-      to: email,
-      subject: 'Seu código de acesso Lenglish',
-      html: `
-        <div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;padding:32px 24px">
-          <h1 style="color:#0033A0;font-size:28px;margin-bottom:4px">Leng<span style="color:#CC0000">lish</span></h1>
-          <p style="color:#78766E;font-size:13px;margin-bottom:24px">English Learning Platform</p>
-          <p style="font-size:15px;color:#1C1C1A">Olá, <strong>${nome}</strong>!</p>
-          <p style="font-size:14px;color:#78766E">Seu código de acesso é:</p>
-          <div style="font-size:28px;font-weight:900;letter-spacing:4px;color:#0033A0;background:#E8EEFA;border-radius:8px;padding:16px 24px;display:inline-block;font-family:monospace;margin:12px 0">${codigo}</div>
-          <p style="font-size:13px;color:#78766E;margin-top:16px">Use este código junto com sua senha para acessar a plataforma em <a href="https://lenglish.com.br" style="color:#0033A0">lenglish.com.br</a>.</p>
-        </div>
-      `
-    });
-    res.json({ ok: true });
-  } catch (err) {
-    console.error('Erro recuperar código:', err);
-    res.status(500).json({ error: 'Erro ao enviar e-mail.' });
-  }
-});
-
-
-// ═══════════════════════════════════════════════════════
-// MASTER — Gestão de cadastros
-// ═══════════════════════════════════════════════════════
-
-// GET /master/cadastros — listar todos (com filtro por status)
-app.get('/master/cadastros', masterMiddleware, async (req, res) => {
-  const { status } = req.query;
-  try {
-    const params = status ? [status] : [];
-    const where  = status ? 'WHERE status_cadastro = $1' : '';
-    const result = await pool.query(
-      `SELECT id, nome, sobrenome, email, codigo, nivel, whatsapp,
-              instituicao, status_cadastro, criado_em, ultimo_acesso
-       FROM usuarios
-       ${where}
-       ORDER BY criado_em DESC`,
-      params
-    );
-    res.json({ usuarios: result.rows });
-  } catch (err) {
-    console.error('Erro listar cadastros:', err);
-    res.status(500).json({ error: 'Erro ao listar cadastros.' });
-  }
-});
-
-// PATCH /master/cadastros/:id/aprovar
-app.patch('/master/cadastros/:id/aprovar', masterMiddleware, async (req, res) => {
-  try {
-    const result = await pool.query(
-      `UPDATE usuarios SET status_cadastro = 'aprovado'
-       WHERE id = $1 RETURNING nome, sobrenome, email, codigo`,
-      [req.params.id]
-    );
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'Usuário não encontrado.' });
-    }
-    const u = result.rows[0];
-    // Enviar email de aprovação
-    try {
-      await resend.emails.send({
-        from: process.env.RESEND_FROM_EMAIL || 'noreply@lenglish.com.br',
-        to: u.email,
-        subject: 'Cadastro aprovado — Lenglish',
-        html: `
-          <div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;padding:32px 24px">
-            <h1 style="color:#0033A0;font-size:28px;margin-bottom:4px">Leng<span style="color:#CC0000">lish</span></h1>
-            <p style="color:#78766E;font-size:13px;margin-bottom:24px">English Learning Platform</p>
-            <p style="font-size:15px;color:#1C1C1A">Olá, <strong>${u.nome}</strong>!</p>
-            <p style="font-size:14px;color:#78766E;margin-bottom:16px">
-              Seu cadastro foi <strong style="color:#1A7A3C">aprovado</strong>! 
-              Você já pode acessar a plataforma.
-            </p>
-            <div style="background:#E8EEFA;border-radius:8px;padding:16px 24px;margin:16px 0">
-              <p style="font-size:12px;color:#78766E;margin-bottom:4px">Seu código de acesso:</p>
-              <p style="font-size:24px;font-weight:900;color:#0033A0;font-family:monospace;letter-spacing:4px">${u.codigo}</p>
-            </div>
-            <p style="font-size:13px;color:#78766E">
-              Acesse em <a href="https://lenglish.com.br" style="color:#0033A0">lenglish.com.br</a>
-              e faça login com seu código e senha.
-            </p>
-            <p style="font-size:12px;color:#B0AEA6;margin-top:24px">
-              As atividades começam em 1° de junho de 2026.
-            </p>
-          </div>
-        `
-      });
-    } catch (emailErr) {
-      console.error('Erro email aprovação:', emailErr);
-    }
-    res.json({ ok: true, message: `${u.nome} aprovado com sucesso.` });
-  } catch (err) {
-    console.error('Erro aprovar:', err);
-    res.status(500).json({ error: 'Erro ao aprovar cadastro.' });
-  }
-});
-
-// PATCH /master/cadastros/:id/rejeitar
-app.patch('/master/cadastros/:id/rejeitar', masterMiddleware, async (req, res) => {
-  const { motivo } = req.body;
-  try {
-    const result = await pool.query(
-      `UPDATE usuarios SET status_cadastro = 'rejeitado'
-       WHERE id = $1 RETURNING nome, sobrenome, email, codigo`,
-      [req.params.id]
-    );
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'Usuário não encontrado.' });
-    }
-    const u = result.rows[0];
-    try {
-      await resend.emails.send({
-        from: process.env.RESEND_FROM_EMAIL || 'noreply@lenglish.com.br',
-        to: u.email,
-        subject: 'Cadastro não aprovado — Lenglish',
-        html: `
-          <div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;padding:32px 24px">
-            <h1 style="color:#0033A0;font-size:28px;margin-bottom:4px">Leng<span style="color:#CC0000">lish</span></h1>
-            <p style="color:#78766E;font-size:13px;margin-bottom:24px">English Learning Platform</p>
-            <p style="font-size:15px;color:#1C1C1A">Olá, <strong>${u.nome}</strong>!</p>
-            <p style="font-size:14px;color:#78766E;margin-bottom:16px">
-              Infelizmente seu cadastro <strong style="color:#CC0000">não foi aprovado</strong> no momento.
-              ${motivo ? `<br><br><em>${motivo}</em>` : ''}
-            </p>
-            <p style="font-size:13px;color:#78766E">
-              Em caso de dúvidas, entre em contato com sua instituição.
-            </p>
-          </div>
-        `
-      });
-    } catch (emailErr) {
-      console.error('Erro email rejeição:', emailErr);
-    }
-    res.json({ ok: true, message: `${u.nome} rejeitado.` });
-  } catch (err) {
-    console.error('Erro rejeitar:', err);
-    res.status(500).json({ error: 'Erro ao rejeitar cadastro.' });
-  }
-});
-
-
-// ═══════════════════════════════════════════════════════
-// TTS — Text-to-Speech via OpenAI
-// ═══════════════════════════════════════════════════════
-// Rota de teste TTS — sem auth, apenas para validar chave OpenAI
-app.get('/tts-test', async (req, res) => {
-  if (!process.env.OPENAI_API_KEY) {
-    return res.json({ ok: false, error: 'OPENAI_API_KEY não configurada' });
-  }
-  const https = require('https');
-  const body = JSON.stringify({ model:'tts-1', input:'Hello!', voice:'nova', response_format:'mp3' });
-  const options = {
-    hostname: 'api.openai.com',
-    path: '/v1/audio/speech',
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`,
-      'Content-Type': 'application/json',
-      'Content-Length': Buffer.byteLength(body),
-    },
-  };
-  const req2 = https.request(options, (r) => {
-    let data = [];
-    r.on('data', chunk => data.push(chunk));
-    r.on('end', () => {
-      if(r.statusCode === 200){
-        res.json({ ok: true, status: r.statusCode, bytes: Buffer.concat(data).length });
-      } else {
-        res.json({ ok: false, status: r.statusCode, body: Buffer.concat(data).toString().substring(0,200) });
+    const soma = (rows, campo) => rows.reduce((s, r) => s + Number(r[campo] || 0), 0);
+    res.json({
+      periodo: { inicio: ini, fim },
+      recebidas: recebidas.rows, a_receber: aReceber.rows, vencidas: vencidas.rows,
+      totais: {
+        recebido: recebidas.rows.reduce((s, r) => s + (Number(r.valor_final) - Number(r.desconto_pontualidade || 0)), 0),
+        a_receber: soma(aReceber.rows, 'valor_final'),
+        vencido: soma(vencidas.rows, 'valor_final')
       }
     });
-  });
-  req2.on('error', e => res.json({ ok: false, error: e.message }));
-  req2.write(body);
-  req2.end();
+  } catch (e) { console.error('Erro relatório detalhado:', e); res.status(500).json({ erro: 'Erro ao gerar relatório detalhado.' }); }
+}); }
 });
 
-app.post('/tts', authMiddleware, async (req, res) => {
-  const { text, voice = 'nova' } = req.body;
-  if (!text || !text.trim()) {
-    return res.status(400).json({ error: 'Texto obrigatório.' });
+// ============================================================
+// 10. CRUD — USUÁRIOS (apenas master)
+// ============================================================
+app.get('/admin/usuarios', autenticar, exigirPerfil('master'), async (req, res) => {
+  try {
+    const r = await pool.query(
+      `SELECT id, codigo, nome, cpf, email, whatsapp, data_nascimento, perfil, referencia_id, status, senha_provisoria, criado_em, ultimo_acesso
+       FROM usuarios ORDER BY nome`
+    );
+    res.json(r.rows);
+  } catch (e) {
+    console.error('Erro GET usuarios:', e);
+    res.status(500).json({ erro: 'Erro ao listar usuários.' });
   }
-  if (text.length > 4096) {
-    return res.status(400).json({ error: 'Texto muito longo.' });
+});
+
+app.post('/admin/usuarios', autenticar, exigirPerfil('master'), async (req, res) => {
+  try {
+    const erro = obrigatorios(req.body, ['nome', 'cpf', 'senha', 'perfil']);
+    if (erro) return res.status(400).json({ erro });
+    if (String(req.body.senha).length < 8) return res.status(400).json({ erro: 'A senha deve ter ao menos 8 caracteres.' });
+    if (!cpfValido(soDigitos(req.body.cpf))) return res.status(400).json({ erro: 'CPF do usuário inválido — confira os dígitos.' });
+    const hash = await bcrypt.hash(req.body.senha, 10);
+    const r = await pool.query(
+      `INSERT INTO usuarios (nome, cpf, email, whatsapp, senha_hash, data_nascimento, perfil, referencia_id, senha_provisoria)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,TRUE)
+       RETURNING id, nome, cpf, perfil, referencia_id, status`,
+      [req.body.nome, soDigitos(req.body.cpf), req.body.email || null, req.body.whatsapp || null,
+       hash, req.body.data_nascimento || null, req.body.perfil, req.body.referencia_id || null]
+    );
+    res.status(201).json(r.rows[0]);
+  } catch (e) {
+    if (e.code === '23505') return res.status(409).json({ erro: 'Já existe usuário com este CPF.' });
+    console.error('Erro POST usuario:', e);
+    res.status(500).json({ erro: 'Erro ao cadastrar usuário.' });
   }
-  if (!process.env.OPENAI_API_KEY) {
-    return res.status(500).json({ error: 'TTS não configurado.' });
+});
+
+app.put('/admin/usuarios/:id', autenticar, exigirPerfil('master'), async (req, res) => {
+  try {
+    const atual = await pool.query(`SELECT * FROM usuarios WHERE id = $1`, [req.params.id]);
+    if (!atual.rows.length) return res.status(404).json({ erro: 'Usuário não encontrado.' });
+    const x = atual.rows[0];
+    if (req.body.cpf !== undefined && !cpfValido(soDigitos(req.body.cpf))) {
+      return res.status(400).json({ erro: 'CPF do usuário inválido — confira os dígitos.' });
+    }
+
+    // Proteção: não permitir inativar/rebaixar o último master ativo
+    const novoPerfil = req.body.perfil ?? x.perfil;
+    const novoStatus = req.body.status ?? x.status;
+    if (x.perfil === 'master' && (novoPerfil !== 'master' || novoStatus !== 'ativo')) {
+      const outros = await pool.query(`SELECT COUNT(*)::int AS n FROM usuarios WHERE perfil='master' AND status='ativo' AND id <> $1`, [x.id]);
+      if (outros.rows[0].n === 0) return res.status(409).json({ erro: 'Não é possível inativar ou rebaixar o único usuário master ativo.' });
+    }
+
+    let senha_hash = x.senha_hash;
+    let senha_provisoria = x.senha_provisoria;
+    if (req.body.senha) {
+      if (String(req.body.senha).length < 8) return res.status(400).json({ erro: 'A senha deve ter ao menos 8 caracteres.' });
+      senha_hash = await bcrypt.hash(req.body.senha, 10);
+      senha_provisoria = true;
+    }
+    const r = await pool.query(
+      `UPDATE usuarios SET nome=$1, cpf=$2, email=$3, whatsapp=$4, data_nascimento=$5, perfil=$6, referencia_id=$7, status=$8, senha_hash=$9, senha_provisoria=$10
+       WHERE id=$11 RETURNING id, nome, cpf, perfil, referencia_id, status`,
+      [
+        req.body.nome ?? x.nome,
+        req.body.cpf !== undefined ? soDigitos(req.body.cpf) : x.cpf,
+        req.body.email ?? x.email, req.body.whatsapp ?? x.whatsapp,
+        req.body.data_nascimento ?? x.data_nascimento,
+        novoPerfil, req.body.referencia_id ?? x.referencia_id, novoStatus,
+        senha_hash, senha_provisoria, req.params.id
+      ]
+    );
+    res.json(r.rows[0]);
+  } catch (e) {
+    if (e.code === '23505') return res.status(409).json({ erro: 'Já existe usuário com este CPF.' });
+    console.error('Erro PUT usuario:', e);
+    res.status(500).json({ erro: 'Erro ao atualizar usuário.' });
   }
+});
 
-  console.log('[TTS] Iniciando, texto:', text.trim().substring(0, 50));
+app.delete('/admin/usuarios/:id', autenticar, exigirPerfil('master'), async (req, res) => {
+  try {
+    if (Number(req.params.id) === req.usuario.id) {
+      return res.status(409).json({ erro: 'Você não pode excluir o próprio usuário em uso.' });
+    }
+    const alvo = await pool.query(`SELECT perfil, status FROM usuarios WHERE id = $1`, [req.params.id]);
+    if (!alvo.rows.length) return res.status(404).json({ erro: 'Usuário não encontrado.' });
+    if (alvo.rows[0].perfil === 'master') {
+      const outros = await pool.query(`SELECT COUNT(*)::int AS n FROM usuarios WHERE perfil='master' AND status='ativo' AND id <> $1`, [req.params.id]);
+      if (outros.rows[0].n === 0) return res.status(409).json({ erro: 'Não é possível excluir o único usuário master ativo.' });
+    }
+    await pool.query(`DELETE FROM usuarios WHERE id = $1`, [req.params.id]);
+    res.json({ mensagem: 'Usuário excluído.' });
+  } catch (e) {
+    console.error('Erro DELETE usuario:', e);
+    res.status(500).json({ erro: 'Erro ao excluir usuário.' });
+  }
+});
 
-  // Usar https nativo do Node (sempre disponível, sem fetch)
-  const https = require('https');
-  const bodyData = JSON.stringify({
-    model: 'tts-1',
-    input: text.trim(),
-    voice: voice || 'nova',
-    response_format: 'mp3',
-  });
+// ============================================================
+// 11. FRONTEND SERVIDO PELO BACKEND (pasta /public no repositório)
+// ============================================================
+const PASTA_PUBLIC = path.join(__dirname, 'public');
+// ============================================================
+// PORTAL DOS PAIS — PRÉ-INSCRIÇÃO ONLINE (públicas, sem autenticação)
+// ============================================================
+app.get('/publico/opcoes', limiterPublico, async (req, res) => {
+  try {
+    const taxa = Number(await getConfig('taxa_matricula', 0)) || 0;
+    const semestre = String(await getConfig('semestre_vigente', '') || '');
+    const t = await pool.query(
+      `SELECT DISTINCT turno FROM turmas WHERE status <> 'encerrada' AND turno IS NOT NULL AND turno <> '' ORDER BY turno`);
+    let turnos = t.rows.map(r => r.turno);
+    if (!turnos.length) turnos = ['Matutino', 'Vespertino'];
+    res.json({ taxa_matricula: taxa, semestre, turnos });
+  } catch (e) { console.error('Erro /publico/opcoes:', e); res.status(500).json({ erro: 'Erro ao carregar as opções de inscrição.' }); }
+});
 
-  const options = {
-    hostname: 'api.openai.com',
-    path: '/v1/audio/speech',
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`,
-      'Content-Type': 'application/json',
-      'Content-Length': Buffer.byteLength(bodyData),
-    },
-    timeout: 30000,
-  };
+app.post('/publico/pre-inscricao', limiterPublico, async (req, res) => {
+  try {
+    const alunoNome = String(req.body.aluno_nome || '').trim();
+    const nasc = String(req.body.aluno_data_nascimento || '').trim();
+    const turno = String(req.body.turno || '').trim();
+    const respNome = String(req.body.responsavel_nome || '').trim();
+    const respZap = String(req.body.responsavel_whatsapp || '').trim();
+    const respEmail = String(req.body.responsavel_email || '').trim();
+    const respCpf = String(req.body.responsavel_cpf || '').trim();
+    const alunoCpf = String(req.body.aluno_cpf || '').trim();
+    const parentesco = String(req.body.parentesco || '').trim();
+    const aceite = req.body.aceite_termos === true || req.body.aceite_termos === 'true';
 
-  const chunks = [];
-  const request = https.request(options, (response) => {
-    console.log('[TTS] OpenAI status:', response.statusCode);
-    response.on('data', chunk => chunks.push(chunk));
-    response.on('end', () => {
-      const buffer = Buffer.concat(chunks);
-      if (response.statusCode === 200) {
-        res.set({
-          'Content-Type': 'audio/mpeg',
-          'Content-Length': buffer.length,
-          'Cache-Control': 'public, max-age=86400',
-        });
-        res.send(buffer);
-      } else {
-        const errText = buffer.toString();
-        console.error('[TTS] OpenAI erro:', response.statusCode, errText.substring(0, 200));
-        let errMsg = 'Erro ao gerar áudio.';
-        try { errMsg = JSON.parse(errText)?.error?.message || errMsg; } catch(_) {}
-        res.status(502).json({ error: errMsg, openai_status: response.statusCode });
-      }
+    if (!alunoNome) return res.status(400).json({ erro: 'Informe o nome do aluno.' });
+    if (!nasc) return res.status(400).json({ erro: 'Informe a data de nascimento do aluno.' });
+    if (!turno) return res.status(400).json({ erro: 'Escolha o turno.' });
+    if (!respNome) return res.status(400).json({ erro: 'Informe o nome do responsável.' });
+    if (!respZap && !respEmail) return res.status(400).json({ erro: 'Informe ao menos um contato (WhatsApp ou e-mail).' });
+    if (!aceite) return res.status(400).json({ erro: 'É necessário aceitar os Termos e a Política de Privacidade.' });
+
+    const dn = new Date(nasc + 'T12:00:00');
+    if (isNaN(dn.getTime())) return res.status(400).json({ erro: 'Data de nascimento inválida.' });
+    const hoje = new Date();
+    let idade = hoje.getFullYear() - dn.getFullYear();
+    const dm = hoje.getMonth() - dn.getMonth();
+    if (dm < 0 || (dm === 0 && hoje.getDate() < dn.getDate())) idade--;
+    if (idade < 0 || idade > 120) return res.status(400).json({ erro: 'Data de nascimento inválida.' });
+    const programa = idade < 10 ? 'kids' : 'basico';
+
+    const taxa = Number(await getConfig('taxa_matricula', 0)) || 0;
+
+    const r = await pool.query(
+      `INSERT INTO pre_inscricoes
+         (aluno_nome, aluno_data_nascimento, aluno_cpf, programa, turno,
+          responsavel_nome, responsavel_cpf, responsavel_whatsapp, responsavel_email, parentesco, valor_taxa)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING id`,
+      [alunoNome.toUpperCase(), nasc, alunoCpf || null, programa, turno,
+       respNome.toUpperCase(), respCpf || null, respZap || null, respEmail || null, parentesco || null, taxa]);
+    const id = r.rows[0].id;
+    const protocolo = `PRE-${hoje.getFullYear()}-${String(id).padStart(6, '0')}`;
+    await pool.query(`UPDATE pre_inscricoes SET protocolo = $1 WHERE id = $2`, [protocolo, id]);
+
+    res.status(201).json({
+      id, protocolo, programa, programa_label: programa === 'kids' ? 'KIDS' : 'Básico',
+      turno, idade, valor_taxa: taxa,
+      mensagem: 'Pré-inscrição registrada. O pagamento da taxa via PIX será habilitado na próxima etapa.'
     });
+  } catch (e) { console.error('Erro /publico/pre-inscricao:', e); res.status(500).json({ erro: 'Erro ao registrar a pré-inscrição.' }); }
+});
+
+app.post('/publico/rematricula', limiterPublico, async (req, res) => {
+  try {
+    const alunoNome = String(req.body.aluno_nome || '').trim();
+    const alunoCpf = String(req.body.aluno_cpf || '').trim();
+    const nasc = String(req.body.aluno_data_nascimento || '').trim();
+    const turno = String(req.body.turno || '').trim();
+    const semestre = String(req.body.semestre || '').trim();
+    const respNome = String(req.body.responsavel_nome || '').trim();
+    const respCpf = String(req.body.responsavel_cpf || '').trim();
+    const respZap = String(req.body.responsavel_whatsapp || '').trim();
+    const respEmail = String(req.body.responsavel_email || '').trim();
+    const parentesco = String(req.body.parentesco || '').trim();
+    const aceite = req.body.aceite_termos === true || req.body.aceite_termos === 'true';
+
+    if (!alunoNome) return res.status(400).json({ erro: 'Informe o nome do aluno.' });
+    if (!alunoCpf) return res.status(400).json({ erro: 'Informe o CPF do aluno.' });
+    if (!semestre) return res.status(400).json({ erro: 'Selecione o semestre.' });
+    if (turno !== 'Matutino' && turno !== 'Vespertino') return res.status(400).json({ erro: 'Selecione o turno (Matutino ou Vespertino).' });
+    if (!respNome) return res.status(400).json({ erro: 'Informe o nome do responsável.' });
+    if (!respZap && !respEmail) return res.status(400).json({ erro: 'Informe ao menos um contato do responsável (WhatsApp ou e-mail).' });
+    if (!aceite) return res.status(400).json({ erro: 'É necessário estar ciente do Termo do semestre.' });
+
+    let nascVal = null;
+    if (nasc) { const dn = new Date(nasc + 'T12:00:00'); if (!isNaN(dn.getTime())) nascVal = nasc; }
+    const taxa = Number(await getConfig('taxa_matricula', 0)) || 0;
+
+    const r = await pool.query(
+      `INSERT INTO pre_inscricoes
+         (tipo, semestre, aluno_nome, aluno_data_nascimento, aluno_cpf, turno,
+          responsavel_nome, responsavel_cpf, responsavel_whatsapp, responsavel_email, parentesco, valor_taxa)
+       VALUES ('rematriculaonline',$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING id`,
+      [semestre, alunoNome.toUpperCase(), nascVal, alunoCpf, turno,
+       respNome.toUpperCase(), respCpf || null, respZap || null, respEmail || null, parentesco || null, taxa]);
+    const id = r.rows[0].id;
+    const protocolo = `REM-${new Date().getFullYear()}-${String(id).padStart(6, '0')}`;
+    await pool.query(`UPDATE pre_inscricoes SET protocolo = $1 WHERE id = $2`, [protocolo, id]);
+
+    res.status(201).json({
+      id, protocolo, semestre, turno, valor_taxa: taxa,
+      mensagem: 'Rematrícula registrada. Prossiga para o pagamento da taxa via PIX.'
+    });
+  } catch (e) { console.error('Erro /publico/rematricula:', e); res.status(500).json({ erro: 'Erro ao registrar a rematrícula.' }); }
+});
+
+app.get('/admin/pre-inscricoes', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const cond = []; const params = [];
+    if (req.query.status) { params.push(req.query.status); cond.push(`status = $${params.length}`); }
+    if (req.query.tipo) { params.push(req.query.tipo); cond.push(`tipo = $${params.length}`); }
+    const where = cond.length ? `WHERE ${cond.join(' AND ')}` : '';
+    const r = await pool.query(`SELECT * FROM pre_inscricoes ${where} ORDER BY criado_em DESC`, params);
+    res.json(r.rows);
+  } catch (e) { console.error('Erro GET pre-inscricoes:', e); res.status(500).json({ erro: 'Erro ao listar pré-inscrições.' }); }
+});
+
+// ============================================================
+// INTEGRAÇÃO PIX — BANCO INTER (Portal dos Pais)
+// ============================================================
+const INTER = {
+  base: process.env.INTER_BASE_URL || 'https://cdpj.partners.bancointer.com.br',
+  clientId: process.env.INTER_CLIENT_ID || '',
+  clientSecret: process.env.INTER_CLIENT_SECRET || '',
+  cert: (process.env.INTER_CERT || '').replace(/\\n/g, '\n'),
+  key: (process.env.INTER_KEY || '').replace(/\\n/g, '\n'),
+  chave: process.env.INTER_PIX_KEY || '',
+  conta: process.env.INTER_CONTA_CORRENTE || ''
+};
+const INTER_SCOPES = 'cob.write cob.read pix.read webhook.write webhook.read';
+function interConfigurado() {
+  return !!(INTER.clientId && INTER.clientSecret && INTER.cert && INTER.key && INTER.chave);
+}
+let interAgent = null;
+function getInterAgent() {
+  if (!interAgent) interAgent = new https.Agent({ cert: INTER.cert, key: INTER.key, keepAlive: true });
+  return interAgent;
+}
+function interHttp(method, pathname, { token, body, form } = {}) {
+  return new Promise((resolve, reject) => {
+    const url = new URL(INTER.base + pathname);
+    const payload = form ? new URLSearchParams(form).toString() : (body ? JSON.stringify(body) : null);
+    const headers = {};
+    if (form) headers['Content-Type'] = 'application/x-www-form-urlencoded';
+    else if (body) headers['Content-Type'] = 'application/json';
+    if (token) headers['Authorization'] = 'Bearer ' + token;
+    if (INTER.conta) headers['x-conta-corrente'] = INTER.conta;
+    if (payload) headers['Content-Length'] = Buffer.byteLength(payload);
+    const r = https.request({ hostname: url.hostname, path: url.pathname + url.search, method, headers, agent: getInterAgent() }, (resp) => {
+      let data = '';
+      resp.on('data', c => data += c);
+      resp.on('end', () => {
+        let parsed; try { parsed = data ? JSON.parse(data) : {}; } catch { parsed = { raw: data }; }
+        if (resp.statusCode >= 200 && resp.statusCode < 300) resolve(parsed);
+        else reject(new Error(`Inter ${resp.statusCode}: ${JSON.stringify(parsed)}`));
+      });
+    });
+    r.on('error', reject);
+    if (payload) r.write(payload);
+    r.end();
   });
+}
+let interTokenCache = { token: null, exp: 0 };
+async function interToken() {
+  const now = Date.now();
+  if (interTokenCache.token && interTokenCache.exp > now + 30000) return interTokenCache.token;
+  const r = await interHttp('POST', '/oauth/v2/token', { form: {
+    client_id: INTER.clientId, client_secret: INTER.clientSecret,
+    grant_type: 'client_credentials', scope: INTER_SCOPES
+  }});
+  interTokenCache = { token: r.access_token, exp: now + (Number(r.expires_in || 3600) * 1000) };
+  return r.access_token;
+}
+async function interCriarCob(txid, valor, solicitacao) {
+  const token = await interToken();
+  return interHttp('PUT', `/pix/v2/cob/${txid}`, { token, body: {
+    calendario: { expiracao: 3600 },
+    valor: { original: Number(valor).toFixed(2) },
+    chave: INTER.chave,
+    solicitacaoPagador: String(solicitacao || '').slice(0, 140)
+  }});
+}
+async function interConsultarCob(txid) {
+  const token = await interToken();
+  return interHttp('GET', `/pix/v2/cob/${txid}`, { token });
+}
+async function marcarPreInscricaoPaga(preId) {
+  const r = await pool.query(
+    `UPDATE pre_inscricoes SET status='pago', pago_em=NOW() WHERE id=$1 AND status='aguardando_pagamento' RETURNING id`,
+    [preId]);
+  return r.rows.length > 0;
+}
 
-  request.on('error', (err) => {
-    console.error('[TTS] Erro de rede:', err.message);
-    res.status(500).json({ error: 'Erro de conexão com OpenAI: ' + err.message });
-  });
-
-  request.on('timeout', () => {
-    console.error('[TTS] Timeout na chamada OpenAI');
-    request.destroy();
-    res.status(504).json({ error: 'Timeout ao gerar áudio. Tente novamente.' });
-  });
-
-  request.write(bodyData);
-  request.end();
-});
-
-// ═══════════════════════════════════════════════════════
-// MENSAGENS — Canal aluno ↔ professor
-// ═══════════════════════════════════════════════════════
-
-// GET /mensagens — listar mensagens do aluno
-app.get('/mensagens', authMiddleware, async (req, res) => {
+// Gera (ou reaproveita) a cobrança PIX da taxa de uma pré-inscrição
+app.post('/publico/pre-inscricao/:id/pix', limiterPublico, async (req, res) => {
   try {
-    const result = await pool.query(
-      `SELECT m.id, m.remetente_tipo, m.conteudo, m.lida, m.criado_em,
-              u.nome AS nome_remetente, u.codigo AS codigo_remetente
-       FROM mensagens m
-       LEFT JOIN usuarios u ON m.remetente_id = u.id
-       WHERE m.usuario_id = $1
-       ORDER BY m.criado_em ASC`,
-      [req.user.id]
-    );
-    res.json({ mensagens: result.rows });
-  } catch (err) {
-    console.error('Erro mensagens:', err);
-    res.status(500).json({ error: 'Erro ao carregar mensagens.' });
-  }
+    if (!interConfigurado()) return res.status(503).json({ erro: 'Pagamento via PIX ainda não está configurado.' });
+    const q = await pool.query(`SELECT * FROM pre_inscricoes WHERE id = $1`, [req.params.id]);
+    if (!q.rows.length) return res.status(404).json({ erro: 'Pré-inscrição não encontrada.' });
+    const pre = q.rows[0];
+    if (['pago', 'efetivada'].includes(pre.status)) return res.status(409).json({ erro: 'Esta inscrição já foi paga.' });
+    const valor = Number(pre.valor_taxa);
+    if (!(valor > 0)) return res.status(400).json({ erro: 'Valor da taxa inválido para cobrança.' });
+
+    let txid = pre.mp_payment_id;
+    let copiaCola = pre.pix_copia_cola;
+    if (!txid || !copiaCola) {
+      txid = crypto.randomBytes(16).toString('hex'); // 32 caracteres alfanuméricos
+      const cob = await interCriarCob(txid, valor, `Taxa de matricula CEMIC ${pre.protocolo || ''}`.trim());
+      copiaCola = cob.pixCopiaECola;
+      await pool.query(`UPDATE pre_inscricoes SET mp_payment_id=$1, pix_copia_cola=$2 WHERE id=$3`, [txid, copiaCola, pre.id]);
+    }
+    res.json({ txid, copia_cola: copiaCola, valor, expiracao: 3600 });
+  } catch (e) { console.error('Erro gerar PIX Inter:', e); res.status(500).json({ erro: 'Não foi possível gerar o PIX agora. Tente novamente.' }); }
 });
 
-// POST /mensagens — aluno envia mensagem
-app.post('/mensagens', authMiddleware, async (req, res) => {
-  const { conteudo } = req.body;
-  if (!conteudo || !conteudo.trim()) {
-    return res.status(400).json({ error: 'Mensagem vazia.' });
-  }
-  if (conteudo.length > 1000) {
-    return res.status(400).json({ error: 'Mensagem muito longa (máx. 1000 caracteres).' });
-  }
+// Consulta de status (polling) — confirma na API do Inter antes de marcar pago
+app.get('/publico/pre-inscricao/:id/status', limiterPublico, async (req, res) => {
   try {
-    await pool.query(
-      `INSERT INTO mensagens (usuario_id, remetente_id, remetente_tipo, conteudo)
-       VALUES ($1, $1, 'aluno', $2)`,
-      [req.user.id, conteudo.trim()]
-    );
-    res.json({ ok: true });
-  } catch (err) {
-    console.error('Erro enviar mensagem:', err);
-    res.status(500).json({ error: 'Erro ao enviar mensagem.' });
-  }
+    const q = await pool.query(`SELECT id, protocolo, status, mp_payment_id FROM pre_inscricoes WHERE id = $1`, [req.params.id]);
+    if (!q.rows.length) return res.status(404).json({ erro: 'Pré-inscrição não encontrada.' });
+    const pre = q.rows[0];
+    if (['pago', 'efetivada'].includes(pre.status)) return res.json({ status: 'pago', protocolo: pre.protocolo });
+    if (interConfigurado() && pre.mp_payment_id) {
+      try {
+        const cob = await interConsultarCob(pre.mp_payment_id);
+        if (cob && cob.status === 'CONCLUIDA') { await marcarPreInscricaoPaga(pre.id); return res.json({ status: 'pago', protocolo: pre.protocolo }); }
+      } catch (e) { console.error('Status: erro consultar cob:', e.message); }
+    }
+    res.json({ status: pre.status });
+  } catch (e) { console.error('Erro status pré-inscrição:', e); res.status(500).json({ erro: 'Erro ao consultar o status.' }); }
 });
 
-// POST /mensagens/professor — professor responde (requer master token)
-app.post('/mensagens/professor', masterMiddleware, async (req, res) => {
-  const { usuario_id, conteudo } = req.body;
-  if (!usuario_id || !conteudo || !conteudo.trim()) {
-    return res.status(400).json({ error: 'usuario_id e conteudo são obrigatórios.' });
-  }
+// Webhook do Inter (sem rate limit; responde 200 rápido e confirma por consulta)
+app.post('/publico/pix/webhook', async (req, res) => {
   try {
-    await pool.query(
-      `INSERT INTO mensagens (usuario_id, remetente_id, remetente_tipo, conteudo)
-       VALUES ($1, NULL, 'professor', $2)`,
-      [usuario_id, conteudo.trim()]
-    );
-    // Marcar todas as mensagens do aluno como lidas pelo professor
-    await pool.query(
-      `UPDATE mensagens SET lida = true
-       WHERE usuario_id = $1 AND remetente_tipo = 'aluno' AND lida = false`,
-      [usuario_id]
-    );
-    res.json({ ok: true });
-  } catch (err) {
-    console.error('Erro resposta professor:', err);
-    res.status(500).json({ error: 'Erro ao enviar resposta.' });
-  }
+    const corpo = req.body || {};
+    const lista = Array.isArray(corpo) ? corpo : (Array.isArray(corpo.pix) ? corpo.pix : []);
+    for (const p of lista) {
+      const txid = p && p.txid;
+      if (!txid) continue;
+      const q = await pool.query(`SELECT id, status FROM pre_inscricoes WHERE mp_payment_id = $1`, [txid]);
+      if (!q.rows.length || ['pago', 'efetivada'].includes(q.rows[0].status)) continue;
+      try {
+        const cob = await interConsultarCob(txid);
+        if (cob && cob.status === 'CONCLUIDA') await marcarPreInscricaoPaga(q.rows[0].id);
+      } catch (e) { console.error('Webhook: erro consultar cob:', e.message); }
+    }
+  } catch (e) { console.error('Erro webhook Inter:', e); }
+  res.status(200).json({ ok: true });
 });
 
-// GET /mensagens/nao-lidas — contagem de msgs não lidas do aluno
-app.get('/mensagens/nao-lidas', authMiddleware, async (req, res) => {
+// Registro do webhook no Inter (operação única, feita pelo master)
+app.post('/admin/inter/webhook', autenticar, exigirPerfil('master'), async (req, res) => {
   try {
-    const result = await pool.query(
-      `SELECT COUNT(*) AS total FROM mensagens
-       WHERE usuario_id = $1 AND remetente_tipo = 'professor' AND lida = false`,
-      [req.user.id]
-    );
-    res.json({ total: parseInt(result.rows[0].total) });
-  } catch (err) {
-    res.status(500).json({ error: 'Erro.' });
-  }
+    if (!interConfigurado()) return res.status(503).json({ erro: 'Inter não configurado.' });
+    const url = String(req.body.url || '').trim();
+    if (!/^https:\/\//.test(url)) return res.status(400).json({ erro: 'Informe a URL HTTPS do webhook.' });
+    const token = await interToken();
+    await interHttp('PUT', `/pix/v2/webhook/${encodeURIComponent(INTER.chave)}`, { token, body: { webhookUrl: url } });
+    res.json({ mensagem: 'Webhook registrado no Inter.', url });
+  } catch (e) { console.error('Erro registrar webhook Inter:', e); res.status(500).json({ erro: 'Erro ao registrar webhook: ' + e.message }); }
 });
 
-// PATCH /mensagens/marcar-lidas — aluno marca msgs do professor como lidas
-app.patch('/mensagens/marcar-lidas', authMiddleware, async (req, res) => {
+app.use(express.static(PASTA_PUBLIC));
+app.get('/', (req, res) => {
+  const arquivo = path.join(PASTA_PUBLIC, 'index.html');
+  if (fs.existsSync(arquivo)) return res.sendFile(arquivo);
+  res.status(200).send('CEMIC Gestão — backend no ar. Adicione o index.html na pasta /public do repositório para servir o sistema por aqui.');
+});
+
+// ============================================================
+// 12. SAÚDE E INICIALIZAÇÃO
+// ============================================================
+app.get('/health', async (req, res) => {
   try {
-    await pool.query(
-      `UPDATE mensagens SET lida = true
-       WHERE usuario_id = $1 AND remetente_tipo = 'professor' AND lida = false`,
-      [req.user.id]
-    );
-    res.json({ ok: true });
-  } catch (err) {
-    res.status(500).json({ error: 'Erro.' });
+    await pool.query('SELECT 1');
+    res.json({ status: 'ok', sistema: 'CEMIC Gestão', versao: '3.12 (Portal dos Pais + Pix Inter + Rematrícula ONLINE)' });
+  } catch {
+    res.status(500).json({ status: 'erro', detalhe: 'Banco de dados inacessível.' });
   }
 });
 
-// GET /master/mensagens — professor vê todas as conversas
-app.get('/master/mensagens', masterMiddleware, async (req, res) => {
-  try {
-    const result = await pool.query(
-      `SELECT u.id, u.nome, u.sobrenome, u.codigo, u.nivel,
-              COUNT(m.id) FILTER (WHERE m.remetente_tipo='aluno' AND m.lida=false) AS nao_lidas,
-              MAX(m.criado_em) AS ultima_msg
-       FROM usuarios u
-       LEFT JOIN mensagens m ON m.usuario_id = u.id
-       GROUP BY u.id
-       HAVING COUNT(m.id) > 0
-       ORDER BY nao_lidas DESC, ultima_msg DESC`
-    );
-    res.json({ alunos: result.rows });
-  } catch (err) {
-    res.status(500).json({ error: 'Erro.' });
-  }
-});
-
-// GET /master/mensagens/:usuario_id — professor vê conversa com aluno
-app.get('/master/mensagens/:usuario_id', masterMiddleware, async (req, res) => {
-  try {
-    const result = await pool.query(
-      `SELECT id, remetente_tipo, conteudo, lida, criado_em
-       FROM mensagens WHERE usuario_id = $1 ORDER BY criado_em ASC`,
-      [req.params.usuario_id]
-    );
-    res.json({ mensagens: result.rows });
-  } catch (err) {
-    res.status(500).json({ error: 'Erro.' });
-  }
-});
-
-  
-
-}).catch(err => {
-  console.error('❌ Erro ao inicializar banco:', err);
-  process.exit(1);
-});
+const PORT = process.env.PORT || 3000;
+initDB()
+  .then(() => app.listen(PORT, () => console.log(`CEMIC Gestão — backend v3.12 rodando na porta ${PORT}`)))
+  .catch(e => { console.error('Falha ao inicializar o banco:', e); process.exit(1); });
