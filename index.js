@@ -1,5 +1,5 @@
 // ============================================================
-// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v3.12 (… + Portal dos Pais + Pix Inter)
+// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v3.13 (… + Portal dos Pais + Pix Inter)
 // Banco + Autenticação com perfis + Configurações + CRUDs
 // Stack: Node.js/Express + PostgreSQL (Railway)
 // ============================================================
@@ -145,8 +145,7 @@ async function initDB() {
     status TEXT NOT NULL DEFAULT 'ativa' CHECK (status IN ('ativa','trancada','cancelada','concluida')),
     resultado TEXT CHECK (resultado IN ('aprovado','reprovado')),
     media_final NUMERIC(5,2),
-    frequencia_final NUMERIC(5,2),
-    UNIQUE(aluno_id, turma_id)
+    frequencia_final NUMERIC(5,2)
   );
 
   CREATE TABLE IF NOT EXISTS avaliacoes (
@@ -324,6 +323,10 @@ async function initDB() {
   )`);
   await pool.query(`ALTER TABLE pre_inscricoes ADD COLUMN IF NOT EXISTS semestre TEXT`);
   await pool.query(`ALTER TABLE pre_inscricoes ADD COLUMN IF NOT EXISTS tipo TEXT NOT NULL DEFAULT 'pre_inscricao'`);
+  // Matrícula: a unicidade passa a valer só para matrícula que ocupa vaga (ativa/trancada).
+  // Assim, matrícula cancelada ou concluída não impede nova matrícula na mesma turma.
+  await pool.query(`ALTER TABLE matriculas DROP CONSTRAINT IF EXISTS matriculas_aluno_id_turma_id_key`);
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS uq_matricula_vaga ON matriculas (aluno_id, turma_id) WHERE status IN ('ativa','trancada')`);
   await seedConfiguracoes();
   await seedCursosNiveis();
   await seedMaster();
@@ -1078,6 +1081,9 @@ app.post('/admin/matriculas', autenticar, somenteGestao, async (req, res) => {
     if (!aq.rows.length) { await client.query('ROLLBACK'); client.release(); return res.status(404).json({ erro: 'Aluno não encontrado.' }); }
     const aluno = aq.rows[0];
     if (aluno.status !== 'ativo') { await client.query('ROLLBACK'); client.release(); return res.status(409).json({ erro: 'Aluno inativo não pode ser matriculado. Reative o cadastro primeiro.' }); }
+
+    const dupq = await client.query(`SELECT 1 FROM matriculas WHERE aluno_id = $1 AND turma_id = $2 AND status IN ('ativa','trancada')`, [aluno.id, turma.id]);
+    if (dupq.rows.length) { await client.query('ROLLBACK'); client.release(); return res.status(409).json({ erro: 'O aluno já possui matrícula ativa nesta turma.' }); }
 
     const ocup = await client.query(`SELECT COUNT(*)::int AS n FROM matriculas WHERE turma_id = $1 AND status = 'ativa'`, [turma.id]);
     if (ocup.rows[0].n >= turma.capacidade) {
@@ -1951,7 +1957,7 @@ app.get('/', (req, res) => {
 app.get('/health', async (req, res) => {
   try {
     await pool.query('SELECT 1');
-    res.json({ status: 'ok', sistema: 'CEMIC Gestão', versao: '3.12 (Portal dos Pais + Pix Inter + Rematrícula ONLINE)' });
+    res.json({ status: 'ok', sistema: 'CEMIC Gestão', versao: '3.13 (Portal dos Pais + Pix Inter + Rematrícula ONLINE + correção rematrícula)' });
   } catch {
     res.status(500).json({ status: 'erro', detalhe: 'Banco de dados inacessível.' });
   }
@@ -1959,5 +1965,5 @@ app.get('/health', async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 initDB()
-  .then(() => app.listen(PORT, () => console.log(`CEMIC Gestão — backend v3.12 rodando na porta ${PORT}`)))
+  .then(() => app.listen(PORT, () => console.log(`CEMIC Gestão — backend v3.13 rodando na porta ${PORT}`)))
   .catch(e => { console.error('Falha ao inicializar o banco:', e); process.exit(1); });
