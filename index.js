@@ -1,5 +1,5 @@
 // ============================================================
-// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v3.14 (… + Portal dos Pais + Pix Inter)
+// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v3.16 (… + Portal dos Pais + Pix Inter)
 // Banco + Autenticação com perfis + Configurações + CRUDs
 // Stack: Node.js/Express + PostgreSQL (Railway)
 // ============================================================
@@ -1854,6 +1854,91 @@ app.get('/publico/portal/alunos', autenticarResponsavel, async (req, res) => {
   catch (e) { console.error('Erro portal alunos:', e); res.status(500).json({ erro: 'Erro ao carregar os alunos.' }); }
 });
 
+// ---------- Avisos (coordenação publica; pais leem no portal) ----------
+app.post('/admin/avisos', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const escopo = ['geral', 'turma', 'aluno'].includes(req.body.escopo) ? req.body.escopo : 'geral';
+    const titulo = String(req.body.titulo || '').trim();
+    const mensagem = String(req.body.mensagem || '').trim();
+    if (!titulo) return res.status(400).json({ erro: 'Informe o título.' });
+    if (!mensagem) return res.status(400).json({ erro: 'Informe a mensagem.' });
+    let turmaId = null, alunoId = null;
+    if (escopo === 'turma') { turmaId = Number(req.body.turma_id) || null; if (!turmaId) return res.status(400).json({ erro: 'Selecione a turma.' }); }
+    if (escopo === 'aluno') { alunoId = Number(req.body.aluno_id) || null; if (!alunoId) return res.status(400).json({ erro: 'Selecione o aluno.' }); }
+    const r = await pool.query(
+      `INSERT INTO avisos (autor_id, escopo, turma_id, aluno_id, titulo, mensagem)
+       VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
+      [req.usuario.id, escopo, turmaId, alunoId, titulo, mensagem]);
+    res.status(201).json({ id: r.rows[0].id });
+  } catch (e) { console.error('Erro POST avisos:', e); res.status(500).json({ erro: 'Erro ao publicar o aviso.' }); }
+});
+
+app.get('/admin/avisos', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const r = await pool.query(
+      `SELECT av.id, av.escopo, av.titulo, av.mensagem, av.criado_em, av.turma_id, av.aluno_id,
+              t.nome AS turma_nome, a.nome AS aluno_nome, u.nome AS autor_nome
+       FROM avisos av
+       LEFT JOIN turmas t ON t.id = av.turma_id
+       LEFT JOIN alunos a ON a.id = av.aluno_id
+       LEFT JOIN usuarios u ON u.id = av.autor_id
+       ORDER BY av.criado_em DESC LIMIT 200`);
+    res.json(r.rows);
+  } catch (e) { console.error('Erro GET avisos:', e); res.status(500).json({ erro: 'Erro ao listar avisos.' }); }
+});
+
+app.delete('/admin/avisos/:id', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const r = await pool.query(`DELETE FROM avisos WHERE id = $1 RETURNING id`, [req.params.id]);
+    if (!r.rows.length) return res.status(404).json({ erro: 'Aviso não encontrado.' });
+    res.json({ ok: true });
+  } catch (e) { console.error('Erro DELETE avisos:', e); res.status(500).json({ erro: 'Erro ao remover o aviso.' }); }
+});
+
+app.get('/publico/portal/aluno/:id/avisos', autenticarResponsavel, async (req, res) => {
+  try {
+    const alunoId = Number(req.params.id);
+    const vinc = await pool.query(
+      `SELECT 1 FROM aluno_responsavel WHERE responsavel_id = $1 AND aluno_id = $2`,
+      [req.responsavelId, alunoId]);
+    if (!vinc.rows.length) return res.status(403).json({ erro: 'Acesso negado a este aluno.' });
+    const r = await pool.query(
+      `SELECT av.id, av.escopo, av.titulo, av.mensagem, av.criado_em, t.nome AS turma_nome
+       FROM avisos av
+       LEFT JOIN turmas t ON t.id = av.turma_id
+       WHERE av.escopo = 'geral'
+          OR (av.escopo = 'aluno' AND av.aluno_id = $1)
+          OR (av.escopo = 'turma' AND av.turma_id IN (
+                SELECT turma_id FROM matriculas WHERE aluno_id = $1 AND status = 'ativa'))
+       ORDER BY av.criado_em DESC LIMIT 100`, [alunoId]);
+    res.json(r.rows);
+  } catch (e) { console.error('Erro portal avisos:', e); res.status(500).json({ erro: 'Erro ao carregar os avisos.' }); }
+});
+
+// ---------- Alteração de turma (transfere matrícula ativa sem cancelar) ----------
+app.put('/admin/matriculas/:id/turma', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const matId = Number(req.params.id);
+    const novaTurmaId = Number(req.body.turma_id);
+    if (!novaTurmaId) return res.status(400).json({ erro: 'Selecione a turma de destino.' });
+    const mr = await pool.query(`SELECT * FROM matriculas WHERE id = $1`, [matId]);
+    const mat = mr.rows[0];
+    if (!mat) return res.status(404).json({ erro: 'Matrícula não encontrada.' });
+    if (mat.status !== 'ativa') return res.status(409).json({ erro: 'Só é possível alterar a turma de uma matrícula ativa.' });
+    if (mat.turma_id === novaTurmaId) return res.status(400).json({ erro: 'A turma de destino é a mesma da turma atual.' });
+    const tr = await pool.query(`SELECT * FROM turmas WHERE id = $1`, [novaTurmaId]);
+    const turma = tr.rows[0];
+    if (!turma) return res.status(404).json({ erro: 'Turma de destino não encontrada.' });
+    if (turma.status === 'encerrada') return res.status(409).json({ erro: 'A turma de destino está encerrada.' });
+    const dup = await pool.query(`SELECT 1 FROM matriculas WHERE aluno_id = $1 AND turma_id = $2 AND status IN ('ativa','trancada')`, [mat.aluno_id, novaTurmaId]);
+    if (dup.rows.length) return res.status(409).json({ erro: 'O aluno já possui matrícula ativa nessa turma.' });
+    const ocup = await pool.query(`SELECT COUNT(*)::int AS n FROM matriculas WHERE turma_id = $1 AND status = 'ativa'`, [novaTurmaId]);
+    if (ocup.rows[0].n >= turma.capacidade) return res.status(409).json({ erro: 'A turma de destino está lotada.' });
+    await pool.query(`UPDATE matriculas SET turma_id = $1 WHERE id = $2`, [novaTurmaId, matId]);
+    res.json({ ok: true, turma_id: novaTurmaId });
+  } catch (e) { console.error('Erro alterar turma:', e); res.status(500).json({ erro: 'Erro ao alterar a turma.' }); }
+});
+
 app.get('/admin/pre-inscricoes', autenticar, somenteGestao, async (req, res) => {
   try {
     const cond = []; const params = [];
@@ -2025,7 +2110,7 @@ app.get('/', (req, res) => {
 app.get('/health', async (req, res) => {
   try {
     await pool.query('SELECT 1');
-    res.json({ status: 'ok', sistema: 'CEMIC Gestão', versao: '3.14 (Portal dos Pais acadêmico — Fase 1: login do responsável)' });
+    res.json({ status: 'ok', sistema: 'CEMIC Gestão', versao: '3.16 (Portal dos Pais — Avisos + Alteração de Turma)' });
   } catch {
     res.status(500).json({ status: 'erro', detalhe: 'Banco de dados inacessível.' });
   }
@@ -2033,5 +2118,5 @@ app.get('/health', async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 initDB()
-  .then(() => app.listen(PORT, () => console.log(`CEMIC Gestão — backend v3.14 rodando na porta ${PORT}`)))
+  .then(() => app.listen(PORT, () => console.log(`CEMIC Gestão — backend v3.16 rodando na porta ${PORT}`)))
   .catch(e => { console.error('Falha ao inicializar o banco:', e); process.exit(1); });
