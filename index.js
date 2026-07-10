@@ -1,5 +1,5 @@
 // ============================================================
-// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v3.13 (… + Portal dos Pais + Pix Inter)
+// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v3.14 (… + Portal dos Pais + Pix Inter)
 // Banco + Autenticação com perfis + Configurações + CRUDs
 // Stack: Node.js/Express + PostgreSQL (Railway)
 // ============================================================
@@ -327,6 +327,8 @@ async function initDB() {
   // Assim, matrícula cancelada ou concluída não impede nova matrícula na mesma turma.
   await pool.query(`ALTER TABLE matriculas DROP CONSTRAINT IF EXISTS matriculas_aluno_id_turma_id_key`);
   await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS uq_matricula_vaga ON matriculas (aluno_id, turma_id) WHERE status IN ('ativa','trancada')`);
+  // Portal dos Pais: senha do responsável (primeiro acesso)
+  await pool.query(`ALTER TABLE responsaveis ADD COLUMN IF NOT EXISTS senha_hash TEXT`);
   await seedConfiguracoes();
   await seedCursosNiveis();
   await seedMaster();
@@ -440,6 +442,35 @@ function exigirPerfil(...perfis) {
 }
 
 const somenteGestao = exigirPerfil('master', 'secretaria');
+
+function autenticarResponsavel(req, res, next) {
+  const header = req.headers.authorization || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7) : null;
+  if (!token) return res.status(401).json({ erro: 'Sessão não encontrada. Faça login.' });
+  try {
+    const dados = jwt.verify(token, JWT_SECRET);
+    if (dados.perfil !== 'responsavel') return res.status(403).json({ erro: 'Acesso negado.' });
+    req.responsavelId = dados.responsavel_id;
+    req.responsavelNome = dados.nome;
+    next();
+  } catch {
+    return res.status(401).json({ erro: 'Sessão inválida ou expirada. Faça login novamente.' });
+  }
+}
+async function alunosDoResponsavel(respId) {
+  const r = await pool.query(
+    `SELECT a.id, a.nome, a.cpf, a.data_nascimento,
+            t.nome AS turma_nome, t.turno, n.nome AS nivel_nome, c.nome AS curso_nome
+     FROM aluno_responsavel ar
+     JOIN alunos a ON a.id = ar.aluno_id
+     LEFT JOIN matriculas m ON m.aluno_id = a.id AND m.status = 'ativa'
+     LEFT JOIN turmas t ON t.id = m.turma_id
+     LEFT JOIN niveis n ON n.id = t.nivel_id
+     LEFT JOIN cursos c ON c.id = n.curso_id
+     WHERE ar.responsavel_id = $1
+     ORDER BY a.nome`, [respId]);
+  return r.rows;
+}
 
 function obrigatorios(body, campos) {
   const faltando = campos.filter(c => body[c] === undefined || body[c] === null || body[c] === '');
@@ -1786,6 +1817,43 @@ app.post('/publico/rematricula', limiterPublico, async (req, res) => {
   } catch (e) { console.error('Erro /publico/rematricula:', e); res.status(500).json({ erro: 'Erro ao registrar a rematrícula.' }); }
 });
 
+app.post('/publico/portal/primeiro-acesso', limiterLogin, async (req, res) => {
+  try {
+    const cpf = soDigitos(req.body.cpf);
+    const senha = String(req.body.senha || '');
+    if (!cpf) return res.status(400).json({ erro: 'Informe o CPF.' });
+    if (senha.length < 6) return res.status(400).json({ erro: 'A senha deve ter ao menos 6 caracteres.' });
+    const r = await pool.query(`SELECT id, senha_hash FROM responsaveis WHERE cpf = $1`, [cpf]);
+    const resp = r.rows[0];
+    if (!resp) return res.status(404).json({ erro: 'CPF não encontrado. Confirme com a secretaria se você está cadastrado como responsável do aluno.' });
+    if (resp.senha_hash) return res.status(409).json({ erro: 'Você já possui senha cadastrada. Faça login.' });
+    const hash = await bcrypt.hash(senha, 10);
+    await pool.query(`UPDATE responsaveis SET senha_hash = $1 WHERE id = $2`, [hash, resp.id]);
+    res.status(201).json({ mensagem: 'Senha cadastrada com sucesso. Agora é só fazer login.' });
+  } catch (e) { console.error('Erro portal primeiro-acesso:', e); res.status(500).json({ erro: 'Erro ao cadastrar a senha.' }); }
+});
+
+app.post('/publico/portal/login', limiterLogin, async (req, res) => {
+  try {
+    const cpf = soDigitos(req.body.cpf);
+    const senha = String(req.body.senha || '');
+    if (!cpf || !senha) return res.status(400).json({ erro: 'Informe CPF e senha.' });
+    const r = await pool.query(`SELECT id, nome, senha_hash FROM responsaveis WHERE cpf = $1`, [cpf]);
+    const resp = r.rows[0];
+    if (!resp) return res.status(401).json({ erro: 'CPF ou senha inválidos.' });
+    if (!resp.senha_hash) return res.status(409).json({ erro: 'Primeiro acesso necessário. Toque em "Primeiro acesso" para cadastrar sua senha.' });
+    const ok = await bcrypt.compare(senha, resp.senha_hash);
+    if (!ok) return res.status(401).json({ erro: 'CPF ou senha inválidos.' });
+    const token = jwt.sign({ responsavel_id: resp.id, nome: resp.nome, perfil: 'responsavel' }, JWT_SECRET, { expiresIn: '12h' });
+    res.json({ token, responsavel: { nome: resp.nome }, alunos: await alunosDoResponsavel(resp.id) });
+  } catch (e) { console.error('Erro portal login:', e); res.status(500).json({ erro: 'Erro ao entrar.' }); }
+});
+
+app.get('/publico/portal/alunos', autenticarResponsavel, async (req, res) => {
+  try { res.json(await alunosDoResponsavel(req.responsavelId)); }
+  catch (e) { console.error('Erro portal alunos:', e); res.status(500).json({ erro: 'Erro ao carregar os alunos.' }); }
+});
+
 app.get('/admin/pre-inscricoes', autenticar, somenteGestao, async (req, res) => {
   try {
     const cond = []; const params = [];
@@ -1957,7 +2025,7 @@ app.get('/', (req, res) => {
 app.get('/health', async (req, res) => {
   try {
     await pool.query('SELECT 1');
-    res.json({ status: 'ok', sistema: 'CEMIC Gestão', versao: '3.13 (Portal dos Pais + Pix Inter + Rematrícula ONLINE + correção rematrícula)' });
+    res.json({ status: 'ok', sistema: 'CEMIC Gestão', versao: '3.14 (Portal dos Pais acadêmico — Fase 1: login do responsável)' });
   } catch {
     res.status(500).json({ status: 'erro', detalhe: 'Banco de dados inacessível.' });
   }
@@ -1965,5 +2033,5 @@ app.get('/health', async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 initDB()
-  .then(() => app.listen(PORT, () => console.log(`CEMIC Gestão — backend v3.13 rodando na porta ${PORT}`)))
+  .then(() => app.listen(PORT, () => console.log(`CEMIC Gestão — backend v3.14 rodando na porta ${PORT}`)))
   .catch(e => { console.error('Falha ao inicializar o banco:', e); process.exit(1); });
