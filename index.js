@@ -1,5 +1,5 @@
 // ============================================================
-// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v3.16 (… + Portal dos Pais + Pix Inter)
+// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v3.17 (… + Portal dos Pais + Pix Inter)
 // Banco + Autenticação com perfis + Configurações + CRUDs
 // Stack: Node.js/Express + PostgreSQL (Railway)
 // ============================================================
@@ -1939,6 +1939,31 @@ app.put('/admin/matriculas/:id/turma', autenticar, somenteGestao, async (req, re
   } catch (e) { console.error('Erro alterar turma:', e); res.status(500).json({ erro: 'Erro ao alterar a turma.' }); }
 });
 
+// ---------- Relatório: pais cadastrados no Portal, por turma ----------
+app.get('/admin/relatorios/pais-por-turma', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const params = [];
+    let filtroSem = '';
+    if (req.query.semestre) { params.push(req.query.semestre); filtroSem = ` AND t.semestre = $${params.length}`; }
+    const r = await pool.query(
+      `SELECT t.id AS turma_id, t.nome AS turma_nome, t.turno, t.semestre,
+              c.nome AS curso_nome, n.nome AS nivel_nome,
+              a.id AS aluno_id, a.nome AS aluno_nome,
+              r.nome AS responsavel_nome, r.cpf AS responsavel_cpf, r.whatsapp AS responsavel_whatsapp,
+              ar.parentesco, (r.senha_hash IS NOT NULL) AS cadastrado
+       FROM matriculas m
+       JOIN alunos a ON a.id = m.aluno_id
+       JOIN turmas t ON t.id = m.turma_id
+       JOIN niveis n ON n.id = t.nivel_id
+       JOIN cursos c ON c.id = n.curso_id
+       LEFT JOIN aluno_responsavel ar ON ar.aluno_id = a.id
+       LEFT JOIN responsaveis r ON r.id = ar.responsavel_id
+       WHERE m.status = 'ativa'${filtroSem}
+       ORDER BY t.nome, a.nome, r.nome`, params);
+    res.json(r.rows);
+  } catch (e) { console.error('Erro relatório pais por turma:', e); res.status(500).json({ erro: 'Erro ao gerar o relatório.' }); }
+});
+
 app.get('/admin/pre-inscricoes', autenticar, somenteGestao, async (req, res) => {
   try {
     const cond = []; const params = [];
@@ -2110,7 +2135,7 @@ app.get('/', (req, res) => {
 app.get('/health', async (req, res) => {
   try {
     await pool.query('SELECT 1');
-    res.json({ status: 'ok', sistema: 'CEMIC Gestão', versao: '3.16 (Portal dos Pais — Avisos + Alteração de Turma)' });
+    res.json({ status: 'ok', sistema: 'CEMIC Gestão', versao: '3.17 (Portal dos Pais — Avisos + Alteração de Turma + Relatório de pais)' });
   } catch {
     res.status(500).json({ status: 'erro', detalhe: 'Banco de dados inacessível.' });
   }
@@ -2118,5 +2143,5 @@ app.get('/health', async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 initDB()
-  .then(() => app.listen(PORT, () => console.log(`CEMIC Gestão — backend v3.16 rodando na porta ${PORT}`)))
+  .then(() => app.listen(PORT, () => console.log(`CEMIC Gestão — backend v3.17 rodando na porta ${PORT}`)))
   .catch(e => { console.error('Falha ao inicializar o banco:', e); process.exit(1); });
