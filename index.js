@@ -1,5 +1,5 @@
 // ============================================================
-// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v3.17 (… + Portal dos Pais + Pix Inter)
+// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v3.18 (… + Portal dos Pais + Pix Inter)
 // Banco + Autenticação com perfis + Configurações + CRUDs
 // Stack: Node.js/Express + PostgreSQL (Railway)
 // ============================================================
@@ -329,6 +329,19 @@ async function initDB() {
   await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS uq_matricula_vaga ON matriculas (aluno_id, turma_id) WHERE status IN ('ativa','trancada')`);
   // Portal dos Pais: senha do responsável (primeiro acesso)
   await pool.query(`ALTER TABLE responsaveis ADD COLUMN IF NOT EXISTS senha_hash TEXT`);
+  // Declarações emitidas (verificáveis por código)
+  await pool.query(`CREATE TABLE IF NOT EXISTS declaracoes (
+    id SERIAL PRIMARY KEY,
+    codigo TEXT UNIQUE NOT NULL,
+    tipo TEXT NOT NULL DEFAULT 'vinculo',
+    aluno_id INTEGER REFERENCES alunos(id) ON DELETE SET NULL,
+    aluno_nome TEXT NOT NULL,
+    aluno_cpf TEXT,
+    curso TEXT,
+    turno TEXT,
+    responsavel_id INTEGER REFERENCES responsaveis(id) ON DELETE SET NULL,
+    emitida_em TIMESTAMP DEFAULT NOW()
+  )`);
   await seedConfiguracoes();
   await seedCursosNiveis();
   await seedMaster();
@@ -1915,6 +1928,51 @@ app.get('/publico/portal/aluno/:id/avisos', autenticarResponsavel, async (req, r
   } catch (e) { console.error('Erro portal avisos:', e); res.status(500).json({ erro: 'Erro ao carregar os avisos.' }); }
 });
 
+// ---------- Declaração de Vínculo verificável ----------
+app.post('/publico/portal/aluno/:id/declaracao', autenticarResponsavel, async (req, res) => {
+  try {
+    const alunoId = Number(req.params.id);
+    const vinc = await pool.query(`SELECT 1 FROM aluno_responsavel WHERE responsavel_id = $1 AND aluno_id = $2`, [req.responsavelId, alunoId]);
+    if (!vinc.rows.length) return res.status(403).json({ erro: 'Acesso negado a este aluno.' });
+    const dr = await pool.query(
+      `SELECT a.nome, a.cpf, t.turno
+       FROM alunos a
+       LEFT JOIN matriculas m ON m.aluno_id = a.id AND m.status = 'ativa'
+       LEFT JOIN turmas t ON t.id = m.turma_id
+       WHERE a.id = $1 LIMIT 1`, [alunoId]);
+    const d = dr.rows[0];
+    if (!d) return res.status(404).json({ erro: 'Aluno não encontrado.' });
+    const curso = 'Língua e Cultura Inglesa';
+    let codigo, ok = false;
+    for (let i = 0; i < 6 && !ok; i++) {
+      codigo = 'CEMIC-' + crypto.randomBytes(2).toString('hex').toUpperCase() + '-' + crypto.randomBytes(2).toString('hex').toUpperCase();
+      const ex = await pool.query(`SELECT 1 FROM declaracoes WHERE codigo = $1`, [codigo]);
+      if (!ex.rows.length) ok = true;
+    }
+    const ins = await pool.query(
+      `INSERT INTO declaracoes (codigo, tipo, aluno_id, aluno_nome, aluno_cpf, curso, turno, responsavel_id)
+       VALUES ($1, 'vinculo', $2, $3, $4, $5, $6, $7) RETURNING codigo, emitida_em`,
+      [codigo, alunoId, d.nome, d.cpf, curso, d.turno || null, req.responsavelId]);
+    res.status(201).json({
+      codigo: ins.rows[0].codigo, emitida_em: ins.rows[0].emitida_em,
+      aluno_nome: d.nome, aluno_cpf: d.cpf, curso, turno: d.turno || null
+    });
+  } catch (e) { console.error('Erro gerar declaração:', e); res.status(500).json({ erro: 'Erro ao gerar a declaração.' }); }
+});
+
+app.get('/publico/verificar/:codigo', async (req, res) => {
+  try {
+    const codigo = String(req.params.codigo || '').trim().toUpperCase();
+    const r = await pool.query(
+      `SELECT codigo, tipo, aluno_nome, aluno_cpf, curso, turno, emitida_em FROM declaracoes WHERE codigo = $1`, [codigo]);
+    if (!r.rows.length) return res.status(404).json({ valido: false, erro: 'Documento não encontrado. Verifique o código.' });
+    const d = r.rows[0];
+    const cpf = (d.aluno_cpf || '').replace(/\D/g, '');
+    const cpfMasc = cpf.length === 11 ? `${cpf.slice(0, 3)}.***.***-${cpf.slice(9)}` : null;
+    res.json({ valido: true, codigo: d.codigo, tipo: d.tipo, aluno_nome: d.aluno_nome, aluno_cpf: cpfMasc, curso: d.curso, turno: d.turno, emitida_em: d.emitida_em });
+  } catch (e) { console.error('Erro verificar declaração:', e); res.status(500).json({ valido: false, erro: 'Erro ao verificar o documento.' }); }
+});
+
 // ---------- Alteração de turma (transfere matrícula ativa sem cancelar) ----------
 app.put('/admin/matriculas/:id/turma', autenticar, somenteGestao, async (req, res) => {
   try {
@@ -2135,7 +2193,7 @@ app.get('/', (req, res) => {
 app.get('/health', async (req, res) => {
   try {
     await pool.query('SELECT 1');
-    res.json({ status: 'ok', sistema: 'CEMIC Gestão', versao: '3.17 (Portal dos Pais — Avisos + Alteração de Turma + Relatório de pais)' });
+    res.json({ status: 'ok', sistema: 'CEMIC Gestão', versao: '3.18 (Portal dos Pais — Declaração de Vínculo verificável)' });
   } catch {
     res.status(500).json({ status: 'erro', detalhe: 'Banco de dados inacessível.' });
   }
@@ -2143,5 +2201,5 @@ app.get('/health', async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 initDB()
-  .then(() => app.listen(PORT, () => console.log(`CEMIC Gestão — backend v3.17 rodando na porta ${PORT}`)))
+  .then(() => app.listen(PORT, () => console.log(`CEMIC Gestão — backend v3.18 rodando na porta ${PORT}`)))
   .catch(e => { console.error('Falha ao inicializar o banco:', e); process.exit(1); });
