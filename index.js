@@ -1,5 +1,5 @@
 // ============================================================
-// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v3.19 (… + Portal dos Pais + Pix Inter)
+// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v3.21 (… + Portal dos Pais + Pix Inter)
 // Banco + Autenticação com perfis + Configurações + CRUDs
 // Stack: Node.js/Express + PostgreSQL (Railway)
 // ============================================================
@@ -346,6 +346,17 @@ async function initDB() {
   )`);
   await pool.query(`ALTER TABLE declaracoes ADD COLUMN IF NOT EXISTS modulo TEXT`);
   await pool.query(`ALTER TABLE declaracoes ADD COLUMN IF NOT EXISTS semestre TEXT`);
+  // Folha de professores (hora-aula)
+  await pool.query(`CREATE TABLE IF NOT EXISTS professor_horas (
+    id SERIAL PRIMARY KEY,
+    professor_id INTEGER NOT NULL REFERENCES professores(id) ON DELETE CASCADE,
+    data DATE NOT NULL,
+    horas NUMERIC(6,2) NOT NULL,
+    valor_hora NUMERIC(10,2) NOT NULL,
+    observacao TEXT,
+    criado_em TIMESTAMP DEFAULT NOW()
+  )`);
+  await pool.query(`ALTER TABLE professores ADD COLUMN IF NOT EXISTS cpf TEXT`);
   await seedConfiguracoes();
   await seedCursosNiveis();
   await seedMaster();
@@ -375,7 +386,8 @@ async function seedConfiguracoes() {
       cnpj: '', endereco: 'São Luís - MA', telefone: '', email: '', logo_url: ''
     }), 'Dados institucionais usados em documentos e PDFs'],
     ['modelo_boletim', JSON.stringify({ titulo: 'Boletim de Desempenho', exibir_frequencia: true, exibir_observacoes: true, rodape: 'Documento emitido pelo CEMIC.' }), 'Modelo do boletim do aluno'],
-    ['modelo_historico', JSON.stringify({ titulo: 'Histórico Escolar', exibir_carga_horaria: true, rodape: 'Documento emitido pelo CEMIC.' }), 'Modelo do histórico do aluno']
+    ['modelo_historico', JSON.stringify({ titulo: 'Histórico Escolar', exibir_carga_horaria: true, rodape: 'Documento emitido pelo CEMIC.' }), 'Modelo do histórico do aluno'],
+    ['valor_hora_aula', JSON.stringify(0), 'Valor padrão da hora-aula do professor (R$)']
   ];
   for (const [chave, valor, descricao] of padroes) {
     await pool.query(
@@ -843,8 +855,8 @@ app.post('/admin/professores', autenticar, somenteGestao, async (req, res) => {
     const erro = obrigatorios(req.body, ['nome']);
     if (erro) return res.status(400).json({ erro });
     const r = await pool.query(
-      `INSERT INTO professores (nome, email, formacao, whatsapp, data_nascimento) VALUES ($1,$2,$3,$4,$5) RETURNING *`,
-      [req.body.nome, req.body.email || null, req.body.formacao || null, req.body.whatsapp || null, req.body.data_nascimento || null]
+      `INSERT INTO professores (nome, cpf, email, formacao, whatsapp, data_nascimento) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
+      [req.body.nome, req.body.cpf || null, req.body.email || null, req.body.formacao || null, req.body.whatsapp || null, req.body.data_nascimento || null]
     );
     res.status(201).json(r.rows[0]);
   } catch (e) {
@@ -859,9 +871,9 @@ app.put('/admin/professores/:id', autenticar, somenteGestao, async (req, res) =>
     if (!atual.rows.length) return res.status(404).json({ erro: 'Professor não encontrado.' });
     const x = atual.rows[0];
     const r = await pool.query(
-      `UPDATE professores SET nome=$1, email=$2, formacao=$3, whatsapp=$4, data_nascimento=$5, status=$6 WHERE id=$7 RETURNING *`,
+      `UPDATE professores SET nome=$1, cpf=$2, email=$3, formacao=$4, whatsapp=$5, data_nascimento=$6, status=$7 WHERE id=$8 RETURNING *`,
       [
-        req.body.nome ?? x.nome, req.body.email ?? x.email, req.body.formacao ?? x.formacao,
+        req.body.nome ?? x.nome, req.body.cpf ?? x.cpf, req.body.email ?? x.email, req.body.formacao ?? x.formacao,
         req.body.whatsapp ?? x.whatsapp, req.body.data_nascimento ?? x.data_nascimento,
         req.body.status ?? x.status, req.params.id
       ]
@@ -1978,6 +1990,53 @@ app.get('/publico/verificar/:codigo', async (req, res) => {
   } catch (e) { console.error('Erro verificar declaração:', e); res.status(500).json({ valido: false, erro: 'Erro ao verificar o documento.' }); }
 });
 
+// ---------- Folha de professores (hora-aula) ----------
+app.post('/admin/professor-horas', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const professorId = Number(req.body.professor_id);
+    const data = req.body.data;
+    const horas = Number(req.body.horas);
+    const valorHora = Number(req.body.valor_hora);
+    const observacao = (req.body.observacao || '').trim() || null;
+    if (!professorId) return res.status(400).json({ erro: 'Selecione o professor.' });
+    if (!data) return res.status(400).json({ erro: 'Informe a data.' });
+    if (!(horas > 0)) return res.status(400).json({ erro: 'Informe a quantidade de horas-aula.' });
+    if (!(valorHora >= 0)) return res.status(400).json({ erro: 'Informe o valor da hora-aula.' });
+    const p = await pool.query(`SELECT 1 FROM professores WHERE id = $1`, [professorId]);
+    if (!p.rows.length) return res.status(404).json({ erro: 'Professor não encontrado.' });
+    const r = await pool.query(
+      `INSERT INTO professor_horas (professor_id, data, horas, valor_hora, observacao)
+       VALUES ($1,$2,$3,$4,$5) RETURNING id`,
+      [professorId, data, horas, valorHora, observacao]);
+    res.status(201).json({ id: r.rows[0].id });
+  } catch (e) { console.error('Erro POST professor-horas:', e); res.status(500).json({ erro: 'Erro ao lançar as horas-aula.' }); }
+});
+
+app.get('/admin/professor-horas', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const cond = [], params = [];
+    if (req.query.professor_id) { params.push(Number(req.query.professor_id)); cond.push(`ph.professor_id = $${params.length}`); }
+    if (req.query.mes) { params.push(req.query.mes); cond.push(`to_char(ph.data, 'YYYY-MM') = $${params.length}`); }
+    const where = cond.length ? 'WHERE ' + cond.join(' AND ') : '';
+    const r = await pool.query(
+      `SELECT ph.id, ph.professor_id, ph.data, ph.horas, ph.valor_hora, ph.observacao,
+              (ph.horas * ph.valor_hora) AS total, p.nome AS professor_nome
+       FROM professor_horas ph
+       JOIN professores p ON p.id = ph.professor_id
+       ${where}
+       ORDER BY p.nome, ph.data`, params);
+    res.json(r.rows);
+  } catch (e) { console.error('Erro GET professor-horas:', e); res.status(500).json({ erro: 'Erro ao listar as horas-aula.' }); }
+});
+
+app.delete('/admin/professor-horas/:id', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const r = await pool.query(`DELETE FROM professor_horas WHERE id = $1 RETURNING id`, [req.params.id]);
+    if (!r.rows.length) return res.status(404).json({ erro: 'Lançamento não encontrado.' });
+    res.json({ ok: true });
+  } catch (e) { console.error('Erro DELETE professor-horas:', e); res.status(500).json({ erro: 'Erro ao remover o lançamento.' }); }
+});
+
 // ---------- Alteração de turma (transfere matrícula ativa sem cancelar) ----------
 app.put('/admin/matriculas/:id/turma', autenticar, somenteGestao, async (req, res) => {
   try {
@@ -2198,7 +2257,7 @@ app.get('/', (req, res) => {
 app.get('/health', async (req, res) => {
   try {
     await pool.query('SELECT 1');
-    res.json({ status: 'ok', sistema: 'CEMIC Gestão', versao: '3.19 (Declaração de Vínculo — módulo, semestre e verificação)' });
+    res.json({ status: 'ok', sistema: 'CEMIC Gestão', versao: '3.21 (Folha de professores — CPF e recibo por extenso)' });
   } catch {
     res.status(500).json({ status: 'erro', detalhe: 'Banco de dados inacessível.' });
   }
@@ -2206,5 +2265,5 @@ app.get('/health', async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 initDB()
-  .then(() => app.listen(PORT, () => console.log(`CEMIC Gestão — backend v3.19 rodando na porta ${PORT}`)))
+  .then(() => app.listen(PORT, () => console.log(`CEMIC Gestão — backend v3.21 rodando na porta ${PORT}`)))
   .catch(e => { console.error('Falha ao inicializar o banco:', e); process.exit(1); });
