@@ -1,5 +1,5 @@
 // ============================================================
-// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v3.21 (… + Portal dos Pais + Pix Inter)
+// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v3.22 (… + Portal dos Pais + Pix Inter)
 // Banco + Autenticação com perfis + Configurações + CRUDs
 // Stack: Node.js/Express + PostgreSQL (Railway)
 // ============================================================
@@ -357,6 +357,17 @@ async function initDB() {
     criado_em TIMESTAMP DEFAULT NOW()
   )`);
   await pool.query(`ALTER TABLE professores ADD COLUMN IF NOT EXISTS cpf TEXT`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS professor_pagamentos (
+    id SERIAL PRIMARY KEY,
+    professor_id INTEGER NOT NULL REFERENCES professores(id) ON DELETE CASCADE,
+    referencia TEXT NOT NULL,
+    data_pagamento DATE NOT NULL,
+    valor NUMERIC(10,2) NOT NULL,
+    forma TEXT,
+    observacao TEXT,
+    criado_em TIMESTAMP DEFAULT NOW()
+  )`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_prof_pag_ref ON professor_pagamentos (professor_id, referencia)`);
   await seedConfiguracoes();
   await seedCursosNiveis();
   await seedMaster();
@@ -2037,6 +2048,80 @@ app.delete('/admin/professor-horas/:id', autenticar, somenteGestao, async (req, 
   } catch (e) { console.error('Erro DELETE professor-horas:', e); res.status(500).json({ erro: 'Erro ao remover o lançamento.' }); }
 });
 
+// ---------- Pagamentos aos professores (baixas) ----------
+app.post('/admin/professor-pagamentos', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const professorId = Number(req.body.professor_id);
+    const referencia = (req.body.referencia || '').trim();
+    const dataPagamento = req.body.data_pagamento;
+    const valor = Number(req.body.valor);
+    const forma = (req.body.forma || '').trim() || null;
+    const observacao = (req.body.observacao || '').trim() || null;
+    if (!professorId) return res.status(400).json({ erro: 'Selecione o professor.' });
+    if (!/^\d{4}-\d{2}$/.test(referencia)) return res.status(400).json({ erro: 'Mês de referência inválido.' });
+    if (!dataPagamento) return res.status(400).json({ erro: 'Informe a data do pagamento.' });
+    if (!(valor > 0)) return res.status(400).json({ erro: 'Informe o valor pago.' });
+    const p = await pool.query(`SELECT 1 FROM professores WHERE id = $1`, [professorId]);
+    if (!p.rows.length) return res.status(404).json({ erro: 'Professor não encontrado.' });
+    const r = await pool.query(
+      `INSERT INTO professor_pagamentos (professor_id, referencia, data_pagamento, valor, forma, observacao)
+       VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
+      [professorId, referencia, dataPagamento, valor, forma, observacao]);
+    res.status(201).json({ id: r.rows[0].id });
+  } catch (e) { console.error('Erro POST professor-pagamentos:', e); res.status(500).json({ erro: 'Erro ao registrar o pagamento.' }); }
+});
+
+app.get('/admin/professor-pagamentos', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const cond = [], params = [];
+    if (req.query.professor_id) { params.push(Number(req.query.professor_id)); cond.push(`pg.professor_id = $${params.length}`); }
+    if (req.query.mes) { params.push(req.query.mes); cond.push(`pg.referencia = $${params.length}`); }
+    const where = cond.length ? 'WHERE ' + cond.join(' AND ') : '';
+    const r = await pool.query(
+      `SELECT pg.id, pg.professor_id, pg.referencia, pg.data_pagamento, pg.valor, pg.forma, pg.observacao,
+              p.nome AS professor_nome
+       FROM professor_pagamentos pg
+       JOIN professores p ON p.id = pg.professor_id
+       ${where}
+       ORDER BY pg.data_pagamento, pg.id`, params);
+    res.json(r.rows);
+  } catch (e) { console.error('Erro GET professor-pagamentos:', e); res.status(500).json({ erro: 'Erro ao listar os pagamentos.' }); }
+});
+
+app.delete('/admin/professor-pagamentos/:id', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const r = await pool.query(`DELETE FROM professor_pagamentos WHERE id = $1 RETURNING id`, [req.params.id]);
+    if (!r.rows.length) return res.status(404).json({ erro: 'Pagamento não encontrado.' });
+    res.json({ ok: true });
+  } catch (e) { console.error('Erro DELETE professor-pagamentos:', e); res.status(500).json({ erro: 'Erro ao remover o pagamento.' }); }
+});
+
+// Saldo consolidado do mês: devido (horas-aula) x pago (baixas)
+app.get('/admin/professor-folha', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const mes = req.query.mes;
+    if (!mes || !/^\d{4}-\d{2}$/.test(mes)) return res.status(400).json({ erro: 'Informe o mês (AAAA-MM).' });
+    const r = await pool.query(
+      `SELECT p.id AS professor_id, p.nome AS professor_nome,
+              COALESCE(h.horas, 0) AS horas,
+              COALESCE(h.devido, 0) AS devido,
+              COALESCE(g.pago, 0) AS pago,
+              COALESCE(h.devido, 0) - COALESCE(g.pago, 0) AS saldo
+       FROM professores p
+       LEFT JOIN (
+         SELECT professor_id, SUM(horas) AS horas, SUM(horas * valor_hora) AS devido
+         FROM professor_horas WHERE to_char(data, 'YYYY-MM') = $1 GROUP BY professor_id
+       ) h ON h.professor_id = p.id
+       LEFT JOIN (
+         SELECT professor_id, SUM(valor) AS pago
+         FROM professor_pagamentos WHERE referencia = $1 GROUP BY professor_id
+       ) g ON g.professor_id = p.id
+       WHERE COALESCE(h.devido, 0) <> 0 OR COALESCE(g.pago, 0) <> 0
+       ORDER BY p.nome`, [mes]);
+    res.json(r.rows);
+  } catch (e) { console.error('Erro GET professor-folha:', e); res.status(500).json({ erro: 'Erro ao apurar a folha.' }); }
+});
+
 // ---------- Alteração de turma (transfere matrícula ativa sem cancelar) ----------
 app.put('/admin/matriculas/:id/turma', autenticar, somenteGestao, async (req, res) => {
   try {
@@ -2257,7 +2342,7 @@ app.get('/', (req, res) => {
 app.get('/health', async (req, res) => {
   try {
     await pool.query('SELECT 1');
-    res.json({ status: 'ok', sistema: 'CEMIC Gestão', versao: '3.21 (Folha de professores — CPF e recibo por extenso)' });
+    res.json({ status: 'ok', sistema: 'CEMIC Gestão', versao: '3.22 (Folha de professores — saldo e baixas de pagamento)' });
   } catch {
     res.status(500).json({ status: 'erro', detalhe: 'Banco de dados inacessível.' });
   }
@@ -2265,5 +2350,5 @@ app.get('/health', async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 initDB()
-  .then(() => app.listen(PORT, () => console.log(`CEMIC Gestão — backend v3.21 rodando na porta ${PORT}`)))
+  .then(() => app.listen(PORT, () => console.log(`CEMIC Gestão — backend v3.22 rodando na porta ${PORT}`)))
   .catch(e => { console.error('Falha ao inicializar o banco:', e); process.exit(1); });
