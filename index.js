@@ -1,5 +1,5 @@
 // ============================================================
-// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v3.23 (… + Portal dos Pais + Pix Inter)
+// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v3.24 (… + Portal dos Pais + Pix Inter)
 // Banco + Autenticação com perfis + Configurações + CRUDs
 // Stack: Node.js/Express + PostgreSQL (Railway)
 // ============================================================
@@ -1988,6 +1988,105 @@ app.post('/publico/portal/aluno/:id/declaracao', autenticarResponsavel, async (r
   } catch (e) { console.error('Erro gerar declaração:', e); res.status(500).json({ erro: 'Erro ao gerar a declaração.' }); }
 });
 
+// ---------- Portal: Financeiro do aluno ----------
+const SQL_FIN_ITENS = `
+  SELECT cr.id, cr.descricao, cr.competencia, cr.valor_final, cr.vencimento,
+         cr.status, cr.data_pagamento, cr.forma_pagamento, t.semestre,
+         CASE
+           WHEN cr.status = 'paga' THEN 'pago'
+           WHEN cr.vencimento < CURRENT_DATE THEN 'vencido'
+           ELSE 'em_aberto'
+         END AS situacao,
+         CASE
+           WHEN cr.descricao ILIKE 'Taxa de Matrícula%' THEN 'matricula'
+           WHEN cr.descricao ILIKE 'Taxa da Plataforma%' THEN 'plataforma'
+           ELSE 'mensalidade'
+         END AS tipo
+  FROM contas_receber cr
+  JOIN matriculas m ON m.id = cr.matricula_id
+  JOIN turmas t ON t.id = m.turma_id
+  WHERE cr.aluno_id = $1 AND t.semestre = $2 AND cr.status <> 'cancelada'
+  ORDER BY cr.vencimento, cr.id`;
+
+function resumoFinanceiro(itens) {
+  const n = x => Number(x || 0);
+  const total = itens.reduce((s, i) => s + n(i.valor_final), 0);
+  const pago = itens.filter(i => i.situacao === 'pago').reduce((s, i) => s + n(i.valor_final), 0);
+  const vencido = itens.filter(i => i.situacao === 'vencido').reduce((s, i) => s + n(i.valor_final), 0);
+  const aberto = itens.filter(i => i.situacao === 'em_aberto').reduce((s, i) => s + n(i.valor_final), 0);
+  const pendentes = itens.filter(i => i.situacao !== 'pago').length;
+  return { total, pago, aberto, vencido, pendentes, quitado: itens.length > 0 && pendentes === 0 };
+}
+
+app.get('/publico/portal/aluno/:id/financeiro', autenticarResponsavel, async (req, res) => {
+  try {
+    const alunoId = Number(req.params.id);
+    const vinc = await pool.query(`SELECT 1 FROM aluno_responsavel WHERE responsavel_id = $1 AND aluno_id = $2`, [req.responsavelId, alunoId]);
+    if (!vinc.rows.length) return res.status(403).json({ erro: 'Acesso negado a este aluno.' });
+    const sems = await pool.query(
+      `SELECT DISTINCT t.semestre FROM matriculas m
+       JOIN turmas t ON t.id = m.turma_id
+       WHERE m.aluno_id = $1 AND t.semestre IS NOT NULL
+       ORDER BY t.semestre DESC`, [alunoId]);
+    const semestres = sems.rows.map(r => r.semestre);
+    let semestre = (req.query.semestre || '').trim();
+    if (!semestre) {
+      const vig = await getConfig('semestre_vigente', null);
+      semestre = (vig && semestres.includes(vig)) ? vig : (semestres[0] || null);
+    }
+    if (!semestre) return res.json({ semestre: null, semestres: [], itens: [], resumo: resumoFinanceiro([]) });
+    const r = await pool.query(SQL_FIN_ITENS, [alunoId, semestre]);
+    res.json({ semestre, semestres, itens: r.rows, resumo: resumoFinanceiro(r.rows) });
+  } catch (e) { console.error('Erro portal financeiro:', e); res.status(500).json({ erro: 'Erro ao carregar o financeiro.' }); }
+});
+
+app.post('/publico/portal/aluno/:id/relatorio-financeiro', autenticarResponsavel, async (req, res) => {
+  try {
+    const alunoId = Number(req.params.id);
+    const semestre = String(req.body.semestre || '').trim();
+    if (!semestre) return res.status(400).json({ erro: 'Informe o semestre.' });
+    const vinc = await pool.query(`SELECT 1 FROM aluno_responsavel WHERE responsavel_id = $1 AND aluno_id = $2`, [req.responsavelId, alunoId]);
+    if (!vinc.rows.length) return res.status(403).json({ erro: 'Acesso negado a este aluno.' });
+    const it = await pool.query(SQL_FIN_ITENS, [alunoId, semestre]);
+    const itens = it.rows;
+    if (!itens.length) return res.status(404).json({ erro: 'Não há lançamentos financeiros neste semestre.' });
+    const resumo = resumoFinanceiro(itens);
+    if (!resumo.quitado) {
+      return res.status(409).json({
+        erro: 'O relatório só pode ser emitido quando todos os pagamentos do semestre estiverem quitados.',
+        pendentes: resumo.pendentes
+      });
+    }
+    const dr = await pool.query(
+      `SELECT a.nome, a.cpf, t.turno, n.nome AS nivel_nome
+       FROM alunos a
+       LEFT JOIN matriculas m ON m.aluno_id = a.id
+       LEFT JOIN turmas t ON t.id = m.turma_id AND t.semestre = $2
+       LEFT JOIN niveis n ON n.id = t.nivel_id
+       WHERE a.id = $1
+       ORDER BY (t.semestre = $2) DESC NULLS LAST
+       LIMIT 1`, [alunoId, semestre]);
+    const d = dr.rows[0];
+    if (!d) return res.status(404).json({ erro: 'Aluno não encontrado.' });
+    const curso = 'Língua e Cultura Inglesa';
+    let codigo, ok = false;
+    for (let i = 0; i < 6 && !ok; i++) {
+      codigo = 'CEMIC-' + crypto.randomBytes(2).toString('hex').toUpperCase() + '-' + crypto.randomBytes(2).toString('hex').toUpperCase();
+      const ex = await pool.query(`SELECT 1 FROM declaracoes WHERE codigo = $1`, [codigo]);
+      if (!ex.rows.length) ok = true;
+    }
+    const ins = await pool.query(
+      `INSERT INTO declaracoes (codigo, tipo, aluno_id, aluno_nome, aluno_cpf, curso, modulo, turno, semestre, responsavel_id)
+       VALUES ($1, 'financeiro', $2, $3, $4, $5, $6, $7, $8, $9) RETURNING codigo, emitida_em`,
+      [codigo, alunoId, d.nome, d.cpf, curso, d.nivel_nome || null, d.turno || null, semestre, req.responsavelId]);
+    res.status(201).json({
+      codigo: ins.rows[0].codigo, emitida_em: ins.rows[0].emitida_em,
+      aluno_nome: d.nome, aluno_cpf: d.cpf, curso, modulo: d.nivel_nome || null, turno: d.turno || null,
+      semestre, itens, resumo
+    });
+  } catch (e) { console.error('Erro relatório financeiro:', e); res.status(500).json({ erro: 'Erro ao gerar o relatório financeiro.' }); }
+});
+
 app.get('/publico/verificar/:codigo', async (req, res) => {
   try {
     const codigo = String(req.params.codigo || '').trim().toUpperCase();
@@ -2342,7 +2441,7 @@ app.get('/', (req, res) => {
 app.get('/health', async (req, res) => {
   try {
     await pool.query('SELECT 1');
-    res.json({ status: 'ok', sistema: 'CEMIC Gestão', versao: '3.23 (Taxa da Plataforma configurável)' });
+    res.json({ status: 'ok', sistema: 'CEMIC Gestão', versao: '3.24 (Portal — Financeiro do aluno e relatório de quitação)' });
   } catch {
     res.status(500).json({ status: 'erro', detalhe: 'Banco de dados inacessível.' });
   }
@@ -2350,5 +2449,5 @@ app.get('/health', async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 initDB()
-  .then(() => app.listen(PORT, () => console.log(`CEMIC Gestão — backend v3.23 rodando na porta ${PORT}`)))
+  .then(() => app.listen(PORT, () => console.log(`CEMIC Gestão — backend v3.24 rodando na porta ${PORT}`)))
   .catch(e => { console.error('Falha ao inicializar o banco:', e); process.exit(1); });
