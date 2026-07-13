@@ -1,5 +1,5 @@
 // ============================================================
-// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v3.25 (… + Portal dos Pais + Pix Inter)
+// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v3.26 (… + Portal dos Pais + Pix Inter)
 // Banco + Autenticação com perfis + Configurações + CRUDs
 // Stack: Node.js/Express + PostgreSQL (Railway)
 // ============================================================
@@ -385,7 +385,7 @@ async function seedConfiguracoes() {
     ['dia_vencimento', JSON.stringify(10), 'Dia padrão de vencimento das mensalidades'],
     ['taxa_matricula', JSON.stringify(0), 'Valor padrão da taxa de matrícula (R$) — ajustável no ato, paga sempre no ato'],
     ['valor_plataforma', JSON.stringify(35), 'Valor da Taxa da Plataforma Acadêmica (R$) — lançada 1x por semestre'],
-    ['desconto_pontualidade', JSON.stringify(0), 'Desconto de pontualidade (R$) abatido da mensalidade paga até o vencimento'],
+    ['desconto_pontualidade', JSON.stringify(30), 'Desconto de pontualidade (R$) abatido da mensalidade paga até o vencimento'],
     ['multa_atraso', JSON.stringify({ ativa: false, multa_percentual: 2, juros_dia_percentual: 0.033 }), 'Multa e juros por atraso (aplicados quando ativa = true)'],
     ['descontos_disponiveis', JSON.stringify([25, 50, 100]), 'Percentuais de desconto disponíveis para Pagante Parcial (bolsista = 100)'],
     ['mensalidades', JSON.stringify({ 'Inglês': 0, 'Espanhol': 0 }), 'Valor da mensalidade integral por curso (R$) — definir antes das matrículas'],
@@ -1230,7 +1230,7 @@ app.post('/admin/matriculas', autenticar, somenteGestao, async (req, res) => {
     if (platMes === '2' || platMes === '8') {
       const valorPlat = Number(req.body.valor_plataforma) || Number(await getConfig('valor_plataforma', 35)) || 35;
       const mesPlat = platMes === '2' ? 1 : 7;
-      const vencPlat = new Date(anoBase, mesPlat, 1);
+      const vencPlat = new Date(anoBase, mesPlat, 5); // 05/02 ou 05/08 — mesma data impressa no termo
       const compPlat = `${anoBase}-${String(mesPlat + 1).padStart(2, '0')}`;
       await client.query(
         `INSERT INTO contas_receber
@@ -2452,7 +2452,7 @@ app.get('/', (req, res) => {
 app.get('/health', async (req, res) => {
   try {
     await pool.query('SELECT 1');
-    res.json({ status: 'ok', sistema: 'CEMIC Gestão', versao: '3.25 (Portal — Financeiro com valor efetivamente pago)' });
+    res.json({ status: 'ok', sistema: 'CEMIC Gestão', versao: '3.26 (Vencimento da Plataforma em 05 e desconto de pontualidade)' });
   } catch {
     res.status(500).json({ status: 'erro', detalhe: 'Banco de dados inacessível.' });
   }
@@ -2460,5 +2460,5 @@ app.get('/health', async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 initDB()
-  .then(() => app.listen(PORT, () => console.log(`CEMIC Gestão — backend v3.25 rodando na porta ${PORT}`)))
+  .then(() => app.listen(PORT, () => console.log(`CEMIC Gestão — backend v3.26 rodando na porta ${PORT}`)))
   .catch(e => { console.error('Falha ao inicializar o banco:', e); process.exit(1); });
