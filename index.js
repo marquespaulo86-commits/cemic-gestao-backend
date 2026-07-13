@@ -1,5 +1,5 @@
 // ============================================================
-// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v3.24 (… + Portal dos Pais + Pix Inter)
+// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v3.25 (… + Portal dos Pais + Pix Inter)
 // Banco + Autenticação com perfis + Configurações + CRUDs
 // Stack: Node.js/Express + PostgreSQL (Railway)
 // ============================================================
@@ -1990,8 +1990,18 @@ app.post('/publico/portal/aluno/:id/declaracao', autenticarResponsavel, async (r
 
 // ---------- Portal: Financeiro do aluno ----------
 const SQL_FIN_ITENS = `
-  SELECT cr.id, cr.descricao, cr.competencia, cr.valor_final, cr.vencimento,
+  SELECT cr.id, cr.descricao, cr.competencia, cr.vencimento,
          cr.status, cr.data_pagamento, cr.forma_pagamento, t.semestre,
+         cr.valor_final AS valor_cobrado,
+         COALESCE(cr.desconto_pontualidade, 0) AS desconto,
+         COALESCE(cr.juros, 0) AS juros,
+         CASE WHEN cr.status = 'paga'
+              THEN COALESCE(cr.valor_recebido, cr.valor_final - COALESCE(cr.desconto_pontualidade,0) + COALESCE(cr.juros,0))
+         END AS valor_pago,
+         CASE WHEN cr.status = 'paga'
+              THEN COALESCE(cr.valor_recebido, cr.valor_final - COALESCE(cr.desconto_pontualidade,0) + COALESCE(cr.juros,0))
+              ELSE cr.valor_final
+         END AS valor,
          CASE
            WHEN cr.status = 'paga' THEN 'pago'
            WHEN cr.vencimento < CURRENT_DATE THEN 'vencido'
@@ -2010,10 +2020,11 @@ const SQL_FIN_ITENS = `
 
 function resumoFinanceiro(itens) {
   const n = x => Number(x || 0);
-  const total = itens.reduce((s, i) => s + n(i.valor_final), 0);
-  const pago = itens.filter(i => i.situacao === 'pago').reduce((s, i) => s + n(i.valor_final), 0);
-  const vencido = itens.filter(i => i.situacao === 'vencido').reduce((s, i) => s + n(i.valor_final), 0);
-  const aberto = itens.filter(i => i.situacao === 'em_aberto').reduce((s, i) => s + n(i.valor_final), 0);
+  // 'valor' = o que foi realmente pago (nos quitados) ou o que está sendo cobrado (nos demais)
+  const total = itens.reduce((s, i) => s + n(i.valor), 0);
+  const pago = itens.filter(i => i.situacao === 'pago').reduce((s, i) => s + n(i.valor), 0);
+  const vencido = itens.filter(i => i.situacao === 'vencido').reduce((s, i) => s + n(i.valor), 0);
+  const aberto = itens.filter(i => i.situacao === 'em_aberto').reduce((s, i) => s + n(i.valor), 0);
   const pendentes = itens.filter(i => i.situacao !== 'pago').length;
   return { total, pago, aberto, vencido, pendentes, quitado: itens.length > 0 && pendentes === 0 };
 }
@@ -2441,7 +2452,7 @@ app.get('/', (req, res) => {
 app.get('/health', async (req, res) => {
   try {
     await pool.query('SELECT 1');
-    res.json({ status: 'ok', sistema: 'CEMIC Gestão', versao: '3.24 (Portal — Financeiro do aluno e relatório de quitação)' });
+    res.json({ status: 'ok', sistema: 'CEMIC Gestão', versao: '3.25 (Portal — Financeiro com valor efetivamente pago)' });
   } catch {
     res.status(500).json({ status: 'erro', detalhe: 'Banco de dados inacessível.' });
   }
@@ -2449,5 +2460,5 @@ app.get('/health', async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 initDB()
-  .then(() => app.listen(PORT, () => console.log(`CEMIC Gestão — backend v3.24 rodando na porta ${PORT}`)))
+  .then(() => app.listen(PORT, () => console.log(`CEMIC Gestão — backend v3.25 rodando na porta ${PORT}`)))
   .catch(e => { console.error('Falha ao inicializar o banco:', e); process.exit(1); });
