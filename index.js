@@ -1,5 +1,5 @@
 // ============================================================
-// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v3.26 (… + Portal dos Pais + Pix Inter)
+// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v3.27 (… + Portal dos Pais + Pix Inter)
 // Banco + Autenticação com perfis + Configurações + CRUDs
 // Stack: Node.js/Express + PostgreSQL (Railway)
 // ============================================================
@@ -393,8 +393,8 @@ async function seedConfiguracoes() {
     ['categorias_contas_pagar', JSON.stringify(['Aluguel', 'Energia', 'Água/Internet', 'Salários', 'Material Didático', 'Manutenção', 'Outros']), 'Categorias de contas a pagar'],
     ['categorias_contas_receber', JSON.stringify(['Mensalidade', 'Matrícula', 'Material', 'Evento', 'Outros']), 'Categorias de contas a receber'],
     ['dados_instituicao', JSON.stringify({
-      nome: 'CEMIC — Centro Maranhense de Idiomas e Culturas',
-      cnpj: '', endereco: 'São Luís - MA', telefone: '', email: '', logo_url: ''
+      nome: 'Centro Maranhense de Idiomas e Culturas — CEMIC',
+      cnpj: '24.203.264/0001-00', endereco: 'São Luís - MA', telefone: '', email: '', logo_url: ''
     }), 'Dados institucionais usados em documentos e PDFs'],
     ['modelo_boletim', JSON.stringify({ titulo: 'Boletim de Desempenho', exibir_frequencia: true, exibir_observacoes: true, rodape: 'Documento emitido pelo CEMIC.' }), 'Modelo do boletim do aluno'],
     ['modelo_historico', JSON.stringify({ titulo: 'Histórico Escolar', exibir_carga_horaria: true, rodape: 'Documento emitido pelo CEMIC.' }), 'Modelo do histórico do aluno'],
@@ -1751,6 +1751,19 @@ const PASTA_PUBLIC = path.join(__dirname, 'public');
 // ============================================================
 // PORTAL DOS PAIS — PRÉ-INSCRIÇÃO ONLINE (públicas, sem autenticação)
 // ============================================================
+app.get('/publico/instituicao', limiterPublico, async (req, res) => {
+  try {
+    const inst = await getConfig('dados_instituicao', {}) || {};
+    res.json({
+      nome: inst.nome || 'Centro Maranhense de Idiomas e Culturas — CEMIC',
+      cnpj: inst.cnpj || '',
+      endereco: inst.endereco || '',
+      telefone: inst.telefone || '',
+      email: inst.email || ''
+    });
+  } catch (e) { console.error('Erro GET instituicao:', e); res.status(500).json({ erro: 'Erro ao carregar os dados institucionais.' }); }
+});
+
 app.get('/publico/opcoes', limiterPublico, async (req, res) => {
   try {
     const taxa = Number(await getConfig('taxa_matricula', 0)) || 0;
@@ -2452,7 +2465,7 @@ app.get('/', (req, res) => {
 app.get('/health', async (req, res) => {
   try {
     await pool.query('SELECT 1');
-    res.json({ status: 'ok', sistema: 'CEMIC Gestão', versao: '3.26 (Vencimento da Plataforma em 05 e desconto de pontualidade)' });
+    res.json({ status: 'ok', sistema: 'CEMIC Gestão', versao: '3.27 (Dados institucionais configuráveis nos documentos do portal)' });
   } catch {
     res.status(500).json({ status: 'erro', detalhe: 'Banco de dados inacessível.' });
   }
@@ -2460,5 +2473,5 @@ app.get('/health', async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 initDB()
-  .then(() => app.listen(PORT, () => console.log(`CEMIC Gestão — backend v3.26 rodando na porta ${PORT}`)))
+  .then(() => app.listen(PORT, () => console.log(`CEMIC Gestão — backend v3.27 rodando na porta ${PORT}`)))
   .catch(e => { console.error('Falha ao inicializar o banco:', e); process.exit(1); });
