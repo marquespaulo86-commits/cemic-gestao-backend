@@ -1,5 +1,5 @@
 // ============================================================
-// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v3.27 (… + Portal dos Pais + Pix Inter)
+// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v3.28 (… + Portal dos Pais + Pix Inter)
 // Banco + Autenticação com perfis + Configurações + CRUDs
 // Stack: Node.js/Express + PostgreSQL (Railway)
 // ============================================================
@@ -73,7 +73,7 @@ async function initDB() {
     cpf TEXT UNIQUE,
     whatsapp TEXT,
     status TEXT NOT NULL DEFAULT 'ativo' CHECK (status IN ('ativo','inativo')),
-    modalidade TEXT NOT NULL DEFAULT 'pagante' CHECK (modalidade IN ('pagante','pagante_parcial','bolsista')),
+    modalidade TEXT NOT NULL DEFAULT 'pagante' CHECK (modalidade IN ('pagante','pagante_parcial','bolsista','bolsista_iema','desconto_especial')),
     desconto_percentual NUMERIC(5,2) NOT NULL DEFAULT 0,
     data_cadastro DATE DEFAULT CURRENT_DATE,
     observacoes TEXT
@@ -326,6 +326,8 @@ async function initDB() {
   // Matrícula: a unicidade passa a valer só para matrícula que ocupa vaga (ativa/trancada).
   // Assim, matrícula cancelada ou concluída não impede nova matrícula na mesma turma.
   await pool.query(`ALTER TABLE matriculas DROP CONSTRAINT IF EXISTS matriculas_aluno_id_turma_id_key`);
+  await pool.query(`ALTER TABLE alunos DROP CONSTRAINT IF EXISTS alunos_modalidade_check`);
+  await pool.query(`ALTER TABLE alunos ADD CONSTRAINT alunos_modalidade_check CHECK (modalidade IN ('pagante','pagante_parcial','bolsista','bolsista_iema','desconto_especial'))`);
   await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS uq_matricula_vaga ON matriculas (aluno_id, turma_id) WHERE status IN ('ativa','trancada')`);
   // Portal dos Pais: senha do responsável (primeiro acesso)
   await pool.query(`ALTER TABLE responsaveis ADD COLUMN IF NOT EXISTS senha_hash TEXT`);
@@ -1163,6 +1165,8 @@ app.post('/admin/matriculas', autenticar, somenteGestao, async (req, res) => {
     }
 
     const bolsista = aluno.modalidade === 'bolsista';
+    // Bolsista IEMA e Desconto Especial: isentos de mensalidade e taxa de matrícula, mas pagam a Plataforma
+    const isentoMensTaxa = aluno.modalidade === 'bolsista_iema' || aluno.modalidade === 'desconto_especial';
     const hoje = new Date();
     const diaVenc = Math.min(Number(await getConfig('dia_vencimento', 10)) || 10, 28);
 
@@ -1170,7 +1174,7 @@ app.post('/admin/matriculas', autenticar, somenteGestao, async (req, res) => {
     // '1' = 1º semestre (fev–jun) · '2' = 2º semestre (ago–dez) · 'sem' = sem financeiro (bolsista)
     let semLanc = String(req.body.semestre_lancamento || '').trim();
     if (!['1', '2', 'sem'].includes(semLanc)) {
-      semLanc = bolsista ? 'sem' : (String(turma.semestre || '').endsWith('.1') ? '1' : '2');
+      semLanc = (bolsista || isentoMensTaxa) ? 'sem' : (String(turma.semestre || '').endsWith('.1') ? '1' : '2');
     }
     const anoBase = parseInt(String(turma.semestre || '').split('.')[0], 10) || hoje.getFullYear();
     const mesesSem = semLanc === '1' ? [1, 2, 3, 4, 5] : semLanc === '2' ? [7, 8, 9, 10, 11] : [];
@@ -1187,9 +1191,9 @@ app.post('/admin/matriculas', autenticar, somenteGestao, async (req, res) => {
     const vFinal = +(valor - vDesc).toFixed(2);
 
     // Taxa de matrícula: geral, paga sempre no ato (bolsista também paga)
-    const taxa = req.body.taxa_matricula !== undefined
+    const taxa = isentoMensTaxa ? 0 : (req.body.taxa_matricula !== undefined
       ? Number(req.body.taxa_matricula) || 0
-      : Number(await getConfig('taxa_matricula', 0)) || 0;
+      : Number(await getConfig('taxa_matricula', 0)) || 0);
     const formaTaxa = String(req.body.forma_pagamento_taxa || '').trim();
     if (taxa > 0 && !formaTaxa) {
       await client.query('ROLLBACK'); client.release();
@@ -1225,7 +1229,9 @@ app.post('/admin/matriculas', autenticar, somenteGestao, async (req, res) => {
     let platMes = String(req.body.plataforma_mes || '').trim(); // '2' | '8' | 'sem'
     if (!['2', '8', 'sem'].includes(platMes)) {
       const querPlat = req.body.plataforma === true || req.body.plataforma === 'true';
-      platMes = querPlat && semLanc !== 'sem' ? (semLanc === '1' ? '2' : '8') : 'sem';
+      const platSemestre = String(turma.semestre || '').endsWith('.1') ? '2' : '8';
+      if (isentoMensTaxa) { platMes = platSemestre; }        // IEMA/Especial pagam a Plataforma
+      else { platMes = querPlat && semLanc !== 'sem' ? platSemestre : 'sem'; }
     }
     if (platMes === '2' || platMes === '8') {
       const valorPlat = Number(req.body.valor_plataforma) || Number(await getConfig('valor_plataforma', 35)) || 35;
@@ -2465,7 +2471,7 @@ app.get('/', (req, res) => {
 app.get('/health', async (req, res) => {
   try {
     await pool.query('SELECT 1');
-    res.json({ status: 'ok', sistema: 'CEMIC Gestão', versao: '3.27 (Dados institucionais configuráveis nos documentos do portal)' });
+    res.json({ status: 'ok', sistema: 'CEMIC Gestão', versao: '3.28 (Modalidades Bolsista IEMA e Desconto Especial)' });
   } catch {
     res.status(500).json({ status: 'erro', detalhe: 'Banco de dados inacessível.' });
   }
@@ -2473,5 +2479,5 @@ app.get('/health', async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 initDB()
-  .then(() => app.listen(PORT, () => console.log(`CEMIC Gestão — backend v3.27 rodando na porta ${PORT}`)))
+  .then(() => app.listen(PORT, () => console.log(`CEMIC Gestão — backend v3.28 rodando na porta ${PORT}`)))
   .catch(e => { console.error('Falha ao inicializar o banco:', e); process.exit(1); });
