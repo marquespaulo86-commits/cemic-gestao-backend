@@ -1,5 +1,5 @@
 // ============================================================
-// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v3.31 (… + Portal dos Pais + Pix Inter)
+// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v3.32 (… + Portal dos Pais + Pix Inter)
 // Banco + Autenticação com perfis + Configurações + CRUDs
 // Stack: Node.js/Express + PostgreSQL (Railway)
 // ============================================================
@@ -409,6 +409,33 @@ async function initDB() {
   )`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_ocorrencias_aluno ON ocorrencias (aluno_id, data)`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_atividades_turma ON atividades (turma_id, criado_em)`);
+  // ---------- Carteira Estudantil (v3.32) ----------
+  await pool.query(`CREATE TABLE IF NOT EXISTS aluno_fotos (
+    aluno_id INTEGER PRIMARY KEY REFERENCES alunos(id) ON DELETE CASCADE,
+    mime TEXT NOT NULL,
+    tamanho INTEGER NOT NULL,
+    conteudo BYTEA NOT NULL,
+    enviada_por INTEGER REFERENCES responsaveis(id) ON DELETE SET NULL,
+    enviada_em TIMESTAMP DEFAULT NOW()
+  )`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS carteiras (
+    id SERIAL PRIMARY KEY,
+    codigo TEXT UNIQUE NOT NULL,
+    aluno_id INTEGER REFERENCES alunos(id) ON DELETE SET NULL,
+    aluno_nome TEXT NOT NULL,
+    aluno_cpf TEXT,
+    aluno_codigo TEXT,
+    curso TEXT,
+    modulo TEXT,
+    turma_nome TEXT,
+    turno TEXT,
+    semestre TEXT NOT NULL,
+    validade DATE,
+    emitida_em TIMESTAMP DEFAULT NOW(),
+    emitida_por_responsavel INTEGER REFERENCES responsaveis(id) ON DELETE SET NULL
+  )`);
+  await pool.query(`ALTER TABLE carteiras ADD COLUMN IF NOT EXISTS aluno_cpf TEXT`);
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_carteiras_aluno_semestre ON carteiras (aluno_id, semestre)`);
   await seedConfiguracoes();
   await seedCursosNiveis();
   await seedMaster();
@@ -2717,12 +2744,182 @@ app.get('/publico/verificar/:codigo', async (req, res) => {
     const codigo = String(req.params.codigo || '').trim().toUpperCase();
     const r = await pool.query(
       `SELECT codigo, tipo, aluno_nome, aluno_cpf, curso, modulo, turno, semestre, modulos, total_semestres, carga_horaria, emitida_em FROM declaracoes WHERE codigo = $1`, [codigo]);
-    if (!r.rows.length) return res.status(404).json({ valido: false, erro: 'Documento não encontrado. Verifique o código.' });
+    if (!r.rows.length) {
+      // Pode ser uma carteira estudantil
+      const c = await pool.query(
+        `SELECT codigo, aluno_nome, aluno_cpf, aluno_codigo, curso, modulo, turma_nome, turno, semestre, validade, emitida_em FROM carteiras WHERE codigo = $1`, [codigo]);
+      if (!c.rows.length) return res.status(404).json({ valido: false, erro: 'Documento não encontrado. Verifique o código.' });
+      const k = c.rows[0];
+      const vencida = k.validade ? (new Date(k.validade) < new Date(new Date().toDateString())) : false;
+      const cpfK = (k.aluno_cpf || '').replace(/\D/g, '');
+      const cpfKMasc = cpfK.length === 11 ? `${cpfK.slice(0, 3)}.***.***-${cpfK.slice(9)}` : null;
+      return res.json({
+        valido: true, codigo: k.codigo, tipo: 'carteira', aluno_nome: k.aluno_nome, aluno_cpf: cpfKMasc, aluno_codigo: k.aluno_codigo,
+        curso: k.curso, modulo: k.modulo, turma_nome: k.turma_nome, turno: k.turno, semestre: k.semestre,
+        validade: k.validade, situacao: vencida ? 'expirada' : 'vigente', emitida_em: k.emitida_em
+      });
+    }
     const d = r.rows[0];
     const cpf = (d.aluno_cpf || '').replace(/\D/g, '');
     const cpfMasc = cpf.length === 11 ? `${cpf.slice(0, 3)}.***.***-${cpf.slice(9)}` : null;
     res.json({ valido: true, codigo: d.codigo, tipo: d.tipo, aluno_nome: d.aluno_nome, aluno_cpf: cpfMasc, curso: d.curso, modulo: d.modulo, turno: d.turno, semestre: d.semestre, modulos: d.modulos, total_semestres: d.total_semestres, carga_horaria: d.carga_horaria, emitida_em: d.emitida_em });
   } catch (e) { console.error('Erro verificar declaração:', e); res.status(500).json({ valido: false, erro: 'Erro ao verificar o documento.' }); }
+});
+
+// ============================================================
+// CARTEIRA ESTUDANTIL — foto do aluno + emissão (Portal dos Pais)
+// ============================================================
+const FOTO_MIMES = ['image/jpeg', 'image/png', 'image/webp'];
+const FOTO_MAX_BYTES = 2 * 1024 * 1024;
+
+// A carteira vale enquanto o semestre letivo estiver em curso.
+function fimDoSemestre(sem) {
+  const m = String(sem || '').match(/^(\d{4})\.([12])$/);
+  if (!m) return null;
+  return m[2] === '1' ? `${m[1]}-06-30` : `${m[1]}-12-31`;
+}
+
+function fotoDoCorpo(body) {
+  const mime = String((body && body.mime) || '').toLowerCase().trim();
+  if (!FOTO_MIMES.includes(mime)) return { erro: 'Envie a foto em JPG, PNG ou WEBP.' };
+  const base64 = String((body && body.base64) || '').replace(/^data:[^,]*,/, '').trim();
+  if (!base64) return { erro: 'Nenhuma imagem foi recebida.' };
+  if (!/^[A-Za-z0-9+/=\s]+$/.test(base64)) return { erro: 'Imagem inválida.' };
+  const buf = Buffer.from(base64, 'base64');
+  if (!buf.length) return { erro: 'Imagem inválida.' };
+  if (buf.length > FOTO_MAX_BYTES) return { erro: 'A foto deve ter no máximo 2 MB.' };
+  return { mime, buf };
+}
+
+// Envio da foto pelo responsável (uma foto por aluno; novo envio substitui a anterior)
+app.post('/publico/portal/aluno/:id/foto', autenticarResponsavel, async (req, res) => {
+  try {
+    const alunoId = Number(req.params.id);
+    if (!(await vinculoOk(req.responsavelId, alunoId))) return res.status(403).json({ erro: 'Acesso negado a este aluno.' });
+    const f = fotoDoCorpo(req.body);
+    if (f.erro) return res.status(400).json({ erro: f.erro });
+    await pool.query(
+      `INSERT INTO aluno_fotos (aluno_id, mime, tamanho, conteudo, enviada_por, enviada_em)
+       VALUES ($1, $2, $3, $4, $5, NOW())
+       ON CONFLICT (aluno_id) DO UPDATE
+         SET mime = EXCLUDED.mime, tamanho = EXCLUDED.tamanho, conteudo = EXCLUDED.conteudo,
+             enviada_por = EXCLUDED.enviada_por, enviada_em = NOW()`,
+      [alunoId, f.mime, f.buf.length, f.buf, req.responsavelId]);
+    res.status(201).json({ ok: true, tamanho: f.buf.length });
+  } catch (e) { console.error('Erro enviar foto do aluno:', e); res.status(500).json({ erro: 'Erro ao enviar a foto.' }); }
+});
+
+app.delete('/publico/portal/aluno/:id/foto', autenticarResponsavel, async (req, res) => {
+  try {
+    const alunoId = Number(req.params.id);
+    if (!(await vinculoOk(req.responsavelId, alunoId))) return res.status(403).json({ erro: 'Acesso negado a este aluno.' });
+    await pool.query(`DELETE FROM aluno_fotos WHERE aluno_id = $1`, [alunoId]);
+    res.json({ ok: true });
+  } catch (e) { console.error('Erro remover foto do aluno:', e); res.status(500).json({ erro: 'Erro ao remover a foto.' }); }
+});
+
+// A Gestão pode remover uma foto inadequada
+app.delete('/admin/alunos/:id/foto', autenticar, somenteGestao, async (req, res) => {
+  try {
+    await pool.query(`DELETE FROM aluno_fotos WHERE aluno_id = $1`, [Number(req.params.id)]);
+    res.json({ ok: true });
+  } catch (e) { console.error('Erro remover foto (gestão):', e); res.status(500).json({ erro: 'Erro ao remover a foto.' }); }
+});
+
+// Entrega da foto: só o responsável vinculado ou a gestão; nunca uma URL pública
+app.get('/arquivos/aluno-foto/:id', async (req, res) => {
+  try {
+    const header = req.headers.authorization || '';
+    const token = req.query.token || (header.startsWith('Bearer ') ? header.slice(7) : null);
+    if (!token) return res.status(401).json({ erro: 'Token não fornecido.' });
+    let dados;
+    try { dados = jwt.verify(token, JWT_SECRET); } catch { return res.status(401).json({ erro: 'Token inválido ou expirado.' }); }
+    const alunoId = Number(req.params.id);
+    if (dados.perfil === 'responsavel') {
+      if (!(await vinculoOk(dados.responsavel_id, alunoId))) return res.status(403).json({ erro: 'Acesso negado a este aluno.' });
+    } else if (!['master', 'secretaria'].includes(dados.perfil)) {
+      return res.status(403).json({ erro: 'Acesso negado.' });
+    }
+    const r = await pool.query(`SELECT mime, conteudo FROM aluno_fotos WHERE aluno_id = $1`, [alunoId]);
+    if (!r.rows.length) return res.status(404).json({ erro: 'Foto não encontrada.' });
+    res.setHeader('Content-Type', r.rows[0].mime);
+    res.setHeader('Cache-Control', 'private, no-store');
+    res.send(r.rows[0].conteudo);
+  } catch (e) { console.error('Erro baixar foto do aluno:', e); res.status(500).json({ erro: 'Erro ao carregar a foto.' }); }
+});
+
+// Emissão da carteira: uma por aluno e semestre (reemitir devolve a mesma)
+app.post('/publico/portal/aluno/:id/carteira', autenticarResponsavel, async (req, res) => {
+  try {
+    const alunoId = Number(req.params.id);
+    if (!(await vinculoOk(req.responsavelId, alunoId))) return res.status(403).json({ erro: 'Acesso negado a este aluno.' });
+    const dr = await pool.query(
+      `SELECT a.nome, a.cpf AS aluno_cpf, a.codigo AS aluno_codigo, t.nome AS turma_nome, t.turno, t.semestre,
+              n.nome AS nivel_nome, c.nome AS curso_nome
+       FROM alunos a
+       LEFT JOIN matriculas m ON m.aluno_id = a.id AND m.status = 'ativa'
+       LEFT JOIN turmas t ON t.id = m.turma_id
+       LEFT JOIN niveis n ON n.id = t.nivel_id
+       LEFT JOIN cursos c ON c.id = n.curso_id
+       WHERE a.id = $1
+       ORDER BY m.id DESC LIMIT 1`, [alunoId]);
+    const d = dr.rows[0];
+    if (!d) return res.status(404).json({ erro: 'Aluno não encontrado.' });
+    if (!d.semestre) return res.status(400).json({ erro: 'A carteira só pode ser emitida com uma matrícula ativa. Procure a secretaria.' });
+
+    const semestre = d.semestre;
+    const validade = fimDoSemestre(semestre);
+    const curso = d.curso_nome || 'Inglês';
+
+    const existente = await pool.query(`SELECT codigo, emitida_em FROM carteiras WHERE aluno_id = $1 AND semestre = $2`, [alunoId, semestre]);
+    let codigo, emitidaEm;
+    if (existente.rows.length) {
+      codigo = existente.rows[0].codigo;
+      emitidaEm = existente.rows[0].emitida_em;
+      await pool.query(
+        `UPDATE carteiras SET aluno_nome = $1, aluno_cpf = $2, aluno_codigo = $3, curso = $4, modulo = $5, turma_nome = $6, turno = $7, validade = $8
+         WHERE codigo = $9`,
+        [d.nome, d.aluno_cpf, d.aluno_codigo, curso, d.nivel_nome || null, d.turma_nome || null, d.turno || null, validade, codigo]);
+    } else {
+      let ok = false;
+      for (let i = 0; i < 6 && !ok; i++) {
+        codigo = 'CEMIC-' + crypto.randomBytes(2).toString('hex').toUpperCase() + '-' + crypto.randomBytes(2).toString('hex').toUpperCase();
+        const ex = await pool.query(`SELECT 1 FROM declaracoes WHERE codigo = $1 UNION ALL SELECT 1 FROM carteiras WHERE codigo = $1`, [codigo]);
+        if (!ex.rows.length) ok = true;
+      }
+      const ins = await pool.query(
+        `INSERT INTO carteiras (codigo, aluno_id, aluno_nome, aluno_cpf, aluno_codigo, curso, modulo, turma_nome, turno, semestre, validade, emitida_por_responsavel)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING emitida_em`,
+        [codigo, alunoId, d.nome, d.aluno_cpf, d.aluno_codigo, curso, d.nivel_nome || null, d.turma_nome || null, d.turno || null, semestre, validade, req.responsavelId]);
+      emitidaEm = ins.rows[0].emitida_em;
+    }
+
+    const foto = await pool.query(`SELECT 1 FROM aluno_fotos WHERE aluno_id = $1`, [alunoId]);
+    res.status(201).json({
+      codigo, emitida_em: emitidaEm, aluno_nome: d.nome, aluno_cpf: d.aluno_cpf, aluno_codigo: d.aluno_codigo,
+      curso, modulo: d.nivel_nome || null, turma_nome: d.turma_nome || null, turno: d.turno || null,
+      semestre, validade, tem_foto: foto.rows.length > 0
+    });
+  } catch (e) { console.error('Erro emitir carteira:', e); res.status(500).json({ erro: 'Erro ao emitir a carteira.' }); }
+});
+
+// Situação da carteira e da foto, para montar a tela sem emitir nada
+app.get('/publico/portal/aluno/:id/carteira', autenticarResponsavel, async (req, res) => {
+  try {
+    const alunoId = Number(req.params.id);
+    if (!(await vinculoOk(req.responsavelId, alunoId))) return res.status(403).json({ erro: 'Acesso negado a este aluno.' });
+    const foto = await pool.query(`SELECT tamanho, enviada_em FROM aluno_fotos WHERE aluno_id = $1`, [alunoId]);
+    const mat = await matriculaAtivaDoAluno(alunoId);
+    const cart = mat ? await pool.query(`SELECT codigo, emitida_em, validade FROM carteiras WHERE aluno_id = $1 AND semestre = $2`, [alunoId, mat.semestre]) : { rows: [] };
+    res.json({
+      tem_foto: foto.rows.length > 0,
+      foto_enviada_em: foto.rows.length ? foto.rows[0].enviada_em : null,
+      semestre: mat ? mat.semestre : null,
+      emitida: cart.rows.length > 0,
+      codigo: cart.rows.length ? cart.rows[0].codigo : null,
+      validade: cart.rows.length ? cart.rows[0].validade : null
+    });
+  } catch (e) { console.error('Erro consultar carteira:', e); res.status(500).json({ erro: 'Erro ao carregar a carteira.' }); }
 });
 
 // ---------- Folha de professores (hora-aula) ----------
@@ -3066,7 +3263,7 @@ app.get('/', (req, res) => {
 app.get('/health', async (req, res) => {
   try {
     await pool.query('SELECT 1');
-    res.json({ status: 'ok', sistema: 'CEMIC Gestão', versao: '3.31 (Declaração de Estudos — carga horária total)' });
+    res.json({ status: 'ok', sistema: 'CEMIC Gestão', versao: '3.32 (Carteira Estudantil)' });
   } catch {
     res.status(500).json({ status: 'erro', detalhe: 'Banco de dados inacessível.' });
   }
@@ -3074,5 +3271,5 @@ app.get('/health', async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 initDB()
-  .then(() => app.listen(PORT, () => console.log(`CEMIC Gestão — backend v3.31 rodando na porta ${PORT}`)))
+  .then(() => app.listen(PORT, () => console.log(`CEMIC Gestão — backend v3.32 rodando na porta ${PORT}`)))
   .catch(e => { console.error('Falha ao inicializar o banco:', e); process.exit(1); });
