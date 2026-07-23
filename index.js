@@ -1,5 +1,5 @@
 // ============================================================
-// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v3.30 (… + Portal dos Pais + Pix Inter)
+// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v3.31 (… + Portal dos Pais + Pix Inter)
 // Banco + Autenticação com perfis + Configurações + CRUDs
 // Stack: Node.js/Express + PostgreSQL (Railway)
 // ============================================================
@@ -350,6 +350,7 @@ async function initDB() {
   await pool.query(`ALTER TABLE declaracoes ADD COLUMN IF NOT EXISTS semestre TEXT`);
   await pool.query(`ALTER TABLE declaracoes ADD COLUMN IF NOT EXISTS modulos JSONB`);
   await pool.query(`ALTER TABLE declaracoes ADD COLUMN IF NOT EXISTS total_semestres INTEGER`);
+  await pool.query(`ALTER TABLE declaracoes ADD COLUMN IF NOT EXISTS carga_horaria INTEGER`);
   await pool.query(`ALTER TABLE declaracoes ADD COLUMN IF NOT EXISTS emitida_por INTEGER REFERENCES usuarios(id) ON DELETE SET NULL`);
   // Folha de professores (hora-aula)
   await pool.query(`CREATE TABLE IF NOT EXISTS professor_horas (
@@ -2469,8 +2470,10 @@ app.post('/admin/declaracoes/estudos', autenticar, somenteGestao, async (req, re
     const a = await pool.query(`SELECT id, nome, cpf FROM alunos WHERE id = $1`, [alunoId]);
     if (!a.rows.length) return res.status(404).json({ erro: 'Aluno não encontrado.' });
     const aluno = a.rows[0];
-    // 1 módulo = 1 semestre
+    // 1 módulo = 1 semestre letivo = 60 horas-aula
+    const HORAS_POR_MODULO = 60;
     const totalSemestres = modulos.length;
+    const cargaHoraria = totalSemestres * HORAS_POR_MODULO;
     const curso = (req.body.curso || 'Língua e Cultura Inglesa').trim();
     let codigo, ok = false;
     for (let i = 0; i < 6 && !ok; i++) {
@@ -2479,14 +2482,14 @@ app.post('/admin/declaracoes/estudos', autenticar, somenteGestao, async (req, re
       if (!ex.rows.length) ok = true;
     }
     const ins = await pool.query(
-      `INSERT INTO declaracoes (codigo, tipo, aluno_id, aluno_nome, aluno_cpf, curso, modulos, total_semestres, emitida_por)
-       VALUES ($1, 'estudos', $2, $3, $4, $5, $6::jsonb, $7, $8)
+      `INSERT INTO declaracoes (codigo, tipo, aluno_id, aluno_nome, aluno_cpf, curso, modulos, total_semestres, carga_horaria, emitida_por)
+       VALUES ($1, 'estudos', $2, $3, $4, $5, $6::jsonb, $7, $8, $9)
        RETURNING codigo, emitida_em`,
-      [codigo, alunoId, aluno.nome, aluno.cpf, curso, JSON.stringify(modulos), totalSemestres, req.usuario.id]);
+      [codigo, alunoId, aluno.nome, aluno.cpf, curso, JSON.stringify(modulos), totalSemestres, cargaHoraria, req.usuario.id]);
     res.status(201).json({
       codigo: ins.rows[0].codigo, emitida_em: ins.rows[0].emitida_em,
       aluno_nome: aluno.nome, aluno_cpf: aluno.cpf, curso,
-      modulos, total_semestres: totalSemestres
+      modulos, total_semestres: totalSemestres, carga_horaria: cargaHoraria, horas_por_modulo: HORAS_POR_MODULO
     });
   } catch (e) { console.error('Erro declaração de estudos:', e); res.status(500).json({ erro: 'Erro ao emitir a declaração.' }); }
 });
@@ -2713,12 +2716,12 @@ app.get('/publico/verificar/:codigo', async (req, res) => {
   try {
     const codigo = String(req.params.codigo || '').trim().toUpperCase();
     const r = await pool.query(
-      `SELECT codigo, tipo, aluno_nome, aluno_cpf, curso, modulo, turno, semestre, modulos, total_semestres, emitida_em FROM declaracoes WHERE codigo = $1`, [codigo]);
+      `SELECT codigo, tipo, aluno_nome, aluno_cpf, curso, modulo, turno, semestre, modulos, total_semestres, carga_horaria, emitida_em FROM declaracoes WHERE codigo = $1`, [codigo]);
     if (!r.rows.length) return res.status(404).json({ valido: false, erro: 'Documento não encontrado. Verifique o código.' });
     const d = r.rows[0];
     const cpf = (d.aluno_cpf || '').replace(/\D/g, '');
     const cpfMasc = cpf.length === 11 ? `${cpf.slice(0, 3)}.***.***-${cpf.slice(9)}` : null;
-    res.json({ valido: true, codigo: d.codigo, tipo: d.tipo, aluno_nome: d.aluno_nome, aluno_cpf: cpfMasc, curso: d.curso, modulo: d.modulo, turno: d.turno, semestre: d.semestre, modulos: d.modulos, total_semestres: d.total_semestres, emitida_em: d.emitida_em });
+    res.json({ valido: true, codigo: d.codigo, tipo: d.tipo, aluno_nome: d.aluno_nome, aluno_cpf: cpfMasc, curso: d.curso, modulo: d.modulo, turno: d.turno, semestre: d.semestre, modulos: d.modulos, total_semestres: d.total_semestres, carga_horaria: d.carga_horaria, emitida_em: d.emitida_em });
   } catch (e) { console.error('Erro verificar declaração:', e); res.status(500).json({ valido: false, erro: 'Erro ao verificar o documento.' }); }
 });
 
@@ -3063,7 +3066,7 @@ app.get('/', (req, res) => {
 app.get('/health', async (req, res) => {
   try {
     await pool.query('SELECT 1');
-    res.json({ status: 'ok', sistema: 'CEMIC Gestão', versao: '3.30 (Declaração de Estudos — módulos cursados e total de semestres)' });
+    res.json({ status: 'ok', sistema: 'CEMIC Gestão', versao: '3.31 (Declaração de Estudos — carga horária total)' });
   } catch {
     res.status(500).json({ status: 'erro', detalhe: 'Banco de dados inacessível.' });
   }
@@ -3071,5 +3074,5 @@ app.get('/health', async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 initDB()
-  .then(() => app.listen(PORT, () => console.log(`CEMIC Gestão — backend v3.30 rodando na porta ${PORT}`)))
+  .then(() => app.listen(PORT, () => console.log(`CEMIC Gestão — backend v3.31 rodando na porta ${PORT}`)))
   .catch(e => { console.error('Falha ao inicializar o banco:', e); process.exit(1); });
