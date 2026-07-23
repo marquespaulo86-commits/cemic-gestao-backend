@@ -1,5 +1,5 @@
 // ============================================================
-// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v3.28 (… + Portal dos Pais + Pix Inter)
+// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v3.29 (… + Portal dos Pais + Pix Inter)
 // Banco + Autenticação com perfis + Configurações + CRUDs
 // Stack: Node.js/Express + PostgreSQL (Railway)
 // ============================================================
@@ -18,7 +18,7 @@ const rateLimit = require('express-rate-limit');
 const app = express();
 app.set('trust proxy', 1);
 app.use(cors());
-app.use(express.json({ limit: '2mb' }));
+app.use(express.json({ limit: '12mb' }));
 
 // ---------- Variáveis de ambiente obrigatórias ----------
 const { DATABASE_URL, JWT_SECRET } = process.env;
@@ -370,6 +370,41 @@ async function initDB() {
     criado_em TIMESTAMP DEFAULT NOW()
   )`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_prof_pag_ref ON professor_pagamentos (professor_id, referencia)`);
+  // ---------- Portal do Professor ----------
+  await pool.query(`ALTER TABLE aulas ADD COLUMN IF NOT EXISTS professor_id INTEGER REFERENCES professores(id) ON DELETE SET NULL`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS ocorrencias (
+    id SERIAL PRIMARY KEY,
+    aluno_id INTEGER NOT NULL REFERENCES alunos(id) ON DELETE CASCADE,
+    turma_id INTEGER REFERENCES turmas(id) ON DELETE SET NULL,
+    professor_id INTEGER REFERENCES professores(id) ON DELETE SET NULL,
+    data DATE NOT NULL DEFAULT CURRENT_DATE,
+    tipo TEXT NOT NULL DEFAULT 'pedagogica' CHECK (tipo IN ('comportamento','pedagogica','elogio','saude','outro')),
+    titulo TEXT NOT NULL,
+    descricao TEXT NOT NULL,
+    visivel_responsavel BOOLEAN NOT NULL DEFAULT TRUE,
+    criado_em TIMESTAMP DEFAULT NOW()
+  )`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS atividades (
+    id SERIAL PRIMARY KEY,
+    turma_id INTEGER NOT NULL REFERENCES turmas(id) ON DELETE CASCADE,
+    professor_id INTEGER REFERENCES professores(id) ON DELETE SET NULL,
+    titulo TEXT NOT NULL,
+    descricao TEXT,
+    link TEXT,
+    data_entrega DATE,
+    criado_em TIMESTAMP DEFAULT NOW()
+  )`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS atividade_arquivos (
+    id SERIAL PRIMARY KEY,
+    atividade_id INTEGER NOT NULL REFERENCES atividades(id) ON DELETE CASCADE,
+    nome TEXT NOT NULL,
+    mime TEXT NOT NULL,
+    tamanho INTEGER NOT NULL,
+    conteudo BYTEA NOT NULL,
+    enviado_em TIMESTAMP DEFAULT NOW()
+  )`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_ocorrencias_aluno ON ocorrencias (aluno_id, data)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_atividades_turma ON atividades (turma_id, criado_em)`);
   await seedConfiguracoes();
   await seedCursosNiveis();
   await seedMaster();
@@ -2007,6 +2042,526 @@ app.post('/publico/portal/aluno/:id/declaracao', autenticarResponsavel, async (r
   } catch (e) { console.error('Erro gerar declaração:', e); res.status(500).json({ erro: 'Erro ao gerar a declaração.' }); }
 });
 
+// ============================================================
+// PORTAL DO PROFESSOR
+// ============================================================
+const somenteProfessor = exigirPerfil('professor', 'master', 'secretaria');
+
+// professor -> só as próprias turmas; gestão -> acesso amplo (null)
+function escopoProfessor(req) {
+  if (req.usuario.perfil === 'professor') return Number(req.usuario.referencia_id) || -1;
+  return null;
+}
+async function podeTurma(req, turmaId) {
+  const prof = escopoProfessor(req);
+  if (prof === null) return true;
+  const r = await pool.query(`SELECT 1 FROM turmas WHERE id = $1 AND professor_id = $2`, [turmaId, prof]);
+  return r.rows.length > 0;
+}
+async function turmaDaAula(aulaId) {
+  const r = await pool.query(`SELECT turma_id FROM aulas WHERE id = $1`, [aulaId]);
+  return r.rows.length ? r.rows[0].turma_id : null;
+}
+async function turmaDaAvaliacao(avId) {
+  const r = await pool.query(`SELECT turma_id FROM avaliacoes WHERE id = $1`, [avId]);
+  return r.rows.length ? r.rows[0].turma_id : null;
+}
+const MIMES_OK = {
+  'image/jpeg': 1, 'image/png': 1, 'image/webp': 1, 'image/gif': 1, 'application/pdf': 1,
+  'application/msword': 1,
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 1
+};
+const LIMITE_ARQUIVO = 5 * 1024 * 1024;
+
+// --- Turmas do professor ---
+app.get('/professor/turmas', autenticar, somenteProfessor, async (req, res) => {
+  try {
+    const prof = escopoProfessor(req);
+    const cond = prof === null ? '' : 'WHERE t.professor_id = $1';
+    const params = prof === null ? [] : [prof];
+    const r = await pool.query(
+      `SELECT t.id, t.nome, t.semestre, t.turno, t.horario, t.status,
+              n.nome AS nivel_nome, c.nome AS curso_nome,
+              (SELECT COUNT(*) FROM matriculas m WHERE m.turma_id = t.id AND m.status = 'ativa') AS alunos
+       FROM turmas t
+       JOIN niveis n ON n.id = t.nivel_id
+       JOIN cursos c ON c.id = n.curso_id
+       ${cond}
+       ORDER BY t.semestre DESC, t.nome`, params);
+    res.json(r.rows);
+  } catch (e) { console.error('Erro GET professor/turmas:', e); res.status(500).json({ erro: 'Erro ao listar as turmas.' }); }
+});
+
+app.get('/professor/turmas/:id/alunos', autenticar, somenteProfessor, async (req, res) => {
+  try {
+    if (!await podeTurma(req, req.params.id)) return res.status(403).json({ erro: 'Turma não vinculada ao seu cadastro.' });
+    const r = await pool.query(
+      `SELECT m.id AS matricula_id, a.id AS aluno_id, a.nome, a.cpf
+       FROM matriculas m JOIN alunos a ON a.id = m.aluno_id
+       WHERE m.turma_id = $1 AND m.status = 'ativa'
+       ORDER BY a.nome`, [req.params.id]);
+    res.json(r.rows);
+  } catch (e) { console.error('Erro GET alunos da turma:', e); res.status(500).json({ erro: 'Erro ao listar os alunos.' }); }
+});
+
+// --- Aulas / conteúdos ---
+app.get('/professor/turmas/:id/aulas', autenticar, somenteProfessor, async (req, res) => {
+  try {
+    if (!await podeTurma(req, req.params.id)) return res.status(403).json({ erro: 'Turma não vinculada ao seu cadastro.' });
+    const r = await pool.query(
+      `SELECT au.id, au.data, au.conteudo,
+              (SELECT COUNT(*) FROM frequencias f WHERE f.aula_id = au.id) AS chamada_lancada,
+              (SELECT COUNT(*) FROM frequencias f WHERE f.aula_id = au.id AND f.presente = FALSE) AS faltas
+       FROM aulas au WHERE au.turma_id = $1 ORDER BY au.data DESC, au.id DESC`, [req.params.id]);
+    res.json(r.rows);
+  } catch (e) { console.error('Erro GET aulas:', e); res.status(500).json({ erro: 'Erro ao listar as aulas.' }); }
+});
+
+app.post('/professor/turmas/:id/aulas', autenticar, somenteProfessor, async (req, res) => {
+  try {
+    if (!await podeTurma(req, req.params.id)) return res.status(403).json({ erro: 'Turma não vinculada ao seu cadastro.' });
+    const data = req.body.data;
+    const conteudo = (req.body.conteudo || '').trim();
+    if (!data) return res.status(400).json({ erro: 'Informe a data da aula.' });
+    if (!conteudo) return res.status(400).json({ erro: 'Descreva o conteúdo trabalhado.' });
+    const prof = escopoProfessor(req);
+    const r = await pool.query(
+      `INSERT INTO aulas (turma_id, data, conteudo, professor_id) VALUES ($1,$2,$3,$4) RETURNING id`,
+      [req.params.id, data, conteudo, prof]);
+    res.status(201).json({ id: r.rows[0].id });
+  } catch (e) { console.error('Erro POST aula:', e); res.status(500).json({ erro: 'Erro ao registrar a aula.' }); }
+});
+
+app.put('/professor/aulas/:id', autenticar, somenteProfessor, async (req, res) => {
+  try {
+    const tId = await turmaDaAula(req.params.id);
+    if (!tId) return res.status(404).json({ erro: 'Aula não encontrada.' });
+    if (!await podeTurma(req, tId)) return res.status(403).json({ erro: 'Aula de turma não vinculada ao seu cadastro.' });
+    const conteudo = (req.body.conteudo || '').trim();
+    if (!conteudo) return res.status(400).json({ erro: 'Descreva o conteúdo trabalhado.' });
+    await pool.query(`UPDATE aulas SET conteudo = $1, data = COALESCE($2, data) WHERE id = $3`,
+      [conteudo, req.body.data || null, req.params.id]);
+    res.json({ ok: true });
+  } catch (e) { console.error('Erro PUT aula:', e); res.status(500).json({ erro: 'Erro ao atualizar a aula.' }); }
+});
+
+app.delete('/professor/aulas/:id', autenticar, somenteProfessor, async (req, res) => {
+  try {
+    const tId = await turmaDaAula(req.params.id);
+    if (!tId) return res.status(404).json({ erro: 'Aula não encontrada.' });
+    if (!await podeTurma(req, tId)) return res.status(403).json({ erro: 'Aula de turma não vinculada ao seu cadastro.' });
+    await pool.query(`DELETE FROM aulas WHERE id = $1`, [req.params.id]);
+    res.json({ ok: true });
+  } catch (e) { console.error('Erro DELETE aula:', e); res.status(500).json({ erro: 'Erro ao remover a aula.' }); }
+});
+
+// --- Chamada (frequência) ---
+app.get('/professor/aulas/:id/chamada', autenticar, somenteProfessor, async (req, res) => {
+  try {
+    const tId = await turmaDaAula(req.params.id);
+    if (!tId) return res.status(404).json({ erro: 'Aula não encontrada.' });
+    if (!await podeTurma(req, tId)) return res.status(403).json({ erro: 'Aula de turma não vinculada ao seu cadastro.' });
+    const r = await pool.query(
+      `SELECT m.id AS matricula_id, a.nome,
+              COALESCE(f.presente, TRUE) AS presente, f.justificativa,
+              (f.id IS NOT NULL) AS lancado
+       FROM matriculas m
+       JOIN alunos a ON a.id = m.aluno_id
+       LEFT JOIN frequencias f ON f.matricula_id = m.id AND f.aula_id = $2
+       WHERE m.turma_id = $1 AND m.status = 'ativa'
+       ORDER BY a.nome`, [tId, req.params.id]);
+    res.json(r.rows);
+  } catch (e) { console.error('Erro GET chamada:', e); res.status(500).json({ erro: 'Erro ao carregar a chamada.' }); }
+});
+
+app.post('/professor/aulas/:id/chamada', autenticar, somenteProfessor, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const tId = await turmaDaAula(req.params.id);
+    if (!tId) { client.release(); return res.status(404).json({ erro: 'Aula não encontrada.' }); }
+    if (!await podeTurma(req, tId)) { client.release(); return res.status(403).json({ erro: 'Aula de turma não vinculada ao seu cadastro.' }); }
+    const lista = Array.isArray(req.body.presencas) ? req.body.presencas : [];
+    if (!lista.length) { client.release(); return res.status(400).json({ erro: 'Nenhuma presença informada.' }); }
+    await client.query('BEGIN');
+    for (const p of lista) {
+      await client.query(
+        `INSERT INTO frequencias (aula_id, matricula_id, presente, justificativa)
+         VALUES ($1,$2,$3,$4)
+         ON CONFLICT (aula_id, matricula_id)
+         DO UPDATE SET presente = EXCLUDED.presente, justificativa = EXCLUDED.justificativa`,
+        [req.params.id, Number(p.matricula_id), p.presente !== false, (p.justificativa || '').trim() || null]);
+    }
+    await client.query('COMMIT');
+    client.release();
+    res.json({ ok: true, registros: lista.length });
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {}); client.release();
+    console.error('Erro POST chamada:', e); res.status(500).json({ erro: 'Erro ao salvar a chamada.' });
+  }
+});
+
+// --- Avaliações e notas ---
+app.get('/professor/turmas/:id/avaliacoes', autenticar, somenteProfessor, async (req, res) => {
+  try {
+    if (!await podeTurma(req, req.params.id)) return res.status(403).json({ erro: 'Turma não vinculada ao seu cadastro.' });
+    const r = await pool.query(
+      `SELECT av.id, av.nome, av.peso, av.data,
+              (SELECT COUNT(*) FROM notas n WHERE n.avaliacao_id = av.id) AS notas_lancadas
+       FROM avaliacoes av WHERE av.turma_id = $1 ORDER BY av.data NULLS LAST, av.id`, [req.params.id]);
+    res.json(r.rows);
+  } catch (e) { console.error('Erro GET avaliacoes:', e); res.status(500).json({ erro: 'Erro ao listar as avaliações.' }); }
+});
+
+app.post('/professor/turmas/:id/avaliacoes', autenticar, somenteProfessor, async (req, res) => {
+  try {
+    if (!await podeTurma(req, req.params.id)) return res.status(403).json({ erro: 'Turma não vinculada ao seu cadastro.' });
+    const nome = (req.body.nome || '').trim();
+    if (!nome) return res.status(400).json({ erro: 'Informe o nome da avaliação.' });
+    const peso = Number(req.body.peso) > 0 ? Number(req.body.peso) : 1;
+    const r = await pool.query(
+      `INSERT INTO avaliacoes (turma_id, nome, peso, data) VALUES ($1,$2,$3,$4) RETURNING id`,
+      [req.params.id, nome, peso, req.body.data || null]);
+    res.status(201).json({ id: r.rows[0].id });
+  } catch (e) { console.error('Erro POST avaliacao:', e); res.status(500).json({ erro: 'Erro ao criar a avaliação.' }); }
+});
+
+app.delete('/professor/avaliacoes/:id', autenticar, somenteProfessor, async (req, res) => {
+  try {
+    const tId = await turmaDaAvaliacao(req.params.id);
+    if (!tId) return res.status(404).json({ erro: 'Avaliação não encontrada.' });
+    if (!await podeTurma(req, tId)) return res.status(403).json({ erro: 'Avaliação de turma não vinculada ao seu cadastro.' });
+    await pool.query(`DELETE FROM avaliacoes WHERE id = $1`, [req.params.id]);
+    res.json({ ok: true });
+  } catch (e) { console.error('Erro DELETE avaliacao:', e); res.status(500).json({ erro: 'Erro ao remover a avaliação.' }); }
+});
+
+app.get('/professor/avaliacoes/:id/notas', autenticar, somenteProfessor, async (req, res) => {
+  try {
+    const tId = await turmaDaAvaliacao(req.params.id);
+    if (!tId) return res.status(404).json({ erro: 'Avaliação não encontrada.' });
+    if (!await podeTurma(req, tId)) return res.status(403).json({ erro: 'Avaliação de turma não vinculada ao seu cadastro.' });
+    const r = await pool.query(
+      `SELECT m.id AS matricula_id, a.nome, n.nota
+       FROM matriculas m
+       JOIN alunos a ON a.id = m.aluno_id
+       LEFT JOIN notas n ON n.matricula_id = m.id AND n.avaliacao_id = $2
+       WHERE m.turma_id = $1 AND m.status = 'ativa'
+       ORDER BY a.nome`, [tId, req.params.id]);
+    res.json(r.rows);
+  } catch (e) { console.error('Erro GET notas:', e); res.status(500).json({ erro: 'Erro ao carregar as notas.' }); }
+});
+
+app.post('/professor/avaliacoes/:id/notas', autenticar, somenteProfessor, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const tId = await turmaDaAvaliacao(req.params.id);
+    if (!tId) { client.release(); return res.status(404).json({ erro: 'Avaliação não encontrada.' }); }
+    if (!await podeTurma(req, tId)) { client.release(); return res.status(403).json({ erro: 'Avaliação de turma não vinculada ao seu cadastro.' }); }
+    const lista = Array.isArray(req.body.notas) ? req.body.notas : [];
+    await client.query('BEGIN');
+    for (const item of lista) {
+      const mId = Number(item.matricula_id);
+      if (item.nota === '' || item.nota === null || item.nota === undefined) {
+        await client.query(`DELETE FROM notas WHERE avaliacao_id = $1 AND matricula_id = $2`, [req.params.id, mId]);
+        continue;
+      }
+      const valor = Number(item.nota);
+      if (!(valor >= 0 && valor <= 10)) { await client.query('ROLLBACK'); client.release(); return res.status(400).json({ erro: 'As notas devem estar entre 0 e 10.' }); }
+      await client.query(
+        `INSERT INTO notas (avaliacao_id, matricula_id, nota, lancada_por)
+         VALUES ($1,$2,$3,$4)
+         ON CONFLICT (avaliacao_id, matricula_id)
+         DO UPDATE SET nota = EXCLUDED.nota, lancada_por = EXCLUDED.lancada_por, lancada_em = NOW()`,
+        [req.params.id, mId, valor, req.usuario.id]);
+    }
+    await client.query('COMMIT'); client.release();
+    res.json({ ok: true });
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {}); client.release();
+    console.error('Erro POST notas:', e); res.status(500).json({ erro: 'Erro ao salvar as notas.' });
+  }
+});
+
+// --- Avisos do professor (turma ou aluno) ---
+app.post('/professor/avisos', autenticar, somenteProfessor, async (req, res) => {
+  try {
+    const escopo = req.body.escopo === 'aluno' ? 'aluno' : 'turma';
+    const titulo = (req.body.titulo || '').trim();
+    const mensagem = (req.body.mensagem || '').trim();
+    if (!titulo || !mensagem) return res.status(400).json({ erro: 'Informe o título e a mensagem.' });
+    const turmaId = Number(req.body.turma_id) || null;
+    if (!turmaId) return res.status(400).json({ erro: 'Selecione a turma.' });
+    if (!await podeTurma(req, turmaId)) return res.status(403).json({ erro: 'Turma não vinculada ao seu cadastro.' });
+    const alunoId = escopo === 'aluno' ? (Number(req.body.aluno_id) || null) : null;
+    if (escopo === 'aluno' && !alunoId) return res.status(400).json({ erro: 'Selecione o aluno.' });
+    const r = await pool.query(
+      `INSERT INTO avisos (autor_id, escopo, turma_id, aluno_id, titulo, mensagem)
+       VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
+      [req.usuario.id, escopo, turmaId, alunoId, titulo, mensagem]);
+    res.status(201).json({ id: r.rows[0].id });
+  } catch (e) { console.error('Erro POST aviso professor:', e); res.status(500).json({ erro: 'Erro ao publicar o aviso.' }); }
+});
+
+app.get('/professor/avisos', autenticar, somenteProfessor, async (req, res) => {
+  try {
+    const turmaId = Number(req.query.turma_id) || null;
+    if (!turmaId) return res.status(400).json({ erro: 'Selecione a turma.' });
+    if (!await podeTurma(req, turmaId)) return res.status(403).json({ erro: 'Turma não vinculada ao seu cadastro.' });
+    const r = await pool.query(
+      `SELECT av.id, av.escopo, av.titulo, av.mensagem, av.criado_em, a.nome AS aluno_nome
+       FROM avisos av LEFT JOIN alunos a ON a.id = av.aluno_id
+       WHERE av.turma_id = $1 ORDER BY av.criado_em DESC`, [turmaId]);
+    res.json(r.rows);
+  } catch (e) { console.error('Erro GET avisos professor:', e); res.status(500).json({ erro: 'Erro ao listar os avisos.' }); }
+});
+
+app.delete('/professor/avisos/:id', autenticar, somenteProfessor, async (req, res) => {
+  try {
+    const a = await pool.query(`SELECT turma_id FROM avisos WHERE id = $1`, [req.params.id]);
+    if (!a.rows.length) return res.status(404).json({ erro: 'Aviso não encontrado.' });
+    if (a.rows[0].turma_id && !await podeTurma(req, a.rows[0].turma_id)) return res.status(403).json({ erro: 'Aviso de turma não vinculada ao seu cadastro.' });
+    await pool.query(`DELETE FROM avisos WHERE id = $1`, [req.params.id]);
+    res.json({ ok: true });
+  } catch (e) { console.error('Erro DELETE aviso professor:', e); res.status(500).json({ erro: 'Erro ao remover o aviso.' }); }
+});
+
+// --- Ocorrências por aluno ---
+app.get('/professor/ocorrencias', autenticar, somenteProfessor, async (req, res) => {
+  try {
+    const cond = [], params = [];
+    if (req.query.turma_id) {
+      if (!await podeTurma(req, req.query.turma_id)) return res.status(403).json({ erro: 'Turma não vinculada ao seu cadastro.' });
+      params.push(Number(req.query.turma_id)); cond.push(`o.turma_id = $${params.length}`);
+    } else {
+      const prof = escopoProfessor(req);
+      if (prof !== null) { params.push(prof); cond.push(`o.professor_id = $${params.length}`); }
+    }
+    if (req.query.aluno_id) { params.push(Number(req.query.aluno_id)); cond.push(`o.aluno_id = $${params.length}`); }
+    const where = cond.length ? 'WHERE ' + cond.join(' AND ') : '';
+    const r = await pool.query(
+      `SELECT o.id, o.data, o.tipo, o.titulo, o.descricao, o.visivel_responsavel,
+              a.nome AS aluno_nome, t.nome AS turma_nome
+       FROM ocorrencias o
+       JOIN alunos a ON a.id = o.aluno_id
+       LEFT JOIN turmas t ON t.id = o.turma_id
+       ${where} ORDER BY o.data DESC, o.id DESC`, params);
+    res.json(r.rows);
+  } catch (e) { console.error('Erro GET ocorrencias:', e); res.status(500).json({ erro: 'Erro ao listar as ocorrências.' }); }
+});
+
+app.post('/professor/ocorrencias', autenticar, somenteProfessor, async (req, res) => {
+  try {
+    const alunoId = Number(req.body.aluno_id);
+    const turmaId = Number(req.body.turma_id) || null;
+    const titulo = (req.body.titulo || '').trim();
+    const descricao = (req.body.descricao || '').trim();
+    if (!alunoId) return res.status(400).json({ erro: 'Selecione o aluno.' });
+    if (!titulo || !descricao) return res.status(400).json({ erro: 'Informe o título e a descrição.' });
+    if (turmaId && !await podeTurma(req, turmaId)) return res.status(403).json({ erro: 'Turma não vinculada ao seu cadastro.' });
+    const tipos = ['comportamento','pedagogica','elogio','saude','outro'];
+    const tipo = tipos.includes(req.body.tipo) ? req.body.tipo : 'pedagogica';
+    const r = await pool.query(
+      `INSERT INTO ocorrencias (aluno_id, turma_id, professor_id, data, tipo, titulo, descricao, visivel_responsavel)
+       VALUES ($1,$2,$3,COALESCE($4, CURRENT_DATE),$5,$6,$7,$8) RETURNING id`,
+      [alunoId, turmaId, escopoProfessor(req), req.body.data || null, tipo, titulo, descricao,
+       req.body.visivel_responsavel !== false]);
+    res.status(201).json({ id: r.rows[0].id });
+  } catch (e) { console.error('Erro POST ocorrencia:', e); res.status(500).json({ erro: 'Erro ao registrar a ocorrência.' }); }
+});
+
+app.delete('/professor/ocorrencias/:id', autenticar, somenteProfessor, async (req, res) => {
+  try {
+    const o = await pool.query(`SELECT turma_id FROM ocorrencias WHERE id = $1`, [req.params.id]);
+    if (!o.rows.length) return res.status(404).json({ erro: 'Ocorrência não encontrada.' });
+    if (o.rows[0].turma_id && !await podeTurma(req, o.rows[0].turma_id)) return res.status(403).json({ erro: 'Ocorrência de turma não vinculada ao seu cadastro.' });
+    await pool.query(`DELETE FROM ocorrencias WHERE id = $1`, [req.params.id]);
+    res.json({ ok: true });
+  } catch (e) { console.error('Erro DELETE ocorrencia:', e); res.status(500).json({ erro: 'Erro ao remover a ocorrência.' }); }
+});
+
+// --- Atividades para casa (link + arquivos) ---
+app.get('/professor/turmas/:id/atividades', autenticar, somenteProfessor, async (req, res) => {
+  try {
+    if (!await podeTurma(req, req.params.id)) return res.status(403).json({ erro: 'Turma não vinculada ao seu cadastro.' });
+    const r = await pool.query(
+      `SELECT at.id, at.titulo, at.descricao, at.link, at.data_entrega, at.criado_em,
+              COALESCE(json_agg(json_build_object('id', ar.id, 'nome', ar.nome, 'mime', ar.mime, 'tamanho', ar.tamanho)
+                       ORDER BY ar.id) FILTER (WHERE ar.id IS NOT NULL), '[]') AS arquivos
+       FROM atividades at
+       LEFT JOIN atividade_arquivos ar ON ar.atividade_id = at.id
+       WHERE at.turma_id = $1
+       GROUP BY at.id ORDER BY at.criado_em DESC`, [req.params.id]);
+    res.json(r.rows);
+  } catch (e) { console.error('Erro GET atividades:', e); res.status(500).json({ erro: 'Erro ao listar as atividades.' }); }
+});
+
+app.post('/professor/turmas/:id/atividades', autenticar, somenteProfessor, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    if (!await podeTurma(req, req.params.id)) { client.release(); return res.status(403).json({ erro: 'Turma não vinculada ao seu cadastro.' }); }
+    const titulo = (req.body.titulo || '').trim();
+    if (!titulo) { client.release(); return res.status(400).json({ erro: 'Informe o título da atividade.' }); }
+    const arquivos = Array.isArray(req.body.arquivos) ? req.body.arquivos : [];
+    for (const f of arquivos) {
+      if (!MIMES_OK[f.mime]) { client.release(); return res.status(400).json({ erro: `Formato não permitido: ${f.nome || f.mime}. Aceitos: foto, PDF e Word.` }); }
+      const bytes = Buffer.byteLength(String(f.base64 || ''), 'base64');
+      if (bytes > LIMITE_ARQUIVO) { client.release(); return res.status(400).json({ erro: `O arquivo ${f.nome} passa de 5 MB.` }); }
+    }
+    await client.query('BEGIN');
+    const r = await client.query(
+      `INSERT INTO atividades (turma_id, professor_id, titulo, descricao, link, data_entrega)
+       VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
+      [req.params.id, escopoProfessor(req), titulo, (req.body.descricao || '').trim() || null,
+       (req.body.link || '').trim() || null, req.body.data_entrega || null]);
+    const atId = r.rows[0].id;
+    for (const f of arquivos) {
+      const buf = Buffer.from(String(f.base64 || ''), 'base64');
+      await client.query(
+        `INSERT INTO atividade_arquivos (atividade_id, nome, mime, tamanho, conteudo) VALUES ($1,$2,$3,$4,$5)`,
+        [atId, (f.nome || 'arquivo').slice(0, 180), f.mime, buf.length, buf]);
+    }
+    await client.query('COMMIT'); client.release();
+    res.status(201).json({ id: atId, arquivos: arquivos.length });
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {}); client.release();
+    console.error('Erro POST atividade:', e); res.status(500).json({ erro: 'Erro ao publicar a atividade.' });
+  }
+});
+
+app.delete('/professor/atividades/:id', autenticar, somenteProfessor, async (req, res) => {
+  try {
+    const a = await pool.query(`SELECT turma_id FROM atividades WHERE id = $1`, [req.params.id]);
+    if (!a.rows.length) return res.status(404).json({ erro: 'Atividade não encontrada.' });
+    if (!await podeTurma(req, a.rows[0].turma_id)) return res.status(403).json({ erro: 'Atividade de turma não vinculada ao seu cadastro.' });
+    await pool.query(`DELETE FROM atividades WHERE id = $1`, [req.params.id]);
+    res.json({ ok: true });
+  } catch (e) { console.error('Erro DELETE atividade:', e); res.status(500).json({ erro: 'Erro ao remover a atividade.' }); }
+});
+
+// Download de anexo (aceita token de professor/gestão ou de responsável, via header ou ?token=)
+app.get('/arquivos/atividade/:id', async (req, res) => {
+  try {
+    const header = req.headers.authorization || '';
+    const token = req.query.token || (header.startsWith('Bearer ') ? header.slice(7) : null);
+    if (!token) return res.status(401).json({ erro: 'Token não fornecido.' });
+    try { jwt.verify(token, JWT_SECRET); } catch { return res.status(401).json({ erro: 'Token inválido ou expirado.' }); }
+    const r = await pool.query(`SELECT nome, mime, conteudo FROM atividade_arquivos WHERE id = $1`, [req.params.id]);
+    if (!r.rows.length) return res.status(404).json({ erro: 'Arquivo não encontrado.' });
+    const f = r.rows[0];
+    res.setHeader('Content-Type', f.mime);
+    res.setHeader('Content-Disposition', `inline; filename*=UTF-8''${encodeURIComponent(f.nome)}`);
+    res.send(f.conteudo);
+  } catch (e) { console.error('Erro download anexo:', e); res.status(500).json({ erro: 'Erro ao baixar o arquivo.' }); }
+});
+
+// ---------- Portal dos Pais: acadêmico (professor -> responsável) ----------
+async function vinculoOk(respId, alunoId) {
+  const r = await pool.query(`SELECT 1 FROM aluno_responsavel WHERE responsavel_id = $1 AND aluno_id = $2`, [respId, alunoId]);
+  return r.rows.length > 0;
+}
+async function matriculaAtivaDoAluno(alunoId) {
+  const r = await pool.query(
+    `SELECT m.id AS matricula_id, m.turma_id, t.nome AS turma_nome, t.semestre
+     FROM matriculas m JOIN turmas t ON t.id = m.turma_id
+     WHERE m.aluno_id = $1 AND m.status = 'ativa'
+     ORDER BY m.id DESC LIMIT 1`, [alunoId]);
+  return r.rows[0] || null;
+}
+
+app.get('/publico/portal/aluno/:id/faltas', autenticarResponsavel, async (req, res) => {
+  try {
+    const alunoId = Number(req.params.id);
+    if (!await vinculoOk(req.responsavelId, alunoId)) return res.status(403).json({ erro: 'Acesso negado a este aluno.' });
+    const mat = await matriculaAtivaDoAluno(alunoId);
+    if (!mat) return res.json({ turma: null, itens: [], resumo: { aulas: 0, presencas: 0, faltas: 0, percentual: null } });
+    const r = await pool.query(
+      `SELECT au.id, au.data, au.conteudo, f.presente, f.justificativa
+       FROM aulas au
+       LEFT JOIN frequencias f ON f.aula_id = au.id AND f.matricula_id = $2
+       WHERE au.turma_id = $1
+       ORDER BY au.data DESC, au.id DESC`, [mat.turma_id, mat.matricula_id]);
+    const lancadas = r.rows.filter(x => x.presente !== null);
+    const faltas = lancadas.filter(x => x.presente === false).length;
+    const presencas = lancadas.length - faltas;
+    const percentual = lancadas.length ? Math.round((presencas / lancadas.length) * 100) : null;
+    res.json({
+      turma: mat.turma_nome, semestre: mat.semestre,
+      itens: r.rows.filter(x => x.presente !== null),
+      resumo: { aulas: lancadas.length, presencas, faltas, percentual }
+    });
+  } catch (e) { console.error('Erro portal faltas:', e); res.status(500).json({ erro: 'Erro ao carregar a frequência.' }); }
+});
+
+app.get('/publico/portal/aluno/:id/conteudos', autenticarResponsavel, async (req, res) => {
+  try {
+    const alunoId = Number(req.params.id);
+    if (!await vinculoOk(req.responsavelId, alunoId)) return res.status(403).json({ erro: 'Acesso negado a este aluno.' });
+    const mat = await matriculaAtivaDoAluno(alunoId);
+    if (!mat) return res.json({ turma: null, itens: [] });
+    const r = await pool.query(
+      `SELECT au.id, au.data, au.conteudo FROM aulas au
+       WHERE au.turma_id = $1 AND au.conteudo IS NOT NULL AND btrim(au.conteudo) <> ''
+       ORDER BY au.data DESC, au.id DESC`, [mat.turma_id]);
+    res.json({ turma: mat.turma_nome, semestre: mat.semestre, itens: r.rows });
+  } catch (e) { console.error('Erro portal conteudos:', e); res.status(500).json({ erro: 'Erro ao carregar os conteúdos.' }); }
+});
+
+app.get('/publico/portal/aluno/:id/notas', autenticarResponsavel, async (req, res) => {
+  try {
+    const alunoId = Number(req.params.id);
+    if (!await vinculoOk(req.responsavelId, alunoId)) return res.status(403).json({ erro: 'Acesso negado a este aluno.' });
+    const mat = await matriculaAtivaDoAluno(alunoId);
+    if (!mat) return res.json({ turma: null, itens: [], media: null });
+    const r = await pool.query(
+      `SELECT av.id, av.nome, av.peso, av.data, n.nota
+       FROM avaliacoes av
+       LEFT JOIN notas n ON n.avaliacao_id = av.id AND n.matricula_id = $2
+       WHERE av.turma_id = $1
+       ORDER BY av.data NULLS LAST, av.id`, [mat.turma_id, mat.matricula_id]);
+    const comNota = r.rows.filter(x => x.nota !== null);
+    let media = null;
+    if (comNota.length) {
+      const somaPeso = comNota.reduce((s, x) => s + Number(x.peso || 1), 0);
+      const soma = comNota.reduce((s, x) => s + Number(x.nota) * Number(x.peso || 1), 0);
+      media = somaPeso > 0 ? Number((soma / somaPeso).toFixed(2)) : null;
+    }
+    res.json({ turma: mat.turma_nome, semestre: mat.semestre, itens: r.rows, media });
+  } catch (e) { console.error('Erro portal notas:', e); res.status(500).json({ erro: 'Erro ao carregar as notas.' }); }
+});
+
+app.get('/publico/portal/aluno/:id/ocorrencias', autenticarResponsavel, async (req, res) => {
+  try {
+    const alunoId = Number(req.params.id);
+    if (!await vinculoOk(req.responsavelId, alunoId)) return res.status(403).json({ erro: 'Acesso negado a este aluno.' });
+    const r = await pool.query(
+      `SELECT o.id, o.data, o.tipo, o.titulo, o.descricao, p.nome AS professor_nome, t.nome AS turma_nome
+       FROM ocorrencias o
+       LEFT JOIN professores p ON p.id = o.professor_id
+       LEFT JOIN turmas t ON t.id = o.turma_id
+       WHERE o.aluno_id = $1 AND o.visivel_responsavel = TRUE
+       ORDER BY o.data DESC, o.id DESC`, [alunoId]);
+    res.json(r.rows);
+  } catch (e) { console.error('Erro portal ocorrencias:', e); res.status(500).json({ erro: 'Erro ao carregar as ocorrências.' }); }
+});
+
+app.get('/publico/portal/aluno/:id/atividades', autenticarResponsavel, async (req, res) => {
+  try {
+    const alunoId = Number(req.params.id);
+    if (!await vinculoOk(req.responsavelId, alunoId)) return res.status(403).json({ erro: 'Acesso negado a este aluno.' });
+    const mat = await matriculaAtivaDoAluno(alunoId);
+    if (!mat) return res.json({ turma: null, itens: [] });
+    const r = await pool.query(
+      `SELECT at.id, at.titulo, at.descricao, at.link, at.data_entrega, at.criado_em,
+              COALESCE(json_agg(json_build_object('id', ar.id, 'nome', ar.nome, 'mime', ar.mime, 'tamanho', ar.tamanho)
+                       ORDER BY ar.id) FILTER (WHERE ar.id IS NOT NULL), '[]') AS arquivos
+       FROM atividades at
+       LEFT JOIN atividade_arquivos ar ON ar.atividade_id = at.id
+       WHERE at.turma_id = $1
+       GROUP BY at.id ORDER BY at.criado_em DESC`, [mat.turma_id]);
+    res.json({ turma: mat.turma_nome, semestre: mat.semestre, itens: r.rows });
+  } catch (e) { console.error('Erro portal atividades:', e); res.status(500).json({ erro: 'Erro ao carregar as atividades.' }); }
+});
+
 // ---------- Portal: Financeiro do aluno ----------
 const SQL_FIN_ITENS = `
   SELECT cr.id, cr.descricao, cr.competencia, cr.vencimento,
@@ -2471,7 +3026,7 @@ app.get('/', (req, res) => {
 app.get('/health', async (req, res) => {
   try {
     await pool.query('SELECT 1');
-    res.json({ status: 'ok', sistema: 'CEMIC Gestão', versao: '3.28 (Modalidades Bolsista IEMA e Desconto Especial)' });
+    res.json({ status: 'ok', sistema: 'CEMIC Gestão', versao: '3.29 (Portal do Professor — chamada, conteúdos, notas, ocorrências e atividades)' });
   } catch {
     res.status(500).json({ status: 'erro', detalhe: 'Banco de dados inacessível.' });
   }
@@ -2479,5 +3034,5 @@ app.get('/health', async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 initDB()
-  .then(() => app.listen(PORT, () => console.log(`CEMIC Gestão — backend v3.28 rodando na porta ${PORT}`)))
+  .then(() => app.listen(PORT, () => console.log(`CEMIC Gestão — backend v3.29 rodando na porta ${PORT}`)))
   .catch(e => { console.error('Falha ao inicializar o banco:', e); process.exit(1); });
