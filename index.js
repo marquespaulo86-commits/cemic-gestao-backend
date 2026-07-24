@@ -1,5 +1,5 @@
 // ============================================================
-// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v3.34 (… + Portal dos Pais + Pix Inter)
+// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v3.35 (… + Portal dos Pais + Pix Inter)
 // Banco + Autenticação com perfis + Configurações + CRUDs
 // Stack: Node.js/Express + PostgreSQL (Railway)
 // ============================================================
@@ -410,7 +410,7 @@ async function initDB() {
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_ocorrencias_aluno ON ocorrencias (aluno_id, data)`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_atividades_turma ON atividades (turma_id, criado_em)`);
   // ---------- Carteira Estudantil (v3.32) ----------
-  await pool.query(`CREATE TABLE IF NOT EXISTS aluno_fotos (
+  await migrar('aluno_fotos', `CREATE TABLE IF NOT EXISTS aluno_fotos (
     aluno_id INTEGER PRIMARY KEY REFERENCES alunos(id) ON DELETE CASCADE,
     mime TEXT NOT NULL,
     tamanho INTEGER NOT NULL,
@@ -418,7 +418,7 @@ async function initDB() {
     enviada_por INTEGER REFERENCES responsaveis(id) ON DELETE SET NULL,
     enviada_em TIMESTAMP DEFAULT NOW()
   )`);
-  await pool.query(`CREATE TABLE IF NOT EXISTS carteiras (
+  await migrar('carteiras', `CREATE TABLE IF NOT EXISTS carteiras (
     id SERIAL PRIMARY KEY,
     codigo TEXT UNIQUE NOT NULL,
     aluno_id INTEGER REFERENCES alunos(id) ON DELETE SET NULL,
@@ -434,11 +434,11 @@ async function initDB() {
     emitida_em TIMESTAMP DEFAULT NOW(),
     emitida_por_responsavel INTEGER REFERENCES responsaveis(id) ON DELETE SET NULL
   )`);
-  await pool.query(`ALTER TABLE carteiras ADD COLUMN IF NOT EXISTS aluno_cpf TEXT`);
-  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_carteiras_aluno_semestre ON carteiras (aluno_id, semestre)`);
+  await migrar('carteiras', `ALTER TABLE carteiras ADD COLUMN IF NOT EXISTS aluno_cpf TEXT`);
+  await migrar('idx_carteiras_aluno_semestre', `CREATE UNIQUE INDEX IF NOT EXISTS idx_carteiras_aluno_semestre ON carteiras (aluno_id, semestre)`);
   // ---------- Calendário acadêmico, Circulares e Sistema de Avaliação (v3.33) ----------
-  await pool.query(`ALTER TABLE avaliacoes ADD COLUMN IF NOT EXISTS bimestre INTEGER`);
-  await pool.query(`CREATE TABLE IF NOT EXISTS calendario (
+  await migrar('avaliacoes', `ALTER TABLE avaliacoes ADD COLUMN IF NOT EXISTS bimestre INTEGER`);
+  await migrar('calendario', `CREATE TABLE IF NOT EXISTS calendario (
     id SERIAL PRIMARY KEY,
     semestre TEXT NOT NULL,
     data DATE NOT NULL,
@@ -447,8 +447,8 @@ async function initDB() {
     modalidade TEXT NOT NULL DEFAULT 'Presencial',
     criado_em TIMESTAMP DEFAULT NOW()
   )`);
-  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_calendario_evento ON calendario (semestre, data, titulo)`);
-  await pool.query(`CREATE TABLE IF NOT EXISTS circulares (
+  await migrar('idx_calendario_evento', `CREATE UNIQUE INDEX IF NOT EXISTS idx_calendario_evento ON calendario (semestre, data, titulo)`);
+  await migrar('circulares', `CREATE TABLE IF NOT EXISTS circulares (
     id SERIAL PRIMARY KEY,
     numero TEXT,
     titulo TEXT NOT NULL,
@@ -459,14 +459,14 @@ async function initDB() {
     criada_em TIMESTAMP DEFAULT NOW(),
     criada_por INTEGER REFERENCES usuarios(id) ON DELETE SET NULL
   )`);
-  await pool.query(`CREATE TABLE IF NOT EXISTS circular_leituras (
+  await migrar('circular_leituras', `CREATE TABLE IF NOT EXISTS circular_leituras (
     circular_id INTEGER NOT NULL REFERENCES circulares(id) ON DELETE CASCADE,
     usuario_id INTEGER NOT NULL REFERENCES usuarios(id) ON DELETE CASCADE,
     lida_em TIMESTAMP DEFAULT NOW(),
     PRIMARY KEY (circular_id, usuario_id)
   )`);
-  await seedCalendario();
-  await seedConfiguracoes();
+  try { await seedCalendario(); } catch (e) { falhasMigracao.push('seed calendario: ' + e.message); console.error('Falha ao semear o calendário:', e.message); }
+  try { await seedConfiguracoes(); } catch (e) { falhasMigracao.push('seed configuracoes: ' + e.message); console.error('Falha ao semear as configurações:', e.message); }
   await seedCursosNiveis();
   await seedMaster();
   console.log('Banco verificado/criado com sucesso.');
@@ -474,6 +474,16 @@ async function initDB() {
 
 // ---------- Seeds de configurações padrão ----------
 // Calendário oficial 2026.2 — semeado uma única vez; edições da Gestão nunca são sobrescritas
+// Migração tolerante: registra a falha e segue, para um erro pontual não derrubar o sistema inteiro
+const falhasMigracao = [];
+async function migrar(rotulo, sql) {
+  try { await pool.query(sql); }
+  catch (e) {
+    falhasMigracao.push(rotulo + ': ' + e.message);
+    console.error(`MIGRAÇÃO FALHOU [${rotulo}] — ${e.message}`);
+  }
+}
+
 async function seedCalendario() {
   const SEMESTRE = '2026.2';
   const existe = await pool.query(`SELECT 1 FROM calendario WHERE semestre = $1 LIMIT 1`, [SEMESTRE]);
@@ -3241,6 +3251,169 @@ app.post('/professor/turmas/:id/avaliacoes/modelo', autenticar, somenteProfessor
   } catch (e) { console.error('Erro aplicar modelo:', e); res.status(500).json({ erro: 'Erro ao criar as avaliações do bimestre.' }); }
 });
 
+// ============================================================
+// BACKUP DO BANCO DE DADOS
+// ============================================================
+const somenteMaster = exigirPerfil('master');
+
+// Ordem topológica: tabelas-pai antes das filhas, para o restauro respeitar as chaves estrangeiras
+async function tabelasEmOrdem() {
+  const t = await pool.query(
+    `SELECT table_name FROM information_schema.tables
+     WHERE table_schema = 'public' AND table_type = 'BASE TABLE' ORDER BY table_name`);
+  const nomes = t.rows.map(r => r.table_name);
+  const dep = await pool.query(
+    `SELECT tc.table_name AS filho, ccu.table_name AS pai
+     FROM information_schema.table_constraints tc
+     JOIN information_schema.constraint_column_usage ccu ON ccu.constraint_name = tc.constraint_name
+     WHERE tc.constraint_type = 'FOREIGN KEY' AND tc.table_schema = 'public'`);
+  const pais = {};
+  nomes.forEach(n => { pais[n] = new Set(); });
+  for (const d of dep.rows) {
+    // auto-referência não cria dependência entre tabelas
+    if (d.filho !== d.pai && pais[d.filho] && nomes.includes(d.pai)) pais[d.filho].add(d.pai);
+  }
+  const ordem = [], visto = new Set();
+  const visitar = (n, caminho) => {
+    if (visto.has(n) || caminho.has(n)) return;   // ciclo: resolve na ordem alfabética
+    caminho.add(n);
+    for (const p of pais[n]) visitar(p, caminho);
+    caminho.delete(n);
+    visto.add(n); ordem.push(n);
+  };
+  nomes.forEach(n => visitar(n, new Set()));
+  return ordem;
+}
+
+// Colunas BYTEA por tabela — são os anexos e as fotos, que pesam no arquivo
+async function colunasBinarias() {
+  const r = await pool.query(
+    `SELECT table_name, column_name FROM information_schema.columns
+     WHERE table_schema = 'public' AND data_type = 'bytea'`);
+  const mapa = {};
+  for (const c of r.rows) (mapa[c.table_name] = mapa[c.table_name] || []).push(c.column_name);
+  return mapa;
+}
+
+app.get('/admin/backup/resumo', autenticar, somenteMaster, async (req, res) => {
+  try {
+    const ordem = await tabelasEmOrdem();
+    const bin = await colunasBinarias();
+    const tabelas = [];
+    let totalLinhas = 0, totalBytes = 0;
+    for (const nome of ordem) {
+      const c = await pool.query(`SELECT COUNT(*)::int AS n FROM "${nome}"`);
+      const s = await pool.query(`SELECT pg_total_relation_size($1)::bigint AS b`, [nome]);
+      const bytes = Number(s.rows[0].b);
+      totalLinhas += c.rows[0].n; totalBytes += bytes;
+      tabelas.push({ tabela: nome, linhas: c.rows[0].n, bytes, tem_arquivos: !!bin[nome] });
+    }
+    res.json({ gerado_em: new Date().toISOString(), tabelas, total_linhas: totalLinhas, total_bytes: totalBytes });
+  } catch (e) { console.error('Erro resumo backup:', e); res.status(500).json({ erro: 'Erro ao ler o resumo do banco.' }); }
+});
+
+// Backup completo em JSON. arquivos=1 inclui fotos e anexos (arquivo bem maior)
+app.get('/admin/backup', autenticar, somenteMaster, async (req, res) => {
+  try {
+    const incluirArquivos = String(req.query.arquivos || '') === '1';
+    const ordem = await tabelasEmOrdem();
+    const bin = await colunasBinarias();
+    const dump = {
+      sistema: 'CEMIC — Sistema de Gestão Escolar',
+      versao_backend: '3.35',
+      gerado_em: new Date().toISOString(),
+      gerado_por: req.usuario.id,
+      inclui_arquivos: incluirArquivos,
+      ordem,
+      contagem: {},
+      tabelas: {}
+    };
+    let arquivosOmitidos = 0;
+    for (const nome of ordem) {
+      const r = await pool.query(`SELECT * FROM "${nome}"`);
+      const cols = bin[nome] || [];
+      const linhas = r.rows.map(linha => {
+        for (const col of cols) {
+          if (linha[col] == null) continue;
+          if (incluirArquivos) linha[col] = { __bytea: Buffer.from(linha[col]).toString('base64') };
+          else { linha[col] = null; arquivosOmitidos++; }
+        }
+        return linha;
+      });
+      dump.tabelas[nome] = linhas;
+      dump.contagem[nome] = linhas.length;
+    }
+    dump.arquivos_omitidos = arquivosOmitidos;
+    const nomeArq = `cemic-backup-${new Date().toISOString().slice(0, 10)}${incluirArquivos ? '-com-arquivos' : ''}.json`;
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="${nomeArq}"`);
+    res.setHeader('Cache-Control', 'private, no-store');
+    console.log(`Backup gerado por usuário ${req.usuario.id} — arquivos: ${incluirArquivos}`);
+    res.send(JSON.stringify(dump));
+  } catch (e) { console.error('Erro backup:', e); res.status(500).json({ erro: 'Erro ao gerar o backup.' }); }
+});
+
+// Restauro. Por segurança só roda com confirmação explícita; substituir=true apaga o que existe.
+app.post('/admin/backup/restaurar', express.json({ limit: '250mb' }), autenticar, somenteMaster, async (req, res) => {
+  const cliente = await pool.connect();
+  try {
+    const body = req.body || {};
+    if (body.confirmacao !== 'RESTAURAR') {
+      return res.status(400).json({ erro: 'Envie confirmacao: "RESTAURAR" para executar o restauro.' });
+    }
+    const dump = body.backup;
+    if (!dump || !dump.tabelas || !Array.isArray(dump.ordem)) {
+      return res.status(400).json({ erro: 'Arquivo de backup inválido.' });
+    }
+    const substituir = body.substituir === true;
+    const ordemBanco = await tabelasEmOrdem();
+    const alvo = dump.ordem.filter(t => ordemBanco.includes(t));
+
+    if (!substituir) {
+      for (const t of alvo) {
+        const c = await cliente.query(`SELECT 1 FROM "${t}" LIMIT 1`);
+        if (c.rows.length) {
+          return res.status(409).json({ erro: `A tabela "${t}" já tem dados. Para sobrescrever, envie substituir: true.` });
+        }
+      }
+    }
+
+    await cliente.query('BEGIN');
+    if (substituir) {
+      await cliente.query(`TRUNCATE ${alvo.map(t => `"${t}"`).join(', ')} RESTART IDENTITY CASCADE`);
+    }
+    const restaurado = {};
+    for (const t of alvo) {
+      const linhas = dump.tabelas[t] || [];
+      for (const linha of linhas) {
+        const cols = Object.keys(linha);
+        if (!cols.length) continue;
+        const vals = cols.map(k => {
+          const v = linha[k];
+          return (v && typeof v === 'object' && v.__bytea) ? Buffer.from(v.__bytea, 'base64') : v;
+        });
+        await cliente.query(
+          `INSERT INTO "${t}" (${cols.map(c => `"${c}"`).join(',')})
+           VALUES (${cols.map((_, i) => '$' + (i + 1)).join(',')}) ON CONFLICT DO NOTHING`, vals);
+      }
+      restaurado[t] = linhas.length;
+      // realinha a sequência do id para os próximos cadastros não colidirem
+      await cliente.query(
+        `SELECT setval(pg_get_serial_sequence($1, 'id'), COALESCE((SELECT MAX(id) FROM "${t}"), 1))
+         WHERE pg_get_serial_sequence($1, 'id') IS NOT NULL`, [t]);
+    }
+    await cliente.query('COMMIT');
+    console.log(`Restauro concluído por usuário ${req.usuario.id} — substituir: ${substituir}`);
+    res.json({ ok: true, substituir, tabelas: restaurado });
+  } catch (e) {
+    try { await cliente.query('ROLLBACK'); } catch (x) {}
+    console.error('Erro restaurar backup:', e);
+    res.status(500).json({ erro: 'Erro ao restaurar: ' + e.message + ' — nada foi alterado.' });
+  } finally {
+    cliente.release();
+  }
+});
+
 // ---------- Folha de professores (hora-aula) ----------
 app.post('/admin/professor-horas', autenticar, somenteGestao, async (req, res) => {
   try {
@@ -3583,13 +3756,27 @@ app.get('/', (req, res) => {
 app.get('/health', async (req, res) => {
   try {
     await pool.query('SELECT 1');
-    res.json({ status: 'ok', sistema: 'CEMIC Gestão', versao: '3.34 (Redefinição de acesso ao Portal e relatório por turma)' });
+    res.json({
+      status: (erroInicializacao || falhasMigracao.length) ? 'degradado' : 'ok',
+      sistema: 'CEMIC Gestão',
+      versao: '3.35 (Backup do banco de dados)',
+      inicializacao: erroInicializacao || 'ok',
+      migracoes_com_falha: falhasMigracao
+    });
   } catch {
     res.status(500).json({ status: 'erro', detalhe: 'Banco de dados inacessível.' });
   }
 });
 
 const PORT = process.env.PORT || 3000;
+let erroInicializacao = null;
 initDB()
-  .then(() => app.listen(PORT, () => console.log(`CEMIC Gestão — backend v3.34 rodando na porta ${PORT}`)))
-  .catch(e => { console.error('Falha ao inicializar o banco:', e); process.exit(1); });
+  .catch(e => {
+    erroInicializacao = e.message;
+    console.error('Falha ao inicializar o banco:', e);
+  })
+  .finally(() => app.listen(PORT, () => {
+    console.log(`CEMIC Gestão — backend v3.35 rodando na porta ${PORT}`);
+    if (erroInicializacao) console.error('ATENÇÃO: o sistema subiu com falha de inicialização —', erroInicializacao);
+    if (falhasMigracao.length) console.error('ATENÇÃO: migrações com falha —', falhasMigracao.join(' | '));
+  }));
