@@ -1,5 +1,5 @@
 // ============================================================
-// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v3.37 (… + Portal dos Pais + Pix Inter)
+// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v3.38 (… + Portal dos Pais + Pix Inter)
 // Banco + Autenticação com perfis + Configurações + CRUDs
 // Stack: Node.js/Express + PostgreSQL (Railway)
 // ============================================================
@@ -787,10 +787,12 @@ app.put('/admin/configuracoes/:chave', autenticar, exigirPerfil('master'), async
   try {
     if (req.body.valor === undefined) return res.status(400).json({ erro: 'Campo "valor" é obrigatório.' });
     const r = await pool.query(
-      `UPDATE configuracoes SET valor = $1, atualizado_em = NOW(), atualizado_por = $2 WHERE chave = $3 RETURNING chave, valor`,
-      [JSON.stringify(req.body.valor), req.usuario.id, req.params.chave]
+      `INSERT INTO configuracoes (chave, valor, atualizado_em, atualizado_por)
+       VALUES ($1, $2, NOW(), $3)
+       ON CONFLICT (chave) DO UPDATE SET valor = EXCLUDED.valor, atualizado_em = NOW(), atualizado_por = EXCLUDED.atualizado_por
+       RETURNING chave, valor`,
+      [req.params.chave, JSON.stringify(req.body.valor), req.usuario.id]
     );
-    if (!r.rows.length) return res.status(404).json({ erro: 'Configuração não encontrada.' });
     res.json({ mensagem: 'Configuração atualizada.', configuracao: r.rows[0] });
   } catch (e) {
     console.error('Erro PUT configuracoes:', e);
@@ -3915,7 +3917,7 @@ app.get('/health', async (req, res) => {
     res.json({
       status: (erroInicializacao || falhasMigracao.length) ? 'degradado' : 'ok',
       sistema: 'CEMIC Gestão',
-      versao: '3.37 (Termo de Adesão ao Serviço Voluntário)',
+      versao: '3.38 (Termo de Adesão; configurações com upsert)',
       inicializacao: erroInicializacao || 'ok',
       migracoes_com_falha: falhasMigracao
     });
@@ -3932,7 +3934,7 @@ initDB()
     console.error('Falha ao inicializar o banco:', e);
   })
   .finally(() => app.listen(PORT, () => {
-    console.log(`CEMIC Gestão — backend v3.37 rodando na porta ${PORT}`);
+    console.log(`CEMIC Gestão — backend v3.38 rodando na porta ${PORT}`);
     if (erroInicializacao) console.error('ATENÇÃO: o sistema subiu com falha de inicialização —', erroInicializacao);
     if (falhasMigracao.length) console.error('ATENÇÃO: migrações com falha —', falhasMigracao.join(' | '));
   }));
