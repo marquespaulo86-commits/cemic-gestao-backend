@@ -1,5 +1,5 @@
 // ============================================================
-// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v3.38 (… + Portal dos Pais + Pix Inter)
+// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v3.39 (… + Portal dos Pais + Pix Inter)
 // Banco + Autenticação com perfis + Configurações + CRUDs
 // Stack: Node.js/Express + PostgreSQL (Railway)
 // ============================================================
@@ -1304,7 +1304,7 @@ app.get('/admin/matriculas', autenticar, somenteGestao, async (req, res) => {
     if (req.query.turma_id) { params.push(req.query.turma_id); cond.push(`m.turma_id = $${params.length}`); }
     const where = cond.length ? `WHERE ${cond.join(' AND ')}` : '';
     const r = await pool.query(
-      `SELECT m.*, a.nome AS aluno_nome, t.nome AS turma_nome, t.semestre, t.turno, t.horario,
+      `SELECT m.*, a.nome AS aluno_nome, a.data_nascimento AS aluno_nascimento, t.nome AS turma_nome, t.semestre, t.turno, t.horario,
               n.nome AS nivel_nome, c.nome AS curso_nome
        FROM matriculas m
        JOIN alunos a ON a.id = m.aluno_id
@@ -3599,6 +3599,10 @@ app.get('/admin/professor-horas', autenticar, somenteGestao, async (req, res) =>
     const cond = [], params = [];
     if (req.query.professor_id) { params.push(Number(req.query.professor_id)); cond.push(`ph.professor_id = $${params.length}`); }
     if (req.query.mes) { params.push(req.query.mes); cond.push(`to_char(ph.data, 'YYYY-MM') = $${params.length}`); }
+    if (req.query.de && req.query.ate) {
+      params.push(req.query.de); cond.push(`to_char(ph.data, 'YYYY-MM') >= $${params.length}`);
+      params.push(req.query.ate); cond.push(`to_char(ph.data, 'YYYY-MM') <= $${params.length}`);
+    }
     const where = cond.length ? 'WHERE ' + cond.join(' AND ') : '';
     const r = await pool.query(
       `SELECT ph.id, ph.professor_id, ph.data, ph.horas, ph.valor_hora, ph.observacao,
@@ -3647,6 +3651,10 @@ app.get('/admin/professor-pagamentos', autenticar, somenteGestao, async (req, re
     const cond = [], params = [];
     if (req.query.professor_id) { params.push(Number(req.query.professor_id)); cond.push(`pg.professor_id = $${params.length}`); }
     if (req.query.mes) { params.push(req.query.mes); cond.push(`pg.referencia = $${params.length}`); }
+    if (req.query.de && req.query.ate) {
+      params.push(req.query.de); cond.push(`pg.referencia >= $${params.length}`);
+      params.push(req.query.ate); cond.push(`pg.referencia <= $${params.length}`);
+    }
     const where = cond.length ? 'WHERE ' + cond.join(' AND ') : '';
     const r = await pool.query(
       `SELECT pg.id, pg.professor_id, pg.referencia, pg.data_pagamento, pg.valor, pg.forma, pg.observacao,
@@ -3670,8 +3678,13 @@ app.delete('/admin/professor-pagamentos/:id', autenticar, somenteGestao, async (
 // Saldo consolidado do mês: devido (horas-aula) x pago (baixas)
 app.get('/admin/professor-folha', autenticar, somenteGestao, async (req, res) => {
   try {
-    const mes = req.query.mes;
-    if (!mes || !/^\d{4}-\d{2}$/.test(mes)) return res.status(400).json({ erro: 'Informe o mês (AAAA-MM).' });
+    const reMes = /^\d{4}-\d{2}$/;
+    let de = req.query.de, ate = req.query.ate;
+    if (req.query.mes) { de = req.query.mes; ate = req.query.mes; }
+    if (!de || !ate || !reMes.test(de) || !reMes.test(ate)) {
+      return res.status(400).json({ erro: 'Informe o mês (mes=AAAA-MM) ou o período (de=AAAA-MM&ate=AAAA-MM).' });
+    }
+    if (de > ate) { const t = de; de = ate; ate = t; }
     const r = await pool.query(
       `SELECT p.id AS professor_id, p.nome AS professor_nome,
               COALESCE(h.horas, 0) AS horas,
@@ -3681,14 +3694,14 @@ app.get('/admin/professor-folha', autenticar, somenteGestao, async (req, res) =>
        FROM professores p
        LEFT JOIN (
          SELECT professor_id, SUM(horas) AS horas, SUM(horas * valor_hora) AS devido
-         FROM professor_horas WHERE to_char(data, 'YYYY-MM') = $1 GROUP BY professor_id
+         FROM professor_horas WHERE to_char(data, 'YYYY-MM') >= $1 AND to_char(data, 'YYYY-MM') <= $2 GROUP BY professor_id
        ) h ON h.professor_id = p.id
        LEFT JOIN (
          SELECT professor_id, SUM(valor) AS pago
-         FROM professor_pagamentos WHERE referencia = $1 GROUP BY professor_id
+         FROM professor_pagamentos WHERE referencia >= $1 AND referencia <= $2 GROUP BY professor_id
        ) g ON g.professor_id = p.id
        WHERE COALESCE(h.devido, 0) <> 0 OR COALESCE(g.pago, 0) <> 0
-       ORDER BY p.nome`, [mes]);
+       ORDER BY p.nome`, [de, ate]);
     res.json(r.rows);
   } catch (e) { console.error('Erro GET professor-folha:', e); res.status(500).json({ erro: 'Erro ao apurar a folha.' }); }
 });
@@ -3917,7 +3930,7 @@ app.get('/health', async (req, res) => {
     res.json({
       status: (erroInicializacao || falhasMigracao.length) ? 'degradado' : 'ok',
       sistema: 'CEMIC Gestão',
-      versao: '3.38 (Termo de Adesão; configurações com upsert)',
+      versao: '3.39 (Folha por período; nascimento nas matrículas)',
       inicializacao: erroInicializacao || 'ok',
       migracoes_com_falha: falhasMigracao
     });
@@ -3934,7 +3947,7 @@ initDB()
     console.error('Falha ao inicializar o banco:', e);
   })
   .finally(() => app.listen(PORT, () => {
-    console.log(`CEMIC Gestão — backend v3.38 rodando na porta ${PORT}`);
+    console.log(`CEMIC Gestão — backend v3.39 rodando na porta ${PORT}`);
     if (erroInicializacao) console.error('ATENÇÃO: o sistema subiu com falha de inicialização —', erroInicializacao);
     if (falhasMigracao.length) console.error('ATENÇÃO: migrações com falha —', falhasMigracao.join(' | '));
   }));
