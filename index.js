@@ -1,5 +1,5 @@
 // ============================================================
-// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v3.32 (… + Portal dos Pais + Pix Inter)
+// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v3.34 (… + Portal dos Pais + Pix Inter)
 // Banco + Autenticação com perfis + Configurações + CRUDs
 // Stack: Node.js/Express + PostgreSQL (Railway)
 // ============================================================
@@ -436,6 +436,36 @@ async function initDB() {
   )`);
   await pool.query(`ALTER TABLE carteiras ADD COLUMN IF NOT EXISTS aluno_cpf TEXT`);
   await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_carteiras_aluno_semestre ON carteiras (aluno_id, semestre)`);
+  // ---------- Calendário acadêmico, Circulares e Sistema de Avaliação (v3.33) ----------
+  await pool.query(`ALTER TABLE avaliacoes ADD COLUMN IF NOT EXISTS bimestre INTEGER`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS calendario (
+    id SERIAL PRIMARY KEY,
+    semestre TEXT NOT NULL,
+    data DATE NOT NULL,
+    titulo TEXT NOT NULL,
+    detalhe TEXT,
+    modalidade TEXT NOT NULL DEFAULT 'Presencial',
+    criado_em TIMESTAMP DEFAULT NOW()
+  )`);
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_calendario_evento ON calendario (semestre, data, titulo)`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS circulares (
+    id SERIAL PRIMARY KEY,
+    numero TEXT,
+    titulo TEXT NOT NULL,
+    corpo TEXT NOT NULL,
+    destino TEXT NOT NULL DEFAULT 'professores',
+    semestre TEXT,
+    publicada BOOLEAN NOT NULL DEFAULT TRUE,
+    criada_em TIMESTAMP DEFAULT NOW(),
+    criada_por INTEGER REFERENCES usuarios(id) ON DELETE SET NULL
+  )`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS circular_leituras (
+    circular_id INTEGER NOT NULL REFERENCES circulares(id) ON DELETE CASCADE,
+    usuario_id INTEGER NOT NULL REFERENCES usuarios(id) ON DELETE CASCADE,
+    lida_em TIMESTAMP DEFAULT NOW(),
+    PRIMARY KEY (circular_id, usuario_id)
+  )`);
+  await seedCalendario();
   await seedConfiguracoes();
   await seedCursosNiveis();
   await seedMaster();
@@ -443,6 +473,46 @@ async function initDB() {
 }
 
 // ---------- Seeds de configurações padrão ----------
+// Calendário oficial 2026.2 — semeado uma única vez; edições da Gestão nunca são sobrescritas
+async function seedCalendario() {
+  const SEMESTRE = '2026.2';
+  const existe = await pool.query(`SELECT 1 FROM calendario WHERE semestre = $1 LIMIT 1`, [SEMESTRE]);
+  if (existe.rows.length) return;
+  const IEMA = 'Plataforma Virtual · Sábado letivo IEMA Pleno Dr.º João Bacelar Portela';
+  const eventos = [
+    ['2026-08-01', 'TCAA / Acolhimento', 'Aplicação do Teste de Conhecimentos Acumulados dos (as) alunos (as)', 'Presencial'],
+    ['2026-08-08', 'Aula I', null, 'Presencial'],
+    ['2026-08-15', 'Aula II', null, 'Presencial'],
+    ['2026-08-22', 'Aula III', IEMA, 'Online'],
+    ['2026-08-29', 'Aula IV', null, 'Presencial'],
+    ['2026-09-05', 'Aula V', null, 'Presencial'],
+    ['2026-09-12', 'Aula VI', IEMA, 'Online'],
+    ['2026-09-19', 'Aula VII', null, 'Presencial'],
+    ['2026-09-26', 'Aula VIII', null, 'Presencial'],
+    ['2026-10-03', 'Aula IX', 'Plataforma Virtual · Eleições 2026', 'Online'],
+    ['2026-10-10', 'Aula X', IEMA, 'Online'],
+    ['2026-10-17', 'Aula XI', null, 'Presencial'],
+    ['2026-10-24', 'Aula XII', IEMA, 'Online'],
+    ['2026-10-31', 'Aula XIII', null, 'Presencial'],
+    ['2026-11-07', 'Aula XIV', IEMA, 'Online'],
+    ['2026-11-14', 'Aula XV', null, 'Presencial'],
+    ['2026-11-21', 'Aula XVI', null, 'Presencial'],
+    ['2026-11-28', 'Aula XVII', IEMA, 'Online'],
+    ['2026-12-05', 'Aula XVIII', null, 'Presencial'],
+    ['2026-12-12', 'II Avaliação', null, 'Presencial'],
+    ['2026-12-19', 'Recuperação / Prova Final', null, 'Presencial'],
+    ['2027-01-09', 'Rematrícula 2027.1', 'Rematrícula para o semestre 2027.1', 'Presencial'],
+    ['2027-01-16', 'Rematrícula 2027.1', 'Rematrícula para o semestre 2027.1', 'Presencial']
+  ];
+  for (const [data, titulo, detalhe, modalidade] of eventos) {
+    await pool.query(
+      `INSERT INTO calendario (semestre, data, titulo, detalhe, modalidade) VALUES ($1,$2,$3,$4,$5)
+       ON CONFLICT (semestre, data, titulo) DO NOTHING`,
+      [SEMESTRE, data, titulo, detalhe, modalidade]);
+  }
+  console.log('Calendário 2026.2 semeado.');
+}
+
 async function seedConfiguracoes() {
   const padroes = [
     ['semestre_vigente', JSON.stringify('2026.2'), 'Semestre letivo vigente (formato AAAA.S)'],
@@ -466,6 +536,23 @@ async function seedConfiguracoes() {
     }), 'Dados institucionais usados em documentos e PDFs'],
     ['modelo_boletim', JSON.stringify({ titulo: 'Boletim de Desempenho', exibir_frequencia: true, exibir_observacoes: true, rodape: 'Documento emitido pelo CEMIC.' }), 'Modelo do boletim do aluno'],
     ['modelo_historico', JSON.stringify({ titulo: 'Histórico Escolar', exibir_carga_horaria: true, rodape: 'Documento emitido pelo CEMIC.' }), 'Modelo do histórico do aluno'],
+    ['sistema_avaliacao', JSON.stringify({
+      bimestres: 2,
+      nota_maxima: 10,
+      etapas: {
+        '1': [
+          { nome: 'Participação nas atividades', peso: 1 },
+          { nome: 'Prova escrita', peso: 1 },
+          { nome: 'Desempenho na Plataforma', peso: 1 }
+        ],
+        '2': [
+          { nome: 'Prova escrita', peso: 1 },
+          { nome: 'Prova oral', peso: 1 },
+          { nome: 'Desempenho na Plataforma', peso: 1 }
+        ]
+      }
+    }), 'Composição da nota por bimestre (etapas e pesos) — base para as avaliações das turmas'],
+    ['calendario_observacao', JSON.stringify('O presente calendário está sujeito a modificações, considerando o Calendário Escolar Regular do IEMA Pleno Dr.º João Bacelar Portela.'), 'Observação exibida ao pé do calendário acadêmico']
     ['valor_hora_aula', JSON.stringify(0), 'Valor padrão da hora-aula do professor (R$)']
   ];
   for (const [chave, valor, descricao] of padroes) {
@@ -857,7 +944,10 @@ app.get('/admin/responsaveis', autenticar, somenteGestao, async (req, res) => {
     const params = [];
     let where = '';
     if (busca) { params.push(`%${busca}%`); where = `WHERE nome ILIKE $1 OR cpf ILIKE $1`; }
-    const r = await pool.query(`SELECT * FROM responsaveis ${where} ORDER BY nome`, params);
+    // Nunca devolver senha_hash ao frontend — apenas se o acesso ao portal já foi criado
+    const r = await pool.query(
+      `SELECT id, nome, cpf, email, whatsapp, (senha_hash IS NOT NULL) AS cadastrado
+       FROM responsaveis ${where} ORDER BY nome`, params);
     res.json(r.rows);
   } catch (e) {
     console.error('Erro GET responsaveis:', e);
@@ -903,6 +993,17 @@ app.put('/admin/responsaveis/:id', autenticar, somenteGestao, async (req, res) =
     console.error('Erro PUT responsavel:', e);
     res.status(500).json({ erro: 'Erro ao atualizar responsável.' });
   }
+});
+
+// Redefinir acesso: apaga a senha para o responsável refazer o primeiro acesso
+app.post('/admin/responsaveis/:id/redefinir-acesso', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const r = await pool.query(
+      `UPDATE responsaveis SET senha_hash = NULL WHERE id = $1 RETURNING nome, cpf`, [Number(req.params.id)]);
+    if (!r.rowCount) return res.status(404).json({ erro: 'Responsável não encontrado.' });
+    console.log(`Acesso ao Portal redefinido: responsável ${r.rows[0].nome} por usuário ${req.usuario.id}`);
+    res.json({ ok: true, nome: r.rows[0].nome });
+  } catch (e) { console.error('Erro redefinir acesso:', e); res.status(500).json({ erro: 'Erro ao redefinir o acesso.' }); }
 });
 
 app.delete('/admin/responsaveis/:id', autenticar, somenteGestao, async (req, res) => {
@@ -2922,6 +3023,224 @@ app.get('/publico/portal/aluno/:id/carteira', autenticarResponsavel, async (req,
   } catch (e) { console.error('Erro consultar carteira:', e); res.status(500).json({ erro: 'Erro ao carregar a carteira.' }); }
 });
 
+// ============================================================
+// CALENDÁRIO ACADÊMICO
+// ============================================================
+const MESES_PT = ['Janeiro', 'Fevereiro', 'Março', 'Abril', 'Maio', 'Junho', 'Julho', 'Agosto', 'Setembro', 'Outubro', 'Novembro', 'Dezembro'];
+
+// Agrupa os eventos por mês, na ordem do calendário
+function calendarioPorMes(linhas) {
+  const meses = [];
+  for (const ev of linhas) {
+    const d = new Date(ev.data);
+    const chave = `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`;
+    let mes = meses.find(m => m.chave === chave);
+    if (!mes) {
+      mes = { chave, ano: d.getUTCFullYear(), mes: d.getUTCMonth() + 1, nome: MESES_PT[d.getUTCMonth()], eventos: [] };
+      meses.push(mes);
+    }
+    mes.eventos.push({ id: ev.id, data: ev.data, dia: d.getUTCDate(), titulo: ev.titulo, detalhe: ev.detalhe, modalidade: ev.modalidade });
+  }
+  return meses;
+}
+
+async function montarCalendario(semestre) {
+  const sem = semestre || await getConfig('semestre_vigente', '2026.2');
+  const r = await pool.query(
+    `SELECT id, data, titulo, detalhe, modalidade FROM calendario WHERE semestre = $1 ORDER BY data, id`, [sem]);
+  const obs = await getConfig('calendario_observacao', '');
+  return { semestre: sem, observacao: obs, meses: calendarioPorMes(r.rows) };
+}
+
+app.get('/calendario', autenticar, async (req, res) => {
+  try { res.json(await montarCalendario(req.query.semestre)); }
+  catch (e) { console.error('Erro GET calendario:', e); res.status(500).json({ erro: 'Erro ao carregar o calendário.' }); }
+});
+
+app.post('/calendario', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const titulo = (req.body.titulo || '').trim();
+    const data = (req.body.data || '').trim();
+    if (!titulo || !data) return res.status(400).json({ erro: 'Informe a data e o título do evento.' });
+    const semestre = (req.body.semestre || '').trim() || await getConfig('semestre_vigente', '2026.2');
+    const modalidade = ['Presencial', 'Online'].includes(req.body.modalidade) ? req.body.modalidade : 'Presencial';
+    const r = await pool.query(
+      `INSERT INTO calendario (semestre, data, titulo, detalhe, modalidade) VALUES ($1,$2,$3,$4,$5)
+       ON CONFLICT (semestre, data, titulo) DO UPDATE SET detalhe = EXCLUDED.detalhe, modalidade = EXCLUDED.modalidade
+       RETURNING id`,
+      [semestre, data, titulo, (req.body.detalhe || '').trim() || null, modalidade]);
+    res.status(201).json({ id: r.rows[0].id });
+  } catch (e) { console.error('Erro POST calendario:', e); res.status(500).json({ erro: 'Erro ao salvar o evento.' }); }
+});
+
+app.put('/calendario/:id', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const titulo = (req.body.titulo || '').trim();
+    const data = (req.body.data || '').trim();
+    if (!titulo || !data) return res.status(400).json({ erro: 'Informe a data e o título do evento.' });
+    const modalidade = ['Presencial', 'Online'].includes(req.body.modalidade) ? req.body.modalidade : 'Presencial';
+    const r = await pool.query(
+      `UPDATE calendario SET data = $1, titulo = $2, detalhe = $3, modalidade = $4 WHERE id = $5`,
+      [data, titulo, (req.body.detalhe || '').trim() || null, modalidade, Number(req.params.id)]);
+    if (!r.rowCount) return res.status(404).json({ erro: 'Evento não encontrado.' });
+    res.json({ ok: true });
+  } catch (e) { console.error('Erro PUT calendario:', e); res.status(500).json({ erro: 'Erro ao alterar o evento.' }); }
+});
+
+app.delete('/calendario/:id', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const r = await pool.query(`DELETE FROM calendario WHERE id = $1`, [Number(req.params.id)]);
+    if (!r.rowCount) return res.status(404).json({ erro: 'Evento não encontrado.' });
+    res.json({ ok: true });
+  } catch (e) { console.error('Erro DELETE calendario:', e); res.status(500).json({ erro: 'Erro ao excluir o evento.' }); }
+});
+
+// Portal dos Pais: leitura do calendário do semestre vigente
+app.get('/publico/portal/calendario', autenticarResponsavel, async (req, res) => {
+  try { res.json(await montarCalendario(req.query.semestre)); }
+  catch (e) { console.error('Erro calendario portal:', e); res.status(500).json({ erro: 'Erro ao carregar o calendário.' }); }
+});
+
+// ============================================================
+// CIRCULARES (comunicados internos)
+// ============================================================
+const DESTINOS_CIRCULAR = ['professores', 'responsaveis', 'todos'];
+
+app.get('/circulares', autenticar, async (req, res) => {
+  try {
+    const gestao = ['master', 'secretaria'].includes(req.usuario.perfil);
+    if (gestao) {
+      const r = await pool.query(
+        `SELECT c.*, (SELECT COUNT(*) FROM circular_leituras l WHERE l.circular_id = c.id) AS leituras
+         FROM circulares c ORDER BY c.criada_em DESC`);
+      return res.json(r.rows);
+    }
+    const r = await pool.query(
+      `SELECT c.id, c.numero, c.titulo, c.corpo, c.destino, c.semestre, c.criada_em,
+              (l.usuario_id IS NOT NULL) AS lida, l.lida_em
+       FROM circulares c
+       LEFT JOIN circular_leituras l ON l.circular_id = c.id AND l.usuario_id = $1
+       WHERE c.publicada = TRUE AND c.destino IN ('professores', 'todos')
+       ORDER BY c.criada_em DESC`, [req.usuario.id]);
+    res.json(r.rows);
+  } catch (e) { console.error('Erro GET circulares:', e); res.status(500).json({ erro: 'Erro ao listar as circulares.' }); }
+});
+
+app.post('/circulares', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const titulo = (req.body.titulo || '').trim();
+    const corpo = (req.body.corpo || '').trim();
+    if (!titulo || !corpo) return res.status(400).json({ erro: 'Informe o título e o texto da circular.' });
+    const destino = DESTINOS_CIRCULAR.includes(req.body.destino) ? req.body.destino : 'professores';
+    const semestre = (req.body.semestre || '').trim() || await getConfig('semestre_vigente', '2026.2');
+    const seq = await pool.query(`SELECT COUNT(*)::int AS n FROM circulares WHERE semestre = $1`, [semestre]);
+    const numero = String(seq.rows[0].n + 1).padStart(3, '0') + '/' + semestre;
+    const r = await pool.query(
+      `INSERT INTO circulares (numero, titulo, corpo, destino, semestre, publicada, criada_por)
+       VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id, numero`,
+      [numero, titulo, corpo, destino, semestre, req.body.publicada !== false, req.usuario.id]);
+    res.status(201).json(r.rows[0]);
+  } catch (e) { console.error('Erro POST circular:', e); res.status(500).json({ erro: 'Erro ao criar a circular.' }); }
+});
+
+app.put('/circulares/:id', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const titulo = (req.body.titulo || '').trim();
+    const corpo = (req.body.corpo || '').trim();
+    if (!titulo || !corpo) return res.status(400).json({ erro: 'Informe o título e o texto da circular.' });
+    const destino = DESTINOS_CIRCULAR.includes(req.body.destino) ? req.body.destino : 'professores';
+    const r = await pool.query(
+      `UPDATE circulares SET titulo = $1, corpo = $2, destino = $3, publicada = $4 WHERE id = $5`,
+      [titulo, corpo, destino, req.body.publicada !== false, Number(req.params.id)]);
+    if (!r.rowCount) return res.status(404).json({ erro: 'Circular não encontrada.' });
+    res.json({ ok: true });
+  } catch (e) { console.error('Erro PUT circular:', e); res.status(500).json({ erro: 'Erro ao alterar a circular.' }); }
+});
+
+app.delete('/circulares/:id', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const r = await pool.query(`DELETE FROM circulares WHERE id = $1`, [Number(req.params.id)]);
+    if (!r.rowCount) return res.status(404).json({ erro: 'Circular não encontrada.' });
+    res.json({ ok: true });
+  } catch (e) { console.error('Erro DELETE circular:', e); res.status(500).json({ erro: 'Erro ao excluir a circular.' }); }
+});
+
+// Confirmação de leitura pelo professor
+app.post('/circulares/:id/lida', autenticar, async (req, res) => {
+  try {
+    await pool.query(
+      `INSERT INTO circular_leituras (circular_id, usuario_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`,
+      [Number(req.params.id), req.usuario.id]);
+    res.json({ ok: true });
+  } catch (e) { console.error('Erro marcar circular lida:', e); res.status(500).json({ erro: 'Erro ao confirmar a leitura.' }); }
+});
+
+// Quem já leu — controle da Gestão
+app.get('/circulares/:id/leituras', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const r = await pool.query(
+      `SELECT u.nome, u.perfil, l.lida_em FROM circular_leituras l
+       JOIN usuarios u ON u.id = l.usuario_id WHERE l.circular_id = $1 ORDER BY l.lida_em`,
+      [Number(req.params.id)]);
+    res.json(r.rows);
+  } catch (e) { console.error('Erro GET leituras:', e); res.status(500).json({ erro: 'Erro ao listar as leituras.' }); }
+});
+
+// ============================================================
+// SISTEMA DE AVALIAÇÃO (composição da nota por bimestre)
+// ============================================================
+app.get('/avaliacao/modelo', autenticar, async (req, res) => {
+  try { res.json(await getConfig('sistema_avaliacao', { bimestres: 2, nota_maxima: 10, etapas: { '1': [], '2': [] } })); }
+  catch (e) { console.error('Erro GET modelo avaliacao:', e); res.status(500).json({ erro: 'Erro ao carregar o sistema de avaliação.' }); }
+});
+
+app.put('/avaliacao/modelo', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const body = req.body || {};
+    const etapas = {};
+    for (const b of ['1', '2']) {
+      const lista = Array.isArray(body.etapas && body.etapas[b]) ? body.etapas[b] : [];
+      etapas[b] = lista
+        .map(e => ({ nome: String(e.nome || '').trim(), peso: Number(e.peso) > 0 ? Number(e.peso) : 1 }))
+        .filter(e => e.nome);
+    }
+    if (!etapas['1'].length && !etapas['2'].length) return res.status(400).json({ erro: 'Informe ao menos uma etapa.' });
+    const modelo = {
+      bimestres: 2,
+      nota_maxima: Number(body.nota_maxima) > 0 ? Number(body.nota_maxima) : 10,
+      etapas
+    };
+    await pool.query(
+      `INSERT INTO configuracoes (chave, valor, descricao) VALUES ('sistema_avaliacao', $1, 'Composição da nota por bimestre (etapas e pesos) — base para as avaliações das turmas')
+       ON CONFLICT (chave) DO UPDATE SET valor = EXCLUDED.valor`, [JSON.stringify(modelo)]);
+    res.json(modelo);
+  } catch (e) { console.error('Erro PUT modelo avaliacao:', e); res.status(500).json({ erro: 'Erro ao salvar o sistema de avaliação.' }); }
+});
+
+// Cria na turma as avaliações previstas para o bimestre, sem duplicar as já existentes
+app.post('/professor/turmas/:id/avaliacoes/modelo', autenticar, somenteProfessor, async (req, res) => {
+  try {
+    if (!await podeTurma(req, req.params.id)) return res.status(403).json({ erro: 'Turma não vinculada ao seu cadastro.' });
+    const bim = Number(req.body.bimestre);
+    if (![1, 2].includes(bim)) return res.status(400).json({ erro: 'Informe o bimestre (1 ou 2).' });
+    const modelo = await getConfig('sistema_avaliacao', null);
+    const etapas = (modelo && modelo.etapas && modelo.etapas[String(bim)]) || [];
+    if (!etapas.length) return res.status(400).json({ erro: 'O sistema de avaliação ainda não foi configurado pela Gestão.' });
+    let criadas = 0;
+    for (const et of etapas) {
+      const ja = await pool.query(
+        `SELECT 1 FROM avaliacoes WHERE turma_id = $1 AND nome = $2 AND bimestre IS NOT DISTINCT FROM $3`,
+        [req.params.id, et.nome, bim]);
+      if (ja.rows.length) continue;
+      await pool.query(
+        `INSERT INTO avaliacoes (turma_id, nome, peso, bimestre) VALUES ($1,$2,$3,$4)`,
+        [req.params.id, et.nome, Number(et.peso) > 0 ? Number(et.peso) : 1, bim]);
+      criadas++;
+    }
+    res.status(201).json({ criadas, total: etapas.length });
+  } catch (e) { console.error('Erro aplicar modelo:', e); res.status(500).json({ erro: 'Erro ao criar as avaliações do bimestre.' }); }
+});
+
 // ---------- Folha de professores (hora-aula) ----------
 app.post('/admin/professor-horas', autenticar, somenteGestao, async (req, res) => {
   try {
@@ -3073,6 +3392,7 @@ app.get('/admin/relatorios/pais-por-turma', autenticar, somenteGestao, async (re
     const params = [];
     let filtroSem = '';
     if (req.query.semestre) { params.push(req.query.semestre); filtroSem = ` AND t.semestre = $${params.length}`; }
+    if (req.query.turma_id) { params.push(Number(req.query.turma_id)); filtroSem += ` AND t.id = $${params.length}`; }
     const r = await pool.query(
       `SELECT t.id AS turma_id, t.nome AS turma_nome, t.turno, t.semestre,
               c.nome AS curso_nome, n.nome AS nivel_nome,
@@ -3263,7 +3583,7 @@ app.get('/', (req, res) => {
 app.get('/health', async (req, res) => {
   try {
     await pool.query('SELECT 1');
-    res.json({ status: 'ok', sistema: 'CEMIC Gestão', versao: '3.32 (Carteira Estudantil)' });
+    res.json({ status: 'ok', sistema: 'CEMIC Gestão', versao: '3.34 (Redefinição de acesso ao Portal e relatório por turma)' });
   } catch {
     res.status(500).json({ status: 'erro', detalhe: 'Banco de dados inacessível.' });
   }
@@ -3271,5 +3591,5 @@ app.get('/health', async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 initDB()
-  .then(() => app.listen(PORT, () => console.log(`CEMIC Gestão — backend v3.32 rodando na porta ${PORT}`)))
+  .then(() => app.listen(PORT, () => console.log(`CEMIC Gestão — backend v3.34 rodando na porta ${PORT}`)))
   .catch(e => { console.error('Falha ao inicializar o banco:', e); process.exit(1); });
