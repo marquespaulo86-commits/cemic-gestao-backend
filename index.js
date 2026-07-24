@@ -1,5 +1,5 @@
 // ============================================================
-// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v3.35 (… + Portal dos Pais + Pix Inter)
+// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v3.37 (… + Portal dos Pais + Pix Inter)
 // Banco + Autenticação com perfis + Configurações + CRUDs
 // Stack: Node.js/Express + PostgreSQL (Railway)
 // ============================================================
@@ -459,6 +459,31 @@ async function initDB() {
     criada_em TIMESTAMP DEFAULT NOW(),
     criada_por INTEGER REFERENCES usuarios(id) ON DELETE SET NULL
   )`);
+  await migrar('termos_adesao', `CREATE TABLE IF NOT EXISTS termos_adesao (
+    id SERIAL PRIMARY KEY,
+    codigo TEXT UNIQUE,
+    professor_id INTEGER REFERENCES professores(id) ON DELETE SET NULL,
+    usuario_id INTEGER REFERENCES usuarios(id) ON DELETE SET NULL,
+    nome TEXT NOT NULL,
+    cpf TEXT,
+    rg TEXT,
+    data_nascimento DATE,
+    qualificacao TEXT,
+    endereco TEXT,
+    telefone TEXT,
+    email TEXT,
+    turmas_resumo TEXT,
+    turnos TEXT,
+    vigencia_inicio DATE NOT NULL,
+    vigencia_fim DATE NOT NULL,
+    valor_hora NUMERIC(10,2),
+    status TEXT NOT NULL DEFAULT 'pendente' CHECK (status IN ('pendente','aceito')),
+    assinado_em TIMESTAMP DEFAULT NOW(),
+    aceito_em TIMESTAMP,
+    aceito_por INTEGER REFERENCES usuarios(id) ON DELETE SET NULL,
+    aceito_por_nome TEXT
+  )`);
+  await migrar('idx_termo_prof_vigencia', `CREATE UNIQUE INDEX IF NOT EXISTS idx_termo_prof_vigencia ON termos_adesao (professor_id, vigencia_inicio)`);
   await migrar('circular_leituras', `CREATE TABLE IF NOT EXISTS circular_leituras (
     circular_id INTEGER NOT NULL REFERENCES circulares(id) ON DELETE CASCADE,
     usuario_id INTEGER NOT NULL REFERENCES usuarios(id) ON DELETE CASCADE,
@@ -665,13 +690,15 @@ function autenticarResponsavel(req, res, next) {
 async function alunosDoResponsavel(respId) {
   const r = await pool.query(
     `SELECT a.id, a.nome, a.cpf, a.data_nascimento,
-            t.nome AS turma_nome, t.turno, n.nome AS nivel_nome, c.nome AS curso_nome
+            t.nome AS turma_nome, t.turno, n.nome AS nivel_nome, c.nome AS curso_nome,
+            p.nome AS professor_nome
      FROM aluno_responsavel ar
      JOIN alunos a ON a.id = ar.aluno_id
      LEFT JOIN matriculas m ON m.aluno_id = a.id AND m.status = 'ativa'
      LEFT JOIN turmas t ON t.id = m.turma_id
      LEFT JOIN niveis n ON n.id = t.nivel_id
      LEFT JOIN cursos c ON c.id = n.curso_id
+     LEFT JOIN professores p ON p.id = t.professor_id
      WHERE ar.responsavel_id = $1
      ORDER BY a.nome`, [respId]);
   return r.rows;
@@ -2357,6 +2384,9 @@ app.get('/professor/turmas/:id/avaliacoes', autenticar, somenteProfessor, async 
 app.post('/professor/turmas/:id/avaliacoes', autenticar, somenteProfessor, async (req, res) => {
   try {
     if (!await podeTurma(req, req.params.id)) return res.status(403).json({ erro: 'Turma não vinculada ao seu cadastro.' });
+    if (req.usuario.perfil === 'professor') {
+      return res.status(403).json({ erro: 'As avaliações são definidas pela coordenação. Use os botões do Sistema de Avaliação para criar as etapas do bimestre.' });
+    }
     const nome = (req.body.nome || '').trim();
     if (!nome) return res.status(400).json({ erro: 'Informe o nome da avaliação.' });
     const peso = Number(req.body.peso) > 0 ? Number(req.body.peso) : 1;
@@ -2856,6 +2886,19 @@ app.get('/publico/verificar/:codigo', async (req, res) => {
     const r = await pool.query(
       `SELECT codigo, tipo, aluno_nome, aluno_cpf, curso, modulo, turno, semestre, modulos, total_semestres, carga_horaria, emitida_em FROM declaracoes WHERE codigo = $1`, [codigo]);
     if (!r.rows.length) {
+      // Pode ser um termo de adesão ao serviço voluntário
+      const ta = await pool.query(
+        `SELECT codigo, nome, turnos, vigencia_inicio, vigencia_fim, aceito_em, aceito_por_nome
+         FROM termos_adesao WHERE codigo = $1 AND status = 'aceito'`, [codigo]);
+      if (ta.rows.length) {
+        const w = ta.rows[0];
+        const cpfW = null;
+        return res.json({
+          valido: true, codigo: w.codigo, tipo: 'termo', voluntario_nome: w.nome, turnos: w.turnos,
+          vigencia_inicio: w.vigencia_inicio, vigencia_fim: w.vigencia_fim,
+          representante: w.aceito_por_nome, emitida_em: w.aceito_em
+        });
+      }
       // Pode ser uma carteira estudantil
       const c = await pool.query(
         `SELECT codigo, aluno_nome, aluno_cpf, aluno_codigo, curso, modulo, turma_nome, turno, semestre, validade, emitida_em FROM carteiras WHERE codigo = $1`, [codigo]);
@@ -3414,6 +3457,119 @@ app.post('/admin/backup/restaurar', express.json({ limit: '250mb' }), autenticar
   }
 });
 
+// ============================================================
+// TERMO DE ADESÃO AO SERVIÇO VOLUNTÁRIO (Portal do Professor)
+// ============================================================
+const TERMO_VIGENCIA = { inicio: '2026-08-01', fim: '2026-12-19' };
+const TERMO_VALOR_HORA_PADRAO = 33.33;
+
+async function dadosTermoProfessor(req) {
+  const profId = escopoProfessor(req);
+  if (profId === null || profId === -1) return null;
+  const p = await pool.query(
+    `SELECT id, nome, email, formacao, whatsapp, data_nascimento FROM professores WHERE id = $1`, [profId]);
+  if (!p.rows.length) return null;
+  const u = await pool.query(`SELECT cpf FROM usuarios WHERE id = $1`, [req.usuario.id]);
+  const t = await pool.query(
+    `SELECT nome, turno, horario, semestre FROM turmas
+     WHERE professor_id = $1 AND status <> 'encerrada' ORDER BY turno, nome`, [profId]);
+  const valorCfg = Number(await getConfig('valor_hora_aula', 0));
+  return {
+    professor: { ...p.rows[0], cpf: (u.rows[0] && u.rows[0].cpf) || null },
+    turmas: t.rows,
+    turnos: [...new Set(t.rows.map(x => x.turno).filter(Boolean))],
+    vigencia: TERMO_VIGENCIA,
+    valor_hora: valorCfg > 0 ? valorCfg : TERMO_VALOR_HORA_PADRAO
+  };
+}
+
+// Situação do termo + dados pré-preenchidos para a adesão
+app.get('/professor/termo', autenticar, somenteProfessor, async (req, res) => {
+  try {
+    const base = await dadosTermoProfessor(req);
+    if (!base) return res.status(403).json({ erro: 'Disponível apenas para usuários com perfil professor vinculado a um cadastro.' });
+    const t = await pool.query(
+      `SELECT * FROM termos_adesao WHERE professor_id = $1 AND vigencia_inicio = $2`,
+      [base.professor.id, TERMO_VIGENCIA.inicio]);
+    res.json({ ...base, termo: t.rows[0] || null });
+  } catch (e) { console.error('Erro GET termo:', e); res.status(500).json({ erro: 'Erro ao carregar o termo.' }); }
+});
+
+// Adesão do professor: cria o termo pendente de aceite da instituição
+app.post('/professor/termo', autenticar, somenteProfessor, async (req, res) => {
+  try {
+    const base = await dadosTermoProfessor(req);
+    if (!base) return res.status(403).json({ erro: 'Disponível apenas para usuários com perfil professor vinculado a um cadastro.' });
+    if (!base.turmas.length) return res.status(400).json({ erro: 'Você ainda não tem turmas vinculadas neste semestre. Procure a coordenação.' });
+    const ja = await pool.query(
+      `SELECT id, status FROM termos_adesao WHERE professor_id = $1 AND vigencia_inicio = $2`,
+      [base.professor.id, TERMO_VIGENCIA.inicio]);
+    if (ja.rows.length) return res.status(409).json({ erro: 'Você já aderiu ao termo deste período.' });
+    if (req.body.aceite !== true) return res.status(400).json({ erro: 'Confirme a leitura e o aceite do termo.' });
+
+    const turnos = base.turnos.join(' e ') || null;
+    const turmasResumo = base.turmas
+      .map(t => `${t.nome}${t.turno ? ' · ' + t.turno : ''}${t.horario ? ' · ' + t.horario : ''}`)
+      .join(' | ');
+    const r = await pool.query(
+      `INSERT INTO termos_adesao
+         (professor_id, usuario_id, nome, cpf, rg, data_nascimento, qualificacao, endereco, telefone, email,
+          turmas_resumo, turnos, vigencia_inicio, vigencia_fim, valor_hora, status)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,'pendente') RETURNING id, assinado_em`,
+      [base.professor.id, req.usuario.id, base.professor.nome, base.professor.cpf,
+       (req.body.rg || '').trim() || null, base.professor.data_nascimento,
+       (req.body.qualificacao || '').trim() || base.professor.formacao || null,
+       (req.body.endereco || '').trim() || null,
+       (req.body.telefone || '').trim() || base.professor.whatsapp || null,
+       base.professor.email || null,
+       turmasResumo, turnos, TERMO_VIGENCIA.inicio, TERMO_VIGENCIA.fim, base.valor_hora]);
+    res.status(201).json({ id: r.rows[0].id, status: 'pendente', assinado_em: r.rows[0].assinado_em });
+  } catch (e) { console.error('Erro POST termo:', e); res.status(500).json({ erro: 'Erro ao registrar a adesão.' }); }
+});
+
+// Gestão: lista de termos (pendentes primeiro)
+app.get('/admin/termos', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const r = await pool.query(
+      `SELECT t.*, p.nome AS professor_cadastro FROM termos_adesao t
+       LEFT JOIN professores p ON p.id = t.professor_id
+       ORDER BY (t.status = 'pendente') DESC, t.assinado_em DESC`);
+    res.json(r.rows);
+  } catch (e) { console.error('Erro GET termos:', e); res.status(500).json({ erro: 'Erro ao listar os termos.' }); }
+});
+
+// Aceite da instituição: só o master, cujo nome completo passa a constar no termo
+app.post('/admin/termos/:id/aceitar', autenticar, exigirPerfil('master'), async (req, res) => {
+  try {
+    const t = await pool.query(`SELECT id, status FROM termos_adesao WHERE id = $1`, [Number(req.params.id)]);
+    if (!t.rows.length) return res.status(404).json({ erro: 'Termo não encontrado.' });
+    if (t.rows[0].status === 'aceito') return res.status(409).json({ erro: 'Este termo já foi aceito.' });
+    let codigo = null;
+    for (let i = 0; i < 6 && !codigo; i++) {
+      const cand = 'CEMIC-' + crypto.randomBytes(2).toString('hex').toUpperCase() + '-' + crypto.randomBytes(2).toString('hex').toUpperCase();
+      const ex = await pool.query(
+        `SELECT 1 FROM declaracoes WHERE codigo = $1
+         UNION ALL SELECT 1 FROM carteiras WHERE codigo = $1
+         UNION ALL SELECT 1 FROM termos_adesao WHERE codigo = $1`, [cand]);
+      if (!ex.rows.length) codigo = cand;
+    }
+    const r = await pool.query(
+      `UPDATE termos_adesao SET status = 'aceito', codigo = $1, aceito_em = NOW(), aceito_por = $2, aceito_por_nome = $3
+       WHERE id = $4 RETURNING codigo, aceito_em, aceito_por_nome`,
+      [codigo, req.usuario.id, req.usuario.nome, Number(req.params.id)]);
+    console.log(`Termo ${req.params.id} aceito por ${req.usuario.nome}`);
+    res.json(r.rows[0]);
+  } catch (e) { console.error('Erro aceitar termo:', e); res.status(500).json({ erro: 'Erro ao aceitar o termo.' }); }
+});
+
+app.delete('/admin/termos/:id', autenticar, exigirPerfil('master'), async (req, res) => {
+  try {
+    const r = await pool.query(`DELETE FROM termos_adesao WHERE id = $1`, [Number(req.params.id)]);
+    if (!r.rowCount) return res.status(404).json({ erro: 'Termo não encontrado.' });
+    res.json({ ok: true });
+  } catch (e) { console.error('Erro DELETE termo:', e); res.status(500).json({ erro: 'Erro ao excluir o termo.' }); }
+});
+
 // ---------- Folha de professores (hora-aula) ----------
 app.post('/admin/professor-horas', autenticar, somenteGestao, async (req, res) => {
   try {
@@ -3759,7 +3915,7 @@ app.get('/health', async (req, res) => {
     res.json({
       status: (erroInicializacao || falhasMigracao.length) ? 'degradado' : 'ok',
       sistema: 'CEMIC Gestão',
-      versao: '3.35 (Backup do banco de dados)',
+      versao: '3.37 (Termo de Adesão ao Serviço Voluntário)',
       inicializacao: erroInicializacao || 'ok',
       migracoes_com_falha: falhasMigracao
     });
@@ -3776,7 +3932,7 @@ initDB()
     console.error('Falha ao inicializar o banco:', e);
   })
   .finally(() => app.listen(PORT, () => {
-    console.log(`CEMIC Gestão — backend v3.35 rodando na porta ${PORT}`);
+    console.log(`CEMIC Gestão — backend v3.37 rodando na porta ${PORT}`);
     if (erroInicializacao) console.error('ATENÇÃO: o sistema subiu com falha de inicialização —', erroInicializacao);
     if (falhasMigracao.length) console.error('ATENÇÃO: migrações com falha —', falhasMigracao.join(' | '));
   }));
