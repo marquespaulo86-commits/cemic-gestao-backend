@@ -3475,6 +3475,12 @@ app.post('/admin/backup/restaurar', express.json({ limit: '250mb' }), autenticar
 const TERMO_VIGENCIA = { inicio: '2026-08-01', fim: '2026-12-19' };
 const TERMO_VALOR_HORA_PADRAO = 33.33;
 
+// Matutino e vespertino ocorrem somente aos sábados; noturno em dias de semana.
+function diasDoTurnoTermo(turno) {
+  const t = (turno || '').toLowerCase();
+  return (t.startsWith('matut') || t.startsWith('vesper')) ? 'sábados' : '';
+}
+
 async function dadosTermoProfessor(req) {
   const profId = escopoProfessor(req);
   if (profId === null || profId === -1) return null;
@@ -3521,7 +3527,10 @@ app.post('/professor/termo', autenticar, somenteProfessor, async (req, res) => {
 
     const turnos = base.turnos.join(' e ') || null;
     const turmasResumo = base.turmas
-      .map(t => `${t.nome}${t.turno ? ' · ' + t.turno : ''}${t.horario ? ' · ' + t.horario : ''}`)
+      .map(t => {
+        const dias = diasDoTurnoTermo(t.turno);
+        return `${t.nome}${t.turno ? ' · ' + t.turno : ''}${t.horario ? ' · ' + t.horario : ''}${dias ? ' · ' + dias : ''}`;
+      })
       .join(' | ');
     const r = await pool.query(
       `INSERT INTO termos_adesao
