@@ -1,5 +1,5 @@
 // ============================================================
-// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v3.39 (… + Portal dos Pais + Pix Inter)
+// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v3.40 (… + Portal dos Pais + Pix Inter)
 // Banco + Autenticação com perfis + Configurações + CRUDs
 // Stack: Node.js/Express + PostgreSQL (Railway)
 // ============================================================
@@ -638,8 +638,18 @@ async function seedMaster() {
 // ============================================================
 const limiterLogin = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 10,
-  message: { erro: 'Muitas tentativas de login. Aguarde 15 minutos.' }
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  // Conta tentativas por CPF, não por IP: numa escola, dezenas de professores
+  // saem pelo mesmo IP (Wi-Fi/NAT) e travariam uns aos outros. O CPF isola cada conta.
+  keyGenerator: (req) => {
+    const cpf = String((req.body && req.body.cpf) || '').replace(/\D/g, '');
+    return cpf || (req.ip || 'sem-ip');
+  },
+  // Só tentativas malsucedidas contam; quem acerta a senha nunca é barrado.
+  skipSuccessfulRequests: true,
+  message: { erro: 'Muitas tentativas para este CPF. Aguarde 15 minutos ou peça à secretaria para redefinir seu acesso.' }
 });
 
 const limiterPublico = rateLimit({
@@ -3930,7 +3940,7 @@ app.get('/health', async (req, res) => {
     res.json({
       status: (erroInicializacao || falhasMigracao.length) ? 'degradado' : 'ok',
       sistema: 'CEMIC Gestão',
-      versao: '3.39 (Folha por período; nascimento nas matrículas)',
+      versao: '3.40 (Rate limit de login por CPF, não por IP)',
       inicializacao: erroInicializacao || 'ok',
       migracoes_com_falha: falhasMigracao
     });
@@ -3947,7 +3957,7 @@ initDB()
     console.error('Falha ao inicializar o banco:', e);
   })
   .finally(() => app.listen(PORT, () => {
-    console.log(`CEMIC Gestão — backend v3.39 rodando na porta ${PORT}`);
+    console.log(`CEMIC Gestão — backend v3.40 rodando na porta ${PORT}`);
     if (erroInicializacao) console.error('ATENÇÃO: o sistema subiu com falha de inicialização —', erroInicializacao);
     if (falhasMigracao.length) console.error('ATENÇÃO: migrações com falha —', falhasMigracao.join(' | '));
   }));
