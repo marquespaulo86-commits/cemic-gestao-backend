@@ -1,5 +1,5 @@
 // ============================================================
-// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v3.40 (… + Portal dos Pais + Pix Inter)
+// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v3.41 (… + Portal dos Pais + Pix Inter)
 // Banco + Autenticação com perfis + Configurações + CRUDs
 // Stack: Node.js/Express + PostgreSQL (Railway)
 // ============================================================
@@ -1273,6 +1273,30 @@ app.put('/admin/turmas/:id', autenticar, somenteGestao, async (req, res) => {
     console.error('Erro PUT turma:', e);
     res.status(500).json({ erro: 'Erro ao atualizar turma.' });
   }
+});
+
+app.post('/admin/turmas/padronizar-horarios', autenticar, exigirPerfil('master'), async (req, res) => {
+  try {
+    const PADRAO = {
+      Matutino: '8h às 11h45',
+      Vespertino: '13h30 às 17h15',
+      Noturno: '19h20 às 21h30'
+    };
+    // sobrescrever=false (padrão): só ajusta turmas cujo horário está vazio ou diferente do padrão do turno.
+    // sobrescrever=true: força o padrão em todas as turmas ativas com turno reconhecido.
+    const somenteVazias = req.body.somente_vazias === true;
+    const cond = somenteVazias ? "AND (horario IS NULL OR horario = '')" : '';
+    let total = 0;
+    for (const [turno, horario] of Object.entries(PADRAO)) {
+      const r = await pool.query(
+        `UPDATE turmas SET horario = $1
+         WHERE turno = $2 AND status <> 'encerrada' AND (horario IS DISTINCT FROM $1) ${cond}`,
+        [horario, turno]);
+      total += r.rowCount;
+    }
+    console.log(`Horários padronizados em ${total} turma(s) por ${req.usuario.nome}`);
+    res.json({ atualizadas: total });
+  } catch (e) { console.error('Erro padronizar horários:', e); res.status(500).json({ erro: 'Erro ao padronizar horários.' }); }
 });
 
 app.delete('/admin/turmas/:id', autenticar, somenteGestao, async (req, res) => {
@@ -3949,7 +3973,7 @@ app.get('/health', async (req, res) => {
     res.json({
       status: (erroInicializacao || falhasMigracao.length) ? 'degradado' : 'ok',
       sistema: 'CEMIC Gestão',
-      versao: '3.40 (Rate limit de login por CPF, não por IP)',
+      versao: '3.41 (Padronização de horários das turmas por turno)',
       inicializacao: erroInicializacao || 'ok',
       migracoes_com_falha: falhasMigracao
     });
@@ -3966,7 +3990,7 @@ initDB()
     console.error('Falha ao inicializar o banco:', e);
   })
   .finally(() => app.listen(PORT, () => {
-    console.log(`CEMIC Gestão — backend v3.40 rodando na porta ${PORT}`);
+    console.log(`CEMIC Gestão — backend v3.41 rodando na porta ${PORT}`);
     if (erroInicializacao) console.error('ATENÇÃO: o sistema subiu com falha de inicialização —', erroInicializacao);
     if (falhasMigracao.length) console.error('ATENÇÃO: migrações com falha —', falhasMigracao.join(' | '));
   }));
