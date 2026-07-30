@@ -1,5 +1,5 @@
 // ============================================================
-// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v3.41 (… + Portal dos Pais + Pix Inter)
+// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v3.42 (… + Portal dos Pais + Pix Inter + Carteira/Declaração do Professor)
 // Banco + Autenticação com perfis + Configurações + CRUDs
 // Stack: Node.js/Express + PostgreSQL (Railway)
 // ============================================================
@@ -363,6 +363,7 @@ async function initDB() {
     criado_em TIMESTAMP DEFAULT NOW()
   )`);
   await pool.query(`ALTER TABLE professores ADD COLUMN IF NOT EXISTS cpf TEXT`);
+  await pool.query(`ALTER TABLE professores ADD COLUMN IF NOT EXISTS data_ingresso DATE`);
   await pool.query(`CREATE TABLE IF NOT EXISTS professor_pagamentos (
     id SERIAL PRIMARY KEY,
     professor_id INTEGER NOT NULL REFERENCES professores(id) ON DELETE CASCADE,
@@ -436,6 +437,46 @@ async function initDB() {
   )`);
   await migrar('carteiras', `ALTER TABLE carteiras ADD COLUMN IF NOT EXISTS aluno_cpf TEXT`);
   await migrar('idx_carteiras_aluno_semestre', `CREATE UNIQUE INDEX IF NOT EXISTS idx_carteiras_aluno_semestre ON carteiras (aluno_id, semestre)`);
+  // ---------- Documentos do professor: foto, carteira e declaração de vínculo ----------
+  await migrar('professor_fotos', `CREATE TABLE IF NOT EXISTS professor_fotos (
+    professor_id INTEGER PRIMARY KEY REFERENCES professores(id) ON DELETE CASCADE,
+    mime TEXT NOT NULL,
+    tamanho INTEGER NOT NULL,
+    conteudo BYTEA NOT NULL,
+    enviada_em TIMESTAMP DEFAULT NOW()
+  )`);
+  await migrar('carteiras_professor', `CREATE TABLE IF NOT EXISTS carteiras_professor (
+    id SERIAL PRIMARY KEY,
+    codigo TEXT UNIQUE NOT NULL,
+    professor_id INTEGER REFERENCES professores(id) ON DELETE SET NULL,
+    professor_nome TEXT NOT NULL,
+    professor_cpf TEXT,
+    professor_codigo TEXT,
+    formacao TEXT,
+    funcao TEXT,
+    turnos TEXT,
+    semestre TEXT NOT NULL,
+    validade DATE,
+    emitida_em TIMESTAMP DEFAULT NOW()
+  )`);
+  await migrar('idx_cartprof_prof_sem', `CREATE UNIQUE INDEX IF NOT EXISTS idx_cartprof_prof_sem ON carteiras_professor (professor_id, semestre)`);
+  await migrar('declaracoes_professor', `CREATE TABLE IF NOT EXISTS declaracoes_professor (
+    id SERIAL PRIMARY KEY,
+    codigo TEXT UNIQUE NOT NULL,
+    professor_id INTEGER REFERENCES professores(id) ON DELETE SET NULL,
+    professor_nome TEXT NOT NULL,
+    professor_cpf TEXT,
+    formacao TEXT,
+    funcao TEXT,
+    data_ingresso DATE,
+    turmas_resumo TEXT,
+    turnos TEXT,
+    semestre TEXT,
+    vigencia_inicio DATE,
+    vigencia_fim DATE,
+    emitida_em TIMESTAMP DEFAULT NOW()
+  )`);
+  await migrar('idx_declprof_prof_vig', `CREATE UNIQUE INDEX IF NOT EXISTS idx_declprof_prof_vig ON declaracoes_professor (professor_id, vigencia_inicio)`);
   // ---------- Calendário acadêmico, Circulares e Sistema de Avaliação (v3.33) ----------
   await migrar('avaliacoes', `ALTER TABLE avaliacoes ADD COLUMN IF NOT EXISTS bimestre INTEGER`);
   await migrar('calendario', `CREATE TABLE IF NOT EXISTS calendario (
@@ -655,6 +696,19 @@ const limiterLogin = rateLimit({
 const limiterPublico = rateLimit({
   windowMs: 60 * 1000,
   max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { erro: 'Muitas requisições. Aguarde alguns instantes e tente novamente.' }
+});
+
+// Leitura leve dos dados institucionais (nome/CNPJ), chamada 1x ao entrar nos portais.
+// Fica separada e folgada porque dezenas de pais podem cair no mesmo IP público
+// (Wi-Fi da escola numa reunião, ou CGNAT das operadoras móveis) e travariam uns aos
+// outros no limite de 30/min. As rotas sensíveis (pré-inscrição, rematrícula, PIX)
+// continuam no limiterPublico de 30/min.
+const limiterInstitucional = rateLimit({
+  windowMs: 60 * 1000,
+  max: 300,
   standardHeaders: true,
   legacyHeaders: false,
   message: { erro: 'Muitas requisições. Aguarde alguns instantes e tente novamente.' }
@@ -1084,8 +1138,8 @@ app.post('/admin/professores', autenticar, somenteGestao, async (req, res) => {
     const erro = obrigatorios(req.body, ['nome']);
     if (erro) return res.status(400).json({ erro });
     const r = await pool.query(
-      `INSERT INTO professores (nome, cpf, email, formacao, whatsapp, data_nascimento) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
-      [req.body.nome, req.body.cpf || null, req.body.email || null, req.body.formacao || null, req.body.whatsapp || null, req.body.data_nascimento || null]
+      `INSERT INTO professores (nome, cpf, email, formacao, whatsapp, data_nascimento, data_ingresso) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
+      [req.body.nome, req.body.cpf || null, req.body.email || null, req.body.formacao || null, req.body.whatsapp || null, req.body.data_nascimento || null, req.body.data_ingresso || null]
     );
     res.status(201).json(r.rows[0]);
   } catch (e) {
@@ -1100,11 +1154,11 @@ app.put('/admin/professores/:id', autenticar, somenteGestao, async (req, res) =>
     if (!atual.rows.length) return res.status(404).json({ erro: 'Professor não encontrado.' });
     const x = atual.rows[0];
     const r = await pool.query(
-      `UPDATE professores SET nome=$1, cpf=$2, email=$3, formacao=$4, whatsapp=$5, data_nascimento=$6, status=$7 WHERE id=$8 RETURNING *`,
+      `UPDATE professores SET nome=$1, cpf=$2, email=$3, formacao=$4, whatsapp=$5, data_nascimento=$6, data_ingresso=$7, status=$8 WHERE id=$9 RETURNING *`,
       [
         req.body.nome ?? x.nome, req.body.cpf ?? x.cpf, req.body.email ?? x.email, req.body.formacao ?? x.formacao,
         req.body.whatsapp ?? x.whatsapp, req.body.data_nascimento ?? x.data_nascimento,
-        req.body.status ?? x.status, req.params.id
+        req.body.data_ingresso ?? x.data_ingresso, req.body.status ?? x.status, req.params.id
       ]
     );
     res.json(r.rows[0]);
@@ -1997,7 +2051,7 @@ const PASTA_PUBLIC = path.join(__dirname, 'public');
 // ============================================================
 // PORTAL DOS PAIS — PRÉ-INSCRIÇÃO ONLINE (públicas, sem autenticação)
 // ============================================================
-app.get('/publico/instituicao', limiterPublico, async (req, res) => {
+app.get('/publico/instituicao', limiterInstitucional, async (req, res) => {
   try {
     const inst = await getConfig('dados_instituicao', {}) || {};
     res.json({
@@ -2938,16 +2992,45 @@ app.get('/publico/verificar/:codigo', async (req, res) => {
       // Pode ser uma carteira estudantil
       const c = await pool.query(
         `SELECT codigo, aluno_nome, aluno_cpf, aluno_codigo, curso, modulo, turma_nome, turno, semestre, validade, emitida_em FROM carteiras WHERE codigo = $1`, [codigo]);
-      if (!c.rows.length) return res.status(404).json({ valido: false, erro: 'Documento não encontrado. Verifique o código.' });
-      const k = c.rows[0];
-      const vencida = k.validade ? (new Date(k.validade) < new Date(new Date().toDateString())) : false;
-      const cpfK = (k.aluno_cpf || '').replace(/\D/g, '');
-      const cpfKMasc = cpfK.length === 11 ? `${cpfK.slice(0, 3)}.***.***-${cpfK.slice(9)}` : null;
-      return res.json({
-        valido: true, codigo: k.codigo, tipo: 'carteira', aluno_nome: k.aluno_nome, aluno_cpf: cpfKMasc, aluno_codigo: k.aluno_codigo,
-        curso: k.curso, modulo: k.modulo, turma_nome: k.turma_nome, turno: k.turno, semestre: k.semestre,
-        validade: k.validade, situacao: vencida ? 'expirada' : 'vigente', emitida_em: k.emitida_em
-      });
+      if (c.rows.length) {
+        const k = c.rows[0];
+        const vencida = k.validade ? (new Date(k.validade) < new Date(new Date().toDateString())) : false;
+        const cpfK = (k.aluno_cpf || '').replace(/\D/g, '');
+        const cpfKMasc = cpfK.length === 11 ? `${cpfK.slice(0, 3)}.***.***-${cpfK.slice(9)}` : null;
+        return res.json({
+          valido: true, codigo: k.codigo, tipo: 'carteira', aluno_nome: k.aluno_nome, aluno_cpf: cpfKMasc, aluno_codigo: k.aluno_codigo,
+          curso: k.curso, modulo: k.modulo, turma_nome: k.turma_nome, turno: k.turno, semestre: k.semestre,
+          validade: k.validade, situacao: vencida ? 'expirada' : 'vigente', emitida_em: k.emitida_em
+        });
+      }
+      // Pode ser a carteira do professor
+      const cpr = await pool.query(
+        `SELECT codigo, professor_nome, professor_cpf, professor_codigo, formacao, funcao, turnos, semestre, validade, emitida_em FROM carteiras_professor WHERE codigo = $1`, [codigo]);
+      if (cpr.rows.length) {
+        const k = cpr.rows[0];
+        const vencida = k.validade ? (new Date(k.validade) < new Date(new Date().toDateString())) : false;
+        const cpfK = (k.professor_cpf || '').replace(/\D/g, '');
+        const cpfKMasc = cpfK.length === 11 ? `${cpfK.slice(0, 3)}.***.***-${cpfK.slice(9)}` : null;
+        return res.json({
+          valido: true, codigo: k.codigo, tipo: 'carteira_professor', professor_nome: k.professor_nome, professor_cpf: cpfKMasc,
+          professor_codigo: k.professor_codigo, formacao: k.formacao, funcao: k.funcao, turnos: k.turnos, semestre: k.semestre,
+          validade: k.validade, situacao: vencida ? 'expirada' : 'vigente', emitida_em: k.emitida_em
+        });
+      }
+      // Pode ser a declaração de vínculo do professor
+      const dpr = await pool.query(
+        `SELECT codigo, professor_nome, professor_cpf, formacao, funcao, data_ingresso, turmas_resumo, turnos, semestre, vigencia_inicio, vigencia_fim, emitida_em FROM declaracoes_professor WHERE codigo = $1`, [codigo]);
+      if (dpr.rows.length) {
+        const k = dpr.rows[0];
+        const cpfK = (k.professor_cpf || '').replace(/\D/g, '');
+        const cpfKMasc = cpfK.length === 11 ? `${cpfK.slice(0, 3)}.***.***-${cpfK.slice(9)}` : null;
+        return res.json({
+          valido: true, codigo: k.codigo, tipo: 'vinculo_professor', professor_nome: k.professor_nome, professor_cpf: cpfKMasc,
+          formacao: k.formacao, funcao: k.funcao, data_ingresso: k.data_ingresso, turnos: k.turnos, semestre: k.semestre,
+          vigencia_inicio: k.vigencia_inicio, vigencia_fim: k.vigencia_fim, emitida_em: k.emitida_em
+        });
+      }
+      return res.status(404).json({ valido: false, erro: 'Documento não encontrado. Verifique o código.' });
     }
     const d = r.rows[0];
     const cpf = (d.aluno_cpf || '').replace(/\D/g, '');
@@ -3615,6 +3698,202 @@ app.delete('/admin/termos/:id', autenticar, exigirPerfil('master'), async (req, 
   } catch (e) { console.error('Erro DELETE termo:', e); res.status(500).json({ erro: 'Erro ao excluir o termo.' }); }
 });
 
+// ============================================================
+// DOCUMENTOS DO PROFESSOR — foto, carteira e declaração de vínculo
+// ============================================================
+// Reúne o cadastro do professor (referenciado pelo usuário logado), o CPF
+// (do cadastro; na falta, o do usuário), as turmas ativas e o semestre.
+async function dadosProfessorDoc(req) {
+  const profId = escopoProfessor(req);
+  if (profId === null || profId === -1) return null;
+  const p = await pool.query(
+    `SELECT id, nome, codigo, cpf, email, formacao, whatsapp, data_ingresso FROM professores WHERE id = $1`, [profId]);
+  if (!p.rows.length) return null;
+  const u = await pool.query(`SELECT cpf FROM usuarios WHERE id = $1`, [req.usuario.id]);
+  const t = await pool.query(
+    `SELECT nome, turno, horario, semestre FROM turmas
+     WHERE professor_id = $1 AND status <> 'encerrada' ORDER BY turno, nome`, [profId]);
+  const prof = p.rows[0];
+  const cpf = (prof.cpf || (u.rows[0] && u.rows[0].cpf) || null);
+  const turnos = [...new Set(t.rows.map(x => x.turno).filter(Boolean))];
+  const semestre = (t.rows.find(x => x.semestre) || {}).semestre || null;
+  return { professor: { ...prof, cpf }, turmas: t.rows, turnos, semestre };
+}
+
+// Código único verificável, checado contra todas as tabelas de documentos
+async function codigoDocumentoUnico() {
+  for (let i = 0; i < 8; i++) {
+    const cand = 'CEMIC-' + crypto.randomBytes(2).toString('hex').toUpperCase() + '-' + crypto.randomBytes(2).toString('hex').toUpperCase();
+    const ex = await pool.query(
+      `SELECT 1 FROM declaracoes WHERE codigo = $1
+       UNION ALL SELECT 1 FROM carteiras WHERE codigo = $1
+       UNION ALL SELECT 1 FROM termos_adesao WHERE codigo = $1
+       UNION ALL SELECT 1 FROM carteiras_professor WHERE codigo = $1
+       UNION ALL SELECT 1 FROM declaracoes_professor WHERE codigo = $1`, [cand]);
+    if (!ex.rows.length) return cand;
+  }
+  return null;
+}
+
+const PROF_FUNCAO = 'Professor(a) voluntário(a)';
+
+// --- Foto do professor (enviada por ele mesmo; uma por professor) ---
+app.post('/professor/foto', autenticar, somenteProfessor, async (req, res) => {
+  try {
+    const profId = escopoProfessor(req);
+    if (profId === null || profId === -1) return res.status(403).json({ erro: 'Disponível apenas para usuários com perfil professor vinculado a um cadastro.' });
+    const f = fotoDoCorpo(req.body);
+    if (f.erro) return res.status(400).json({ erro: f.erro });
+    await pool.query(
+      `INSERT INTO professor_fotos (professor_id, mime, tamanho, conteudo, enviada_em)
+       VALUES ($1, $2, $3, $4, NOW())
+       ON CONFLICT (professor_id) DO UPDATE
+         SET mime = EXCLUDED.mime, tamanho = EXCLUDED.tamanho, conteudo = EXCLUDED.conteudo, enviada_em = NOW()`,
+      [profId, f.mime, f.buf.length, f.buf]);
+    res.status(201).json({ ok: true, tamanho: f.buf.length });
+  } catch (e) { console.error('Erro enviar foto do professor:', e); res.status(500).json({ erro: 'Erro ao enviar a foto.' }); }
+});
+
+app.delete('/professor/foto', autenticar, somenteProfessor, async (req, res) => {
+  try {
+    const profId = escopoProfessor(req);
+    if (profId === null || profId === -1) return res.status(403).json({ erro: 'Disponível apenas para usuários com perfil professor vinculado a um cadastro.' });
+    await pool.query(`DELETE FROM professor_fotos WHERE professor_id = $1`, [profId]);
+    res.json({ ok: true });
+  } catch (e) { console.error('Erro remover foto do professor:', e); res.status(500).json({ erro: 'Erro ao remover a foto.' }); }
+});
+
+// A Gestão pode remover uma foto inadequada
+app.delete('/admin/professores/:id/foto', autenticar, somenteGestao, async (req, res) => {
+  try {
+    await pool.query(`DELETE FROM professor_fotos WHERE professor_id = $1`, [Number(req.params.id)]);
+    res.json({ ok: true });
+  } catch (e) { console.error('Erro remover foto do professor (gestão):', e); res.status(500).json({ erro: 'Erro ao remover a foto.' }); }
+});
+
+// Entrega autenticada da foto: o próprio professor ou a gestão; nunca URL pública
+app.get('/arquivos/professor-foto/:id', async (req, res) => {
+  try {
+    const header = req.headers.authorization || '';
+    const token = req.query.token || (header.startsWith('Bearer ') ? header.slice(7) : null);
+    if (!token) return res.status(401).json({ erro: 'Token não fornecido.' });
+    let dados;
+    try { dados = jwt.verify(token, JWT_SECRET); } catch { return res.status(401).json({ erro: 'Token inválido ou expirado.' }); }
+    const profId = Number(req.params.id);
+    if (dados.perfil === 'professor') {
+      if (Number(dados.referencia_id) !== profId) return res.status(403).json({ erro: 'Acesso negado.' });
+    } else if (!['master', 'secretaria'].includes(dados.perfil)) {
+      return res.status(403).json({ erro: 'Acesso negado.' });
+    }
+    const r = await pool.query(`SELECT mime, conteudo FROM professor_fotos WHERE professor_id = $1`, [profId]);
+    if (!r.rows.length) return res.status(404).json({ erro: 'Foto não encontrada.' });
+    res.setHeader('Content-Type', r.rows[0].mime);
+    res.setHeader('Cache-Control', 'private, no-store');
+    res.send(r.rows[0].conteudo);
+  } catch (e) { console.error('Erro baixar foto do professor:', e); res.status(500).json({ erro: 'Erro ao carregar a foto.' }); }
+});
+
+// Situação da carteira e da foto (monta a tela sem emitir nada)
+app.get('/professor/carteira', autenticar, somenteProfessor, async (req, res) => {
+  try {
+    const base = await dadosProfessorDoc(req);
+    if (!base) return res.status(403).json({ erro: 'Disponível apenas para usuários com perfil professor vinculado a um cadastro.' });
+    const foto = await pool.query(`SELECT tamanho, enviada_em FROM professor_fotos WHERE professor_id = $1`, [base.professor.id]);
+    const cart = base.semestre
+      ? await pool.query(`SELECT codigo, emitida_em, validade FROM carteiras_professor WHERE professor_id = $1 AND semestre = $2`, [base.professor.id, base.semestre])
+      : { rows: [] };
+    res.json({
+      professor_id: base.professor.id,
+      tem_foto: foto.rows.length > 0,
+      foto_enviada_em: foto.rows.length ? foto.rows[0].enviada_em : null,
+      semestre: base.semestre,
+      emitida: cart.rows.length > 0,
+      codigo: cart.rows.length ? cart.rows[0].codigo : null,
+      validade: cart.rows.length ? cart.rows[0].validade : null
+    });
+  } catch (e) { console.error('Erro consultar carteira do professor:', e); res.status(500).json({ erro: 'Erro ao carregar a carteira.' }); }
+});
+
+// Emissão da carteira: uma por professor e semestre (reemitir devolve a mesma)
+app.post('/professor/carteira', autenticar, somenteProfessor, async (req, res) => {
+  try {
+    const base = await dadosProfessorDoc(req);
+    if (!base) return res.status(403).json({ erro: 'Disponível apenas para usuários com perfil professor vinculado a um cadastro.' });
+    if (!base.semestre) return res.status(400).json({ erro: 'A carteira é emitida quando você tem turma vinculada no semestre. Procure a coordenação.' });
+    const semestre = base.semestre;
+    const validade = fimDoSemestre(semestre);
+    const turnos = base.turnos.join(' e ') || null;
+    const P = base.professor;
+
+    const existente = await pool.query(`SELECT codigo, emitida_em FROM carteiras_professor WHERE professor_id = $1 AND semestre = $2`, [P.id, semestre]);
+    let codigo, emitidaEm;
+    if (existente.rows.length) {
+      codigo = existente.rows[0].codigo;
+      emitidaEm = existente.rows[0].emitida_em;
+      await pool.query(
+        `UPDATE carteiras_professor SET professor_nome = $1, professor_cpf = $2, professor_codigo = $3, formacao = $4, funcao = $5, turnos = $6, validade = $7
+         WHERE codigo = $8`,
+        [P.nome, P.cpf, P.codigo || null, P.formacao || null, PROF_FUNCAO, turnos, validade, codigo]);
+    } else {
+      codigo = await codigoDocumentoUnico();
+      if (!codigo) return res.status(500).json({ erro: 'Não foi possível gerar o código da carteira. Tente novamente.' });
+      const ins = await pool.query(
+        `INSERT INTO carteiras_professor (codigo, professor_id, professor_nome, professor_cpf, professor_codigo, formacao, funcao, turnos, semestre, validade)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING emitida_em`,
+        [codigo, P.id, P.nome, P.cpf, P.codigo || null, P.formacao || null, PROF_FUNCAO, turnos, semestre, validade]);
+      emitidaEm = ins.rows[0].emitida_em;
+    }
+
+    const foto = await pool.query(`SELECT 1 FROM professor_fotos WHERE professor_id = $1`, [P.id]);
+    res.status(201).json({
+      codigo, emitida_em: emitidaEm, professor_id: P.id, professor_nome: P.nome, professor_cpf: P.cpf, professor_codigo: P.codigo || null,
+      formacao: P.formacao || null, funcao: PROF_FUNCAO, turnos, semestre, validade, tem_foto: foto.rows.length > 0
+    });
+  } catch (e) { console.error('Erro emitir carteira do professor:', e); res.status(500).json({ erro: 'Erro ao emitir a carteira.' }); }
+});
+
+// Emissão da declaração de vínculo (uma por professor e vigência; reemitir devolve a mesma)
+app.post('/professor/declaracao-vinculo', autenticar, somenteProfessor, async (req, res) => {
+  try {
+    const base = await dadosProfessorDoc(req);
+    if (!base) return res.status(403).json({ erro: 'Disponível apenas para usuários com perfil professor vinculado a um cadastro.' });
+    const P = base.professor;
+    const turmasResumo = base.turmas
+      .map(t => `${t.nome}${t.turno ? ' · ' + t.turno : ''}${t.horario ? ' · ' + t.horario : ''}`)
+      .join(' | ') || null;
+    const turnos = base.turnos.join(' e ') || null;
+    const semestre = base.semestre;
+
+    const existente = await pool.query(
+      `SELECT codigo, emitida_em FROM declaracoes_professor WHERE professor_id = $1 AND vigencia_inicio = $2`,
+      [P.id, TERMO_VIGENCIA.inicio]);
+    let codigo, emitidaEm;
+    if (existente.rows.length) {
+      codigo = existente.rows[0].codigo;
+      emitidaEm = existente.rows[0].emitida_em;
+      await pool.query(
+        `UPDATE declaracoes_professor SET professor_nome = $1, professor_cpf = $2, formacao = $3, funcao = $4, data_ingresso = $5,
+             turmas_resumo = $6, turnos = $7, semestre = $8, vigencia_fim = $9
+         WHERE codigo = $10`,
+        [P.nome, P.cpf, P.formacao || null, PROF_FUNCAO, P.data_ingresso || null, turmasResumo, turnos, semestre, TERMO_VIGENCIA.fim, codigo]);
+    } else {
+      codigo = await codigoDocumentoUnico();
+      if (!codigo) return res.status(500).json({ erro: 'Não foi possível gerar o código da declaração. Tente novamente.' });
+      const ins = await pool.query(
+        `INSERT INTO declaracoes_professor
+           (codigo, professor_id, professor_nome, professor_cpf, formacao, funcao, data_ingresso, turmas_resumo, turnos, semestre, vigencia_inicio, vigencia_fim)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING emitida_em`,
+        [codigo, P.id, P.nome, P.cpf, P.formacao || null, PROF_FUNCAO, P.data_ingresso || null, turmasResumo, turnos, semestre, TERMO_VIGENCIA.inicio, TERMO_VIGENCIA.fim]);
+      emitidaEm = ins.rows[0].emitida_em;
+    }
+    res.status(201).json({
+      codigo, emitida_em: emitidaEm, professor_nome: P.nome, professor_cpf: P.cpf, formacao: P.formacao || null,
+      funcao: PROF_FUNCAO, data_ingresso: P.data_ingresso || null, turmas_resumo: turmasResumo, turnos, semestre,
+      vigencia_inicio: TERMO_VIGENCIA.inicio, vigencia_fim: TERMO_VIGENCIA.fim
+    });
+  } catch (e) { console.error('Erro emitir declaração de vínculo:', e); res.status(500).json({ erro: 'Erro ao emitir a declaração.' }); }
+});
+
 // ---------- Folha de professores (hora-aula) ----------
 app.post('/admin/professor-horas', autenticar, somenteGestao, async (req, res) => {
   try {
@@ -3973,7 +4252,7 @@ app.get('/health', async (req, res) => {
     res.json({
       status: (erroInicializacao || falhasMigracao.length) ? 'degradado' : 'ok',
       sistema: 'CEMIC Gestão',
-      versao: '3.41 (Padronização de horários das turmas por turno)',
+      versao: '3.42 (Carteira e Declaração de Vínculo do Professor + limiter institucional)',
       inicializacao: erroInicializacao || 'ok',
       migracoes_com_falha: falhasMigracao
     });
@@ -3990,7 +4269,7 @@ initDB()
     console.error('Falha ao inicializar o banco:', e);
   })
   .finally(() => app.listen(PORT, () => {
-    console.log(`CEMIC Gestão — backend v3.41 rodando na porta ${PORT}`);
+    console.log(`CEMIC Gestão — backend v3.42 rodando na porta ${PORT}`);
     if (erroInicializacao) console.error('ATENÇÃO: o sistema subiu com falha de inicialização —', erroInicializacao);
     if (falhasMigracao.length) console.error('ATENÇÃO: migrações com falha —', falhasMigracao.join(' | '));
   }));
