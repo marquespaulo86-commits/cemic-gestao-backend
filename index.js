@@ -1,5 +1,5 @@
 // ============================================================
-// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v3.42 (… + Portal dos Pais + Pix Inter + Carteira/Declaração do Professor)
+// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v3.43 (… + Carteira/Declaração do Professor + Folha de Chamada)
 // Banco + Autenticação com perfis + Configurações + CRUDs
 // Stack: Node.js/Express + PostgreSQL (Railway)
 // ============================================================
@@ -1259,6 +1259,45 @@ app.delete('/admin/niveis/:id', autenticar, somenteGestao, async (req, res) => {
 // ============================================================
 // 8. CRUD — TURMAS
 // ============================================================
+// Folha física de chamada por professor: turmas, alunos ativos e sábados letivos do calendário
+app.get('/admin/professores/:id/folha-chamada', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const profId = Number(req.params.id);
+    const semestre = req.query.semestre || await getConfig('semestre_vigente', '2026.2');
+    const prof = await pool.query(`SELECT nome, codigo FROM professores WHERE id = $1`, [profId]);
+    if (!prof.rows.length) return res.status(404).json({ erro: 'Professor não encontrado.' });
+    const inst = (await getConfig('dados_instituicao', {})) || {};
+
+    const turmasQ = await pool.query(
+      `SELECT t.id, t.nome, t.turno, t.horario, n.nome AS nivel_nome
+         FROM turmas t JOIN niveis n ON n.id = t.nivel_id
+        WHERE t.professor_id = $1 AND t.semestre = $2 AND t.status <> 'encerrada'
+        ORDER BY t.turno, t.nome`, [profId, semestre]);
+    const turmas = [];
+    for (const t of turmasQ.rows) {
+      const al = await pool.query(
+        `SELECT a.nome FROM matriculas m JOIN alunos a ON a.id = m.aluno_id
+          WHERE m.turma_id = $1 AND m.status = 'ativa' ORDER BY a.nome`, [t.id]);
+      turmas.push({ nome: t.nome, turno: t.turno, horario: t.horario, nivel_nome: t.nivel_nome, alunos: al.rows.map(r => r.nome) });
+    }
+
+    // Dias de aula do semestre (exclui rematrícula, que é do semestre seguinte)
+    const cal = await pool.query(
+      `SELECT to_char(data, 'YYYY-MM-DD') AS data, titulo, modalidade
+         FROM calendario
+        WHERE semestre = $1 AND titulo NOT ILIKE '%rematr%'
+        ORDER BY data`, [semestre]);
+
+    res.json({
+      professor: prof.rows[0],
+      semestre,
+      instituicao: { nome: inst.nome || 'CEMIC — Centro Maranhense de Idiomas e Culturas', cnpj: inst.cnpj || '' },
+      sabados: cal.rows,
+      turmas
+    });
+  } catch (e) { console.error('Erro folha de chamada:', e); res.status(500).json({ erro: 'Erro ao montar a folha de chamada.' }); }
+});
+
 app.get('/admin/turmas', autenticar, somenteGestao, async (req, res) => {
   try {
     const { semestre, status } = req.query;
@@ -4252,7 +4291,7 @@ app.get('/health', async (req, res) => {
     res.json({
       status: (erroInicializacao || falhasMigracao.length) ? 'degradado' : 'ok',
       sistema: 'CEMIC Gestão',
-      versao: '3.42 (Carteira e Declaração de Vínculo do Professor + limiter institucional)',
+      versao: '3.43 (Folha de chamada por professor + Carteira/Declaração do Professor)',
       inicializacao: erroInicializacao || 'ok',
       migracoes_com_falha: falhasMigracao
     });
@@ -4269,7 +4308,7 @@ initDB()
     console.error('Falha ao inicializar o banco:', e);
   })
   .finally(() => app.listen(PORT, () => {
-    console.log(`CEMIC Gestão — backend v3.42 rodando na porta ${PORT}`);
+    console.log(`CEMIC Gestão — backend v3.43 rodando na porta ${PORT}`);
     if (erroInicializacao) console.error('ATENÇÃO: o sistema subiu com falha de inicialização —', erroInicializacao);
     if (falhasMigracao.length) console.error('ATENÇÃO: migrações com falha —', falhasMigracao.join(' | '));
   }));
