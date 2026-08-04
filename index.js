@@ -730,6 +730,15 @@ const limiterInstitucional = rateLimit({
   message: { erro: 'Muitas requisições. Aguarde alguns instantes e tente novamente.' }
 });
 
+// IA da English Platform (assistente + dicionário): limita custo/abuso mesmo com login.
+const limiterIA = rateLimit({
+  windowMs: 60 * 1000,
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { erro: 'Muitas perguntas em pouco tempo. Aguarde um instante.' }
+});
+
 function autenticar(req, res, next) {
   const header = req.headers.authorization || '';
   const token = header.startsWith('Bearer ') ? header.slice(7) : null;
@@ -2313,6 +2322,32 @@ app.post('/publico/portal/english-platform/solicitar', autenticarResponsavel, as
     }
     res.status(201).json({ ok: true, solicitados: pedidos.length, alunos: await statusEnglishPlatform(req.responsavelId) });
   } catch (e) { console.error('Erro EP solicitar:', e); res.status(500).json({ erro: 'Erro ao registrar a solicitação de acesso.' }); }
+});
+
+// English Platform · IA (assistente + dicionário). Proxy server-side para não expor a chave no navegador.
+// Só para responsáveis autenticados e com limite de uso. Configure ANTHROPIC_API_KEY no ambiente (Railway).
+app.post('/publico/portal/assistant', autenticarResponsavel, limiterIA, async (req, res) => {
+  try {
+    const key = process.env.ANTHROPIC_API_KEY;
+    if (!key) return res.status(503).json({ erro: 'Assistente indisponível: falta configurar a chave da IA no servidor.' });
+    const system = String((req.body && req.body.system) || '').slice(0, 4000);
+    const user = String((req.body && req.body.user) || '').slice(0, 4000);
+    if (!user) return res.status(400).json({ erro: 'Mensagem vazia.' });
+    const r = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': key, 'anthropic-version': '2023-06-01' },
+      body: JSON.stringify({
+        model: process.env.EP_AI_MODEL || 'claude-sonnet-4-5',
+        max_tokens: 1000,
+        ...(system ? { system } : {}),
+        messages: [{ role: 'user', content: user }]
+      })
+    });
+    const data = await r.json();
+    if (!r.ok) { console.error('Erro IA upstream:', data && data.error); return res.status(502).json({ erro: 'A IA não respondeu agora. Tente novamente.' }); }
+    const text = (data.content || []).filter(b => b.type === 'text').map(b => b.text).join('\n').trim();
+    res.json({ text });
+  } catch (e) { console.error('Erro assistant:', e); res.status(500).json({ erro: 'Erro no assistente.' }); }
 });
 
 // ---------- English Platform · painel do master ----------
@@ -4437,7 +4472,7 @@ app.get('/health', async (req, res) => {
     res.json({
       status: (erroInicializacao || falhasMigracao.length) ? 'degradado' : 'ok',
       sistema: 'CEMIC Gestão',
-      versao: '3.44 (English Platform — liberação de acesso pelo master)',
+      versao: '3.45 (English Platform — IA do assistente/dicionário no servidor)',
       inicializacao: erroInicializacao || 'ok',
       migracoes_com_falha: falhasMigracao
     });
