@@ -1,3022 +1,4659 @@
+// ============================================================
+// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v3.43 (… + Carteira/Declaração do Professor + Folha de Chamada)
+// Banco + Autenticação com perfis + Configurações + CRUDs
+// Stack: Node.js/Express + PostgreSQL (Railway)
+// ============================================================
+
 const express = require('express');
-const cors = require('cors');
-const compression = require('compression');
-const { Pool } = require('pg');
-const bcrypt = require('bcrypt');
-const app = express();
-const SALT_ROUNDS = 12;
-app.use(compression()); // gzip
-
-// A4: headers de segurança
-app.disable('x-powered-by');
-app.use((req, res, next) => {
-  res.setHeader('X-Content-Type-Options', 'nosniff');
-  res.setHeader('X-Frame-Options', 'DENY');
-  res.setHeader('X-XSS-Protection', '1; mode=block');
-  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
-  res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
-  res.setHeader('Content-Security-Policy', "default-src 'none'; frame-ancestors 'none'");
-  res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=(), payment=()');
-  next();
-});
-
-// ── CORS ──────────────────────────────────────────────────────────────
-const allowedOrigins = [
-  'https://redacheck.com.br',
-  'https://www.redacheck.com.br',
-  'https://merry-valkyrie-60e85b.netlify.app',
-  'http://localhost:3000',
-  'http://localhost:5500',
-  'http://127.0.0.1:5500'
-];
-
-app.use(cors({
-  origin: function(origin, callback) {
-    if (!origin) return callback(null, true);
-    if (allowedOrigins.includes(origin)) return callback(null, true);
-    if (origin.endsWith('.netlify.app')) return callback(null, true);
-    callback(new Error('CORS: origem não permitida — ' + origin));
-  },
-  methods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'x-master-token'],
-  credentials: true
-}));
-
-app.use(express.json({ limit: '10mb' }));
-
-// ── CONEXÃO POSTGRESQL ────────────────────────────────────────────────
-if (!process.env.DATABASE_URL) { console.error('❌ DATABASE_URL não configurada!'); process.exit(1); }
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false },
-  max: 10,
-  idleTimeoutMillis: 30000,
-  connectionTimeoutMillis: 5000
-});
-
-// ── HELPER DE LOG ─────────────────────────────────────────────────────
-// Registra qualquer ação do usuário na tabela logs_usuario
-// Nunca lança exceção — log nunca deve interromper o fluxo principal
-async function log(usuarioId, email, acao, status, detalhes = {}, ip = null) {
-  try {
-    await pool.query(
-      `INSERT INTO logs_usuario (usuario_id, email, acao, status, detalhes, ip)
-       VALUES ($1, $2, $3, $4, $5, $6)`,
-      [usuarioId || null, email || null, acao, status || 'ok', JSON.stringify(detalhes), ip || null]
-    );
-  } catch (e) {
-    console.error('[log] Falha ao registrar log:', e.message);
-  }
-}
-
-// ── RESEND ────────────────────────────────────────────────────────────
-async function enviarEmail(to, subject, html) {
-  const apiKey = process.env.RESEND_API_KEY;
-  if (!apiKey) { console.error('RESEND_API_KEY não configurada'); return; }
-  const from = process.env.RESEND_FROM_EMAIL
-    ? `RedaCheck <${process.env.RESEND_FROM_EMAIL}>`
-    : 'RedaCheck <onboarding@resend.dev>';
-  console.log(`[email] Enviando para: ${to} | De: ${from} | Assunto: ${subject}`);
-  const resp = await fetch('https://api.resend.com/emails', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
-    body: JSON.stringify({ from, to: [to], subject, html })
-  });
-  const data = await resp.json();
-  if (!resp.ok) {
-    console.error('[email] Resend retornou erro:', JSON.stringify(data));
-    throw new Error('Resend erro: ' + JSON.stringify(data));
-  }
-  console.log('[email] Enviado com sucesso! ID:', data.id);
-}
-
-// ── CRIAR TABELAS ─────────────────────────────────────────────────────
-async function inicializarBanco() {
-  const client = await pool.connect();
-  try {
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS conversas (
-        id          BIGSERIAL PRIMARY KEY,
-        usuario     TEXT NOT NULL DEFAULT 'Anônimo',
-        mensagens   JSONB NOT NULL DEFAULT '[]',
-        data_inicio TIMESTAMPTZ DEFAULT NOW(),
-        duracao     INTEGER DEFAULT 0,
-        status      TEXT DEFAULT 'novo',
-        tags        JSONB DEFAULT '[]',
-        nota_operador TEXT DEFAULT '',
-        created_at  TIMESTAMPTZ DEFAULT NOW()
-      );
-      CREATE TABLE IF NOT EXISTS feedbacks (
-        id           BIGSERIAL PRIMARY KEY,
-        usuario      TEXT NOT NULL DEFAULT 'Anônimo',
-        nota         INTEGER DEFAULT 0,
-        comentario   TEXT DEFAULT '',
-        banca        TEXT DEFAULT 'ENEM',
-        nota_redacao INTEGER DEFAULT 0,
-        status       TEXT DEFAULT 'novo',
-        aprovado     BOOLEAN DEFAULT FALSE,
-        created_at   TIMESTAMPTZ DEFAULT NOW()
-      );
-      CREATE TABLE IF NOT EXISTS sugestoes (
-        id            BIGSERIAL PRIMARY KEY,
-        usuario       TEXT NOT NULL DEFAULT 'Anônimo',
-        texto         TEXT NOT NULL DEFAULT '',
-        status        TEXT DEFAULT 'novo',
-        nota_operador TEXT DEFAULT '',
-        created_at    TIMESTAMPTZ DEFAULT NOW()
-      );
-      CREATE TABLE IF NOT EXISTS usuarios (
-        id                     BIGSERIAL PRIMARY KEY,
-        nome                   TEXT NOT NULL,
-        email                  TEXT UNIQUE NOT NULL,
-        senha_hash             TEXT NOT NULL DEFAULT '',
-        codigo                 TEXT UNIQUE NOT NULL,
-        banca                  TEXT DEFAULT 'ENEM',
-        plano                  TEXT DEFAULT 'aluno',
-        saldo                  NUMERIC(10,2) DEFAULT 0,
-        total_redacoes         INTEGER DEFAULT 0,
-        professor_status       TEXT DEFAULT 'nao',
-        confirmado             BOOLEAN DEFAULT FALSE,
-        codigo_confirmacao     TEXT,
-        codigo_expira          TIMESTAMPTZ,
-        whatsapp               TEXT,
-        whatsapp_mkt           BOOLEAN DEFAULT FALSE,
-        professor              TEXT DEFAULT 'nao',
-        cnd_arquivo            TEXT,
-        desconto_professor     BOOLEAN DEFAULT FALSE,
-        avaliacoes_disponiveis INTEGER DEFAULT 0,
-        codigo_indicante       TEXT,
-        total_indicacoes       INTEGER DEFAULT 0,
-        created_at             TIMESTAMPTZ DEFAULT NOW(),
-        updated_at             TIMESTAMPTZ DEFAULT NOW()
-      );
-      CREATE TABLE IF NOT EXISTS avaliacoes (
-        id          BIGSERIAL PRIMARY KEY,
-        usuario_id  BIGINT REFERENCES usuarios(id),
-        usuario     TEXT NOT NULL,
-        banca       TEXT DEFAULT 'ENEM',
-        nota_geral  INTEGER DEFAULT 0,
-        resultado   JSONB,
-        redacao     TEXT,
-        created_at  TIMESTAMPTZ DEFAULT NOW()
-      );
-      CREATE TABLE IF NOT EXISTS professores (
-        id            BIGSERIAL PRIMARY KEY,
-        usuario       TEXT NOT NULL,
-        nivel         TEXT,
-        disciplina    TEXT,
-        instituicao   TEXT,
-        arquivo_nome  TEXT,
-        status        TEXT DEFAULT 'pendente',
-        nota_operador TEXT DEFAULT '',
-        created_at    TIMESTAMPTZ DEFAULT NOW()
-      );
-      CREATE TABLE IF NOT EXISTS solicitacoes_professor (
-        id               BIGSERIAL PRIMARY KEY,
-        usuario_id       BIGINT REFERENCES usuarios(id),
-        usuario_nome     TEXT NOT NULL,
-        usuario_email    TEXT NOT NULL,
-        tipo_documento   TEXT NOT NULL DEFAULT 'CND',
-        arquivo_nome     TEXT,
-        arquivo_base64   TEXT,
-        arquivo_mime     TEXT DEFAULT 'application/pdf',
-        nivel            TEXT,
-        disciplina       TEXT,
-        instituicao      TEXT,
-        status           TEXT DEFAULT 'pendente',
-        nota_operador    TEXT DEFAULT '',
-        created_at       TIMESTAMPTZ DEFAULT NOW(),
-        updated_at       TIMESTAMPTZ DEFAULT NOW()
-      );
-      CREATE INDEX IF NOT EXISTS idx_sol_professor_status ON solicitacoes_professor(status);
-      CREATE INDEX IF NOT EXISTS idx_sol_professor_usuario ON solicitacoes_professor(usuario_id);
-      CREATE TABLE IF NOT EXISTS pagamentos (
-        id             BIGSERIAL PRIMARY KEY,
-        usuario_id     BIGINT REFERENCES usuarios(id),
-        pacote         TEXT NOT NULL,
-        avaliacoes     INTEGER NOT NULL,
-        valor          NUMERIC(10,2) NOT NULL,
-        status         TEXT DEFAULT 'pendente',
-        preferencia_id TEXT,
-        payment_id     TEXT,
-        created_at     TIMESTAMPTZ DEFAULT NOW(),
-        updated_at     TIMESTAMPTZ DEFAULT NOW()
-      );
-      CREATE INDEX IF NOT EXISTS idx_pagamentos_usuario ON pagamentos(usuario_id);
-      CREATE INDEX IF NOT EXISTS idx_pagamentos_status  ON pagamentos(status);
-      CREATE INDEX IF NOT EXISTS idx_usuarios_codigo    ON usuarios(codigo);
-      CREATE INDEX IF NOT EXISTS idx_usuarios_indicante ON usuarios(codigo_indicante);
-      CREATE TABLE IF NOT EXISTS logs_usuario (
-        id          BIGSERIAL PRIMARY KEY,
-        usuario_id  BIGINT,
-        email       TEXT,
-        acao        TEXT NOT NULL,
-        status      TEXT DEFAULT 'ok',
-        detalhes    JSONB DEFAULT '{}',
-        ip          TEXT,
-        created_at  TIMESTAMPTZ DEFAULT NOW()
-      );
-      CREATE INDEX IF NOT EXISTS idx_logs_usuario_id ON logs_usuario(usuario_id);
-      CREATE INDEX IF NOT EXISTS idx_logs_acao       ON logs_usuario(acao);
-      CREATE INDEX IF NOT EXISTS idx_logs_created_at ON logs_usuario(created_at DESC);
-    `);
-
-    // ── Migrações separadas (ALTER TABLE fora do bloco CREATE) ─────
-    await client.query(`ALTER TABLE avaliacoes ADD COLUMN IF NOT EXISTS imagem_hash TEXT`).catch(() => {});
-    await client.query(`ALTER TABLE avaliacoes ADD COLUMN IF NOT EXISTS possivel_ia BOOLEAN DEFAULT false`).catch(() => {});
-    await client.query(`ALTER TABLE feedbacks ADD COLUMN IF NOT EXISTS aprovado BOOLEAN DEFAULT FALSE`).catch(() => {});
-    await client.query(`ALTER TABLE sugestoes ADD COLUMN IF NOT EXISTS email TEXT`).catch(() => {});
-    await client.query(`CREATE INDEX IF NOT EXISTS idx_avaliacoes_imagem_hash ON avaliacoes(usuario_id, imagem_hash)`).catch(() => {});
-
-    await client.query(`
-      DO $$
-      BEGIN
-        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='usuarios' AND column_name='senha_hash') THEN
-          ALTER TABLE usuarios ADD COLUMN senha_hash TEXT NOT NULL DEFAULT '';
-        END IF;
-        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='usuarios' AND column_name='confirmado') THEN
-          ALTER TABLE usuarios ADD COLUMN confirmado BOOLEAN DEFAULT FALSE;
-        END IF;
-        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='usuarios' AND column_name='codigo_confirmacao') THEN
-          ALTER TABLE usuarios ADD COLUMN codigo_confirmacao TEXT;
-        END IF;
-        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='usuarios' AND column_name='codigo_expira') THEN
-          ALTER TABLE usuarios ADD COLUMN codigo_expira TIMESTAMPTZ;
-        END IF;
-        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='usuarios' AND column_name='whatsapp') THEN
-          ALTER TABLE usuarios ADD COLUMN whatsapp TEXT;
-        END IF;
-        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='usuarios' AND column_name='whatsapp_mkt') THEN
-          ALTER TABLE usuarios ADD COLUMN whatsapp_mkt BOOLEAN DEFAULT FALSE;
-        END IF;
-        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='usuarios' AND column_name='professor') THEN
-          ALTER TABLE usuarios ADD COLUMN professor TEXT DEFAULT 'nao';
-        END IF;
-        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='usuarios' AND column_name='cnd_arquivo') THEN
-          ALTER TABLE usuarios ADD COLUMN cnd_arquivo TEXT;
-        END IF;
-        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='usuarios' AND column_name='desconto_professor') THEN
-          ALTER TABLE usuarios ADD COLUMN desconto_professor BOOLEAN DEFAULT FALSE;
-        END IF;
-        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='usuarios' AND column_name='avaliacoes_disponiveis') THEN
-          ALTER TABLE usuarios ADD COLUMN avaliacoes_disponiveis INTEGER DEFAULT 0;
-        END IF;
-        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='usuarios' AND column_name='codigo_indicante') THEN
-          ALTER TABLE usuarios ADD COLUMN codigo_indicante TEXT;
-        END IF;
-        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='usuarios' AND column_name='total_indicacoes') THEN
-          ALTER TABLE usuarios ADD COLUMN total_indicacoes INTEGER DEFAULT 0;
-        END IF;
-        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='usuarios' AND column_name='escola') THEN
-          ALTER TABLE usuarios ADD COLUMN escola TEXT;
-        END IF;
-      END $$;
-    `).catch(e => console.error('[migration DO$$]', e.message));
-
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS solicitacoes_professor (
-        id               BIGSERIAL PRIMARY KEY,
-        usuario_id       BIGINT,
-        usuario_nome     TEXT NOT NULL DEFAULT '',
-        usuario_email    TEXT NOT NULL DEFAULT '',
-        tipo_documento   TEXT NOT NULL DEFAULT 'CND',
-        arquivo_nome     TEXT,
-        arquivo_base64   TEXT,
-        arquivo_mime     TEXT DEFAULT 'application/pdf',
-        nivel            TEXT,
-        disciplina       TEXT,
-        instituicao      TEXT,
-        status           TEXT DEFAULT 'pendente',
-        nota_operador    TEXT DEFAULT '',
-        created_at       TIMESTAMPTZ DEFAULT NOW(),
-        updated_at       TIMESTAMPTZ DEFAULT NOW()
-      )
-    `).catch(e => console.warn('[migration sol_professor]', e.message));
-
-    await client.query(`
-      DO $$ BEGIN
-        IF NOT EXISTS (
-          SELECT 1 FROM pg_indexes
-          WHERE tablename='pagamentos' AND indexname='idx_pagamentos_preferencia_id'
-        ) THEN
-          ALTER TABLE pagamentos ADD CONSTRAINT idx_pagamentos_preferencia_id UNIQUE (preferencia_id);
-        END IF;
-      END $$;
-    `).catch(() => {});
-
-    console.log('✅ Banco de dados v9.2 inicializado!');
-  } catch (err) {
-    console.error('❌ Erro ao inicializar banco:', err.message);
-  } finally {
-    client.release();
-  }
-}
-
-// ── HELPERS ───────────────────────────────────────────────────────────
-function gerarCodigo() {
-  const rand = Math.floor(10000 + Math.random() * 90000);
-  return 'RC-' + new Date().getFullYear() + '-' + rand;
-}
-
-function gerarCodigoConfirmacao() {
-  return Math.floor(100000 + Math.random() * 900000).toString();
-}
-
-async function enviarEmailConfirmacao(email, nome, codigo) {
-  const primeiroNome = nome.split(' ')[0];
-  const ano = new Date().getFullYear();
-  await enviarEmail(email, 'RedaCheck — Confirme seu cadastro', `
-    <div style="font-family:-apple-system,sans-serif;max-width:480px;margin:0 auto;padding:32px 24px;background:#FAF9F7">
-      <div style="text-align:center;margin-bottom:24px">
-        <span style="font-size:22px;font-weight:700;letter-spacing:3px;color:#1A1A1A">REDA<span style="color:#C96A3A">CHECK</span></span>
-        <div style="font-size:10px;color:#9B9080;letter-spacing:1.5px;margin-top:4px">MAIS QUE CORRIGIR — APERFEIÇOAR</div>
-      </div>
-      <h2 style="font-size:20px;color:#1A1A1A;margin-bottom:8px">Olá, ${primeiroNome}!</h2>
-      <p style="font-size:14px;color:#6B6255;line-height:1.7;margin-bottom:24px">
-        Bem-vindo ao RedaCheck! Para confirmar seu cadastro e ativar sua conta, insira o código abaixo na plataforma:
-      </p>
-      <div style="background:#1A1A1A;border-radius:16px;padding:24px;text-align:center;margin-bottom:24px">
-        <div style="font-size:11px;color:rgba(255,255,255,0.5);text-transform:uppercase;letter-spacing:1px;margin-bottom:10px">Seu código de confirmação</div>
-        <div style="font-size:40px;font-weight:700;color:#FAF9F7;letter-spacing:8px">${codigo}</div>
-        <div style="font-size:11px;color:rgba(255,255,255,0.4);margin-top:10px">Válido por 15 minutos</div>
-      </div>
-      <p style="font-size:12px;color:#9B9080;line-height:1.6">Se você não criou uma conta no RedaCheck, ignore este e-mail.</p>
-
-      <div style="background:#F5F2EE;border:1px solid #E5E0D8;border-radius:12px;padding:16px;margin-top:20px">
-        <div style="font-size:11px;font-weight:700;color:#6B6255;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:10px">📋 Termos importantes</div>
-        <p style="font-size:12px;color:#6B6255;line-height:1.7;margin:0">
-          Ao usar o RedaCheck, você concorda que:<br><br>
-          <strong style="color:#1A1A1A">1. Responsabilidade pelo conteúdo:</strong> O envio de textos gerados por inteligência artificial ou qualquer outra ferramenta automatizada é de <strong>exclusiva responsabilidade do usuário</strong>. O RedaCheck avalia o texto submetido independentemente de sua origem, e o crédito será debitado normalmente em todos os casos.<br><br>
-          <strong style="color:#1A1A1A">2. Finalidade pedagógica:</strong> A plataforma é destinada ao aperfeiçoamento da escrita humana. O uso de textos gerados por IA contradiz essa finalidade, mas não isenta o usuário do débito.<br><br>
-          <strong style="color:#1A1A1A">3. Termos completos:</strong> Os Termos de Uso e a Política de Privacidade completos estão disponíveis em <a href="https://redacheck.com.br" style="color:#C96A3A">redacheck.com.br</a>.
-        </p>
-      </div>
-
-      <div style="border-top:1px solid #E5E0D8;margin-top:24px;padding-top:16px;text-align:center">
-        <span style="font-size:11px;color:#9B9080">© ${ano} RedaCheck — redacheck.com.br</span>
-      </div>
-    </div>
-  `);
-}
-
-// ── HELPERS DE CACHE ─────────────────────────────────────────────────
+const path = require('path');
+const fs = require('fs');
+const https = require('https');
 const crypto = require('crypto');
+const { Pool } = require('pg');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const cors = require('cors');
+const rateLimit = require('express-rate-limit');
 
-// SHA256 do base64 da imagem/PDF — para cache exato de foto/PDF
-function hashBase64(b64) {
-  return crypto.createHash('sha256').update(b64).digest('hex');
-}
+const app = express();
+app.set('trust proxy', 1);
+// CORS explícito: reflete a origem (permissivo como antes) e trata o preflight OPTIONS em qualquer rota.
+const corsOptions = {
+  origin: (origin, cb) => cb(null, true),   // reflete qualquer origem (educemic.com.br, www, netlify…)
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  credentials: false,
+  optionsSuccessStatus: 204
+};
+app.use(cors(corsOptions));
+app.options('*', cors(corsOptions));   // garante resposta ao preflight em todas as rotas
+app.use(express.json({ limit: '12mb' }));
 
+// ---------- Variáveis de ambiente obrigatórias ----------
+const { DATABASE_URL, JWT_SECRET } = process.env;
+if (!DATABASE_URL) { console.error('ERRO: DATABASE_URL não definida.'); process.exit(1); }
+if (!JWT_SECRET) { console.error('ERRO: JWT_SECRET não definida.'); process.exit(1); }
 
-// ── STATUS ────────────────────────────────────────────────────────────
-app.get('/', (req, res) => {
-  res.json({
-    status: 'RedaCheck API v9.10 online',
-    banco: 'PostgreSQL', versao: '9.2',
-    auth: 'bcrypt+email', pagamento: 'MercadoPago',
-    bonus: 'cadastro + indicacao (10/20 usuarios)',
-    fix: 'webhook Pix: UPDATE por payment_id + logs rastreabilidade'
-  });
+const MASTER_CPF = process.env.MASTER_CPF || '00000000000';
+const MASTER_SENHA = process.env.MASTER_SENHA || null; // se ausente, master só é criado se já houver senha definida
+
+const pool = new Pool({
+  connectionString: DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
 });
 
-// ══════════════════════════════════════════════════════════════════════
-// AUTENTICAÇÃO
-// ══════════════════════════════════════════════════════════════════════
+// ============================================================
+// 1. CRIAÇÃO DO BANCO (idempotente — CREATE IF NOT EXISTS)
+// ============================================================
+async function initDB() {
+  const ddl = `
+  -- ---------- Configurações e autenticação ----------
+  CREATE TABLE IF NOT EXISTS configuracoes (
+    id SERIAL PRIMARY KEY,
+    chave TEXT UNIQUE NOT NULL,
+    valor JSONB NOT NULL,
+    descricao TEXT,
+    atualizado_em TIMESTAMP DEFAULT NOW(),
+    atualizado_por INTEGER
+  );
 
-app.post('/cadastro', async (req, res) => {
-  try {
-    const {
-      nome, email, senha, banca, plano,
-      escola, whatsapp, whatsapp_mkt, professor,
-      cnd_base64, cnd_arquivo,
-      codigo_indicante
-    } = req.body;
+  CREATE TABLE IF NOT EXISTS usuarios (
+    id SERIAL PRIMARY KEY,
+    nome TEXT NOT NULL,
+    cpf TEXT UNIQUE NOT NULL,
+    email TEXT,
+    whatsapp TEXT,
+    senha_hash TEXT NOT NULL,
+    data_nascimento DATE,
+    perfil TEXT NOT NULL CHECK (perfil IN ('master','secretaria','professor','aluno','responsavel')),
+    referencia_id INTEGER,
+    status TEXT NOT NULL DEFAULT 'ativo' CHECK (status IN ('ativo','inativo')),
+    senha_provisoria BOOLEAN DEFAULT FALSE,
+    criado_em TIMESTAMP DEFAULT NOW(),
+    ultimo_acesso TIMESTAMP
+  );
 
-    if (!nome || !email || !senha)
-      return res.status(400).json({ erro: 'Nome, e-mail e senha são obrigatórios.' });
-    if (senha.length < 6)
-      return res.status(400).json({ erro: 'A senha deve ter no mínimo 6 caracteres.' });
+  -- ---------- Pessoas ----------
+  CREATE TABLE IF NOT EXISTS alunos (
+    id SERIAL PRIMARY KEY,
+    nome TEXT NOT NULL,
+    data_nascimento DATE,
+    email TEXT,
+    cpf TEXT UNIQUE,
+    whatsapp TEXT,
+    status TEXT NOT NULL DEFAULT 'ativo' CHECK (status IN ('ativo','inativo')),
+    modalidade TEXT NOT NULL DEFAULT 'pagante' CHECK (modalidade IN ('pagante','pagante_parcial','bolsista','bolsista_iema','desconto_especial')),
+    desconto_percentual NUMERIC(5,2) NOT NULL DEFAULT 0,
+    data_cadastro DATE DEFAULT CURRENT_DATE,
+    observacoes TEXT
+  );
 
-    const existe = await pool.query('SELECT id FROM usuarios WHERE email = $1', [email.toLowerCase()]);
-    if (existe.rows.length > 0)
-      return res.status(409).json({ erro: 'Este e-mail já está cadastrado. Faça login ou use outro e-mail.' });
+  CREATE TABLE IF NOT EXISTS responsaveis (
+    id SERIAL PRIMARY KEY,
+    nome TEXT NOT NULL,
+    cpf TEXT UNIQUE NOT NULL,
+    email TEXT,
+    whatsapp TEXT
+  );
 
-    // Verificar WhatsApp duplicado — apenas se fornecido
-    if (whatsapp && whatsapp.trim() !== '') {
-      const wzCheck = await pool.query(
-        'SELECT id FROM usuarios WHERE whatsapp = $1',
-        [whatsapp.trim()]
-      );
-      if (wzCheck.rows.length > 0)
-        return res.status(409).json({ erro: 'Este número de WhatsApp já está associado a outra conta.' });
-    }
+  CREATE TABLE IF NOT EXISTS aluno_responsavel (
+    id SERIAL PRIMARY KEY,
+    aluno_id INTEGER NOT NULL REFERENCES alunos(id) ON DELETE CASCADE,
+    responsavel_id INTEGER NOT NULL REFERENCES responsaveis(id) ON DELETE CASCADE,
+    parentesco TEXT,
+    responsavel_financeiro BOOLEAN DEFAULT FALSE,
+    UNIQUE(aluno_id, responsavel_id)
+  );
 
-    let indicanteValido = null;
-    if (codigo_indicante && codigo_indicante.trim()) {
-      const indRes = await pool.query(
-        'SELECT id FROM usuarios WHERE codigo = $1 AND confirmado = TRUE',
-        [codigo_indicante.trim().toUpperCase()]
-      );
-      if (indRes.rows.length > 0) {
-        indicanteValido = codigo_indicante.trim().toUpperCase();
+  CREATE TABLE IF NOT EXISTS professores (
+    id SERIAL PRIMARY KEY,
+    nome TEXT NOT NULL,
+    email TEXT,
+    formacao TEXT,
+    whatsapp TEXT,
+    data_nascimento DATE,
+    status TEXT NOT NULL DEFAULT 'ativo' CHECK (status IN ('ativo','inativo'))
+  );
+
+  -- ---------- Acadêmico ----------
+  CREATE TABLE IF NOT EXISTS cursos (
+    id SERIAL PRIMARY KEY,
+    nome TEXT UNIQUE NOT NULL,
+    status TEXT NOT NULL DEFAULT 'ativo' CHECK (status IN ('ativo','inativo'))
+  );
+
+  CREATE TABLE IF NOT EXISTS niveis (
+    id SERIAL PRIMARY KEY,
+    curso_id INTEGER NOT NULL REFERENCES cursos(id),
+    nome TEXT NOT NULL,
+    ordem INTEGER NOT NULL DEFAULT 1,
+    carga_horaria INTEGER,
+    UNIQUE(curso_id, nome)
+  );
+
+  CREATE TABLE IF NOT EXISTS turmas (
+    id SERIAL PRIMARY KEY,
+    nivel_id INTEGER NOT NULL REFERENCES niveis(id),
+    nome TEXT NOT NULL,
+    semestre TEXT NOT NULL,
+    turno TEXT,
+    horario TEXT,
+    professor_id INTEGER REFERENCES professores(id),
+    capacidade INTEGER NOT NULL DEFAULT 15,
+    status TEXT NOT NULL DEFAULT 'em_formacao' CHECK (status IN ('em_formacao','em_andamento','encerrada')),
+    UNIQUE(nome, semestre)
+  );
+
+  CREATE TABLE IF NOT EXISTS matriculas (
+    id SERIAL PRIMARY KEY,
+    aluno_id INTEGER NOT NULL REFERENCES alunos(id),
+    turma_id INTEGER NOT NULL REFERENCES turmas(id),
+    data_matricula DATE DEFAULT CURRENT_DATE,
+    valor_mensalidade NUMERIC(10,2) NOT NULL DEFAULT 0,
+    desconto_aplicado NUMERIC(5,2) NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'ativa' CHECK (status IN ('ativa','trancada','cancelada','concluida')),
+    resultado TEXT CHECK (resultado IN ('aprovado','reprovado')),
+    media_final NUMERIC(5,2),
+    frequencia_final NUMERIC(5,2)
+  );
+
+  CREATE TABLE IF NOT EXISTS avaliacoes (
+    id SERIAL PRIMARY KEY,
+    turma_id INTEGER NOT NULL REFERENCES turmas(id) ON DELETE CASCADE,
+    nome TEXT NOT NULL,
+    peso NUMERIC(5,2) NOT NULL DEFAULT 1,
+    data DATE
+  );
+
+  CREATE TABLE IF NOT EXISTS notas (
+    id SERIAL PRIMARY KEY,
+    avaliacao_id INTEGER NOT NULL REFERENCES avaliacoes(id) ON DELETE CASCADE,
+    matricula_id INTEGER NOT NULL REFERENCES matriculas(id) ON DELETE CASCADE,
+    nota NUMERIC(5,2) NOT NULL,
+    lancada_por INTEGER REFERENCES usuarios(id),
+    lancada_em TIMESTAMP DEFAULT NOW(),
+    UNIQUE(avaliacao_id, matricula_id)
+  );
+
+  CREATE TABLE IF NOT EXISTS aulas (
+    id SERIAL PRIMARY KEY,
+    turma_id INTEGER NOT NULL REFERENCES turmas(id) ON DELETE CASCADE,
+    data DATE NOT NULL,
+    conteudo TEXT
+  );
+
+  CREATE TABLE IF NOT EXISTS frequencias (
+    id SERIAL PRIMARY KEY,
+    aula_id INTEGER NOT NULL REFERENCES aulas(id) ON DELETE CASCADE,
+    matricula_id INTEGER NOT NULL REFERENCES matriculas(id) ON DELETE CASCADE,
+    presente BOOLEAN NOT NULL DEFAULT TRUE,
+    justificativa TEXT,
+    UNIQUE(aula_id, matricula_id)
+  );
+
+  -- ---------- Financeiro ----------
+  CREATE TABLE IF NOT EXISTS fornecedores (
+    id SERIAL PRIMARY KEY,
+    nome TEXT NOT NULL,
+    cpf_cnpj TEXT,
+    email TEXT,
+    whatsapp TEXT,
+    categoria TEXT,
+    observacoes TEXT,
+    status TEXT NOT NULL DEFAULT 'ativo' CHECK (status IN ('ativo','inativo'))
+  );
+
+  CREATE TABLE IF NOT EXISTS contas_pagar (
+    id SERIAL PRIMARY KEY,
+    fornecedor_id INTEGER REFERENCES fornecedores(id),
+    descricao TEXT NOT NULL,
+    categoria TEXT,
+    valor NUMERIC(10,2) NOT NULL,
+    vencimento DATE NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pendente' CHECK (status IN ('pendente','paga','atrasada','cancelada')),
+    data_pagamento DATE,
+    forma_pagamento TEXT,
+    comprovante_url TEXT,
+    criado_por INTEGER REFERENCES usuarios(id),
+    criado_em TIMESTAMP DEFAULT NOW()
+  );
+
+  CREATE TABLE IF NOT EXISTS contas_receber (
+    id SERIAL PRIMARY KEY,
+    aluno_id INTEGER NOT NULL REFERENCES alunos(id),
+    matricula_id INTEGER REFERENCES matriculas(id),
+    descricao TEXT NOT NULL,
+    competencia TEXT,
+    valor_original NUMERIC(10,2) NOT NULL,
+    desconto NUMERIC(10,2) NOT NULL DEFAULT 0,
+    valor_final NUMERIC(10,2) NOT NULL,
+    vencimento DATE NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pendente' CHECK (status IN ('pendente','paga','atrasada','cancelada')),
+    data_pagamento DATE,
+    forma_pagamento TEXT,
+    recebido_por INTEGER REFERENCES usuarios(id),
+    criado_em TIMESTAMP DEFAULT NOW()
+  );
+
+  -- ---------- Comunicação ----------
+  CREATE TABLE IF NOT EXISTS avisos (
+    id SERIAL PRIMARY KEY,
+    autor_id INTEGER REFERENCES usuarios(id),
+    escopo TEXT NOT NULL DEFAULT 'geral' CHECK (escopo IN ('geral','turma','aluno')),
+    turma_id INTEGER REFERENCES turmas(id) ON DELETE CASCADE,
+    aluno_id INTEGER REFERENCES alunos(id) ON DELETE CASCADE,
+    titulo TEXT NOT NULL,
+    mensagem TEXT NOT NULL,
+    criado_em TIMESTAMP DEFAULT NOW()
+  );
+  `;
+  await pool.query(ddl);
+  // Migrações (idempotentes): desconto em R$ e pontualidade
+  await pool.query(`ALTER TABLE alunos ADD COLUMN IF NOT EXISTS desconto_valor NUMERIC(10,2) NOT NULL DEFAULT 0`);
+  await pool.query(`ALTER TABLE matriculas ALTER COLUMN desconto_aplicado TYPE NUMERIC(10,2)`);
+  await pool.query(`ALTER TABLE contas_receber ADD COLUMN IF NOT EXISTS desconto_pontualidade NUMERIC(10,2) NOT NULL DEFAULT 0`);
+
+  // ---------- Migrações — Módulo Financeiro v3.9 ----------
+  // Código de identificação por entidade (determinístico a partir do id) + backfill dos existentes
+  await pool.query(`ALTER TABLE alunos       ADD COLUMN IF NOT EXISTS codigo TEXT`);
+  await pool.query(`ALTER TABLE professores  ADD COLUMN IF NOT EXISTS codigo TEXT`);
+  await pool.query(`ALTER TABLE usuarios     ADD COLUMN IF NOT EXISTS codigo TEXT`);
+  await pool.query(`ALTER TABLE fornecedores ADD COLUMN IF NOT EXISTS codigo TEXT`);
+  await pool.query(`UPDATE alunos       SET codigo = 'ALU-' || lpad(id::text, 4, '0') WHERE codigo IS NULL`);
+  await pool.query(`UPDATE professores  SET codigo = 'PRF-' || lpad(id::text, 4, '0') WHERE codigo IS NULL`);
+  await pool.query(`UPDATE usuarios     SET codigo = 'USR-' || lpad(id::text, 4, '0') WHERE codigo IS NULL`);
+  await pool.query(`UPDATE fornecedores SET codigo = 'FRN-' || lpad(id::text, 4, '0') WHERE codigo IS NULL`);
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_alunos_codigo       ON alunos(codigo)`);
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_professores_codigo  ON professores(codigo)`);
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_usuarios_codigo     ON usuarios(codigo)`);
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_fornecedores_codigo ON fornecedores(codigo)`);
+
+  // Contas a Receber: documento, juros, valor recebido e cliente livre; aluno_id passa a ser opcional (avulsa)
+  await pool.query(`ALTER TABLE contas_receber ADD COLUMN IF NOT EXISTS numero_documento TEXT`);
+  await pool.query(`ALTER TABLE contas_receber ADD COLUMN IF NOT EXISTS juros NUMERIC(10,2) NOT NULL DEFAULT 0`);
+  await pool.query(`ALTER TABLE contas_receber ADD COLUMN IF NOT EXISTS valor_recebido NUMERIC(10,2)`);
+  await pool.query(`ALTER TABLE contas_receber ADD COLUMN IF NOT EXISTS cliente_nome TEXT`);
+  await pool.query(`ALTER TABLE contas_receber ALTER COLUMN aluno_id DROP NOT NULL`);
+  await pool.query(`UPDATE contas_receber SET numero_documento = 'CR-' || to_char(COALESCE(criado_em, NOW()), 'YYYY') || '-' || lpad(id::text, 6, '0') WHERE numero_documento IS NULL`);
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_contas_receber_documento ON contas_receber(numero_documento)`);
+
+  // Geração automática de código/documento em novas inserções.
+  // AFTER INSERT + UPDATE: o NEW.id é garantido nesse ponto, sem depender da ordem
+  // de avaliação de DEFAULT em BEFORE INSERT — abordagem à prova de falhas.
+  await pool.query(`CREATE OR REPLACE FUNCTION gera_codigo() RETURNS trigger AS $func$
+    BEGIN
+      IF NEW.codigo IS NULL THEN
+        EXECUTE format('UPDATE %I SET codigo = $1 WHERE id = $2', TG_TABLE_NAME)
+          USING TG_ARGV[0] || lpad(NEW.id::text, 4, '0'), NEW.id;
+      END IF;
+      RETURN NULL;
+    END; $func$ LANGUAGE plpgsql`);
+  await pool.query(`CREATE OR REPLACE FUNCTION gera_documento_cr() RETURNS trigger AS $func$
+    BEGIN
+      IF NEW.numero_documento IS NULL THEN
+        UPDATE contas_receber
+          SET numero_documento = 'CR-' || to_char(COALESCE(NEW.criado_em, NOW()), 'YYYY') || '-' || lpad(NEW.id::text, 6, '0')
+          WHERE id = NEW.id;
+      END IF;
+      RETURN NULL;
+    END; $func$ LANGUAGE plpgsql`);
+  for (const [tab, pref] of [['alunos', 'ALU-'], ['professores', 'PRF-'], ['usuarios', 'USR-'], ['fornecedores', 'FRN-']]) {
+    await pool.query(`DROP TRIGGER IF EXISTS trg_codigo_${tab} ON ${tab}`);
+    await pool.query(`CREATE TRIGGER trg_codigo_${tab} AFTER INSERT ON ${tab} FOR EACH ROW EXECUTE FUNCTION gera_codigo('${pref}')`);
+  }
+  await pool.query(`DROP TRIGGER IF EXISTS trg_documento_cr ON contas_receber`);
+  await pool.query(`CREATE TRIGGER trg_documento_cr AFTER INSERT ON contas_receber FOR EACH ROW EXECUTE FUNCTION gera_documento_cr()`);
+
+  // ---------- Portal dos Pais — Pré-inscrições (v3.10) ----------
+  await pool.query(`CREATE TABLE IF NOT EXISTS pre_inscricoes (
+    id SERIAL PRIMARY KEY,
+    protocolo TEXT,
+    aluno_nome TEXT NOT NULL,
+    aluno_data_nascimento DATE,
+    aluno_cpf TEXT,
+    programa TEXT,
+    turno TEXT,
+    responsavel_nome TEXT NOT NULL,
+    responsavel_cpf TEXT,
+    responsavel_whatsapp TEXT,
+    responsavel_email TEXT,
+    parentesco TEXT,
+    valor_taxa NUMERIC(10,2) NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'aguardando_pagamento'
+      CHECK (status IN ('aguardando_pagamento','pago','cancelada','efetivada')),
+    mp_payment_id TEXT,
+    pix_qr TEXT,
+    pix_copia_cola TEXT,
+    aluno_id INTEGER REFERENCES alunos(id),
+    matricula_id INTEGER REFERENCES matriculas(id),
+    observacoes TEXT,
+    criado_em TIMESTAMPTZ DEFAULT NOW(),
+    pago_em TIMESTAMPTZ
+  )`);
+  await pool.query(`ALTER TABLE pre_inscricoes ADD COLUMN IF NOT EXISTS semestre TEXT`);
+  await pool.query(`ALTER TABLE pre_inscricoes ADD COLUMN IF NOT EXISTS tipo TEXT NOT NULL DEFAULT 'pre_inscricao'`);
+  // Matrícula: a unicidade passa a valer só para matrícula que ocupa vaga (ativa/trancada).
+  // Assim, matrícula cancelada ou concluída não impede nova matrícula na mesma turma.
+  await pool.query(`ALTER TABLE matriculas DROP CONSTRAINT IF EXISTS matriculas_aluno_id_turma_id_key`);
+  await pool.query(`ALTER TABLE alunos DROP CONSTRAINT IF EXISTS alunos_modalidade_check`);
+  await pool.query(`ALTER TABLE alunos ADD CONSTRAINT alunos_modalidade_check CHECK (modalidade IN ('pagante','pagante_parcial','bolsista','bolsista_iema','desconto_especial'))`);
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS uq_matricula_vaga ON matriculas (aluno_id, turma_id) WHERE status IN ('ativa','trancada')`);
+  // Portal dos Pais: senha do responsável (primeiro acesso)
+  await pool.query(`ALTER TABLE responsaveis ADD COLUMN IF NOT EXISTS senha_hash TEXT`);
+  // Declarações emitidas (verificáveis por código)
+  await pool.query(`CREATE TABLE IF NOT EXISTS declaracoes (
+    id SERIAL PRIMARY KEY,
+    codigo TEXT UNIQUE NOT NULL,
+    tipo TEXT NOT NULL DEFAULT 'vinculo',
+    aluno_id INTEGER REFERENCES alunos(id) ON DELETE SET NULL,
+    aluno_nome TEXT NOT NULL,
+    aluno_cpf TEXT,
+    curso TEXT,
+    modulo TEXT,
+    turno TEXT,
+    semestre TEXT,
+    responsavel_id INTEGER REFERENCES responsaveis(id) ON DELETE SET NULL,
+    emitida_em TIMESTAMP DEFAULT NOW()
+  )`);
+  await pool.query(`ALTER TABLE declaracoes ADD COLUMN IF NOT EXISTS modulo TEXT`);
+  await pool.query(`ALTER TABLE declaracoes ADD COLUMN IF NOT EXISTS semestre TEXT`);
+  await pool.query(`ALTER TABLE declaracoes ADD COLUMN IF NOT EXISTS modulos JSONB`);
+  await pool.query(`ALTER TABLE declaracoes ADD COLUMN IF NOT EXISTS total_semestres INTEGER`);
+  await pool.query(`ALTER TABLE declaracoes ADD COLUMN IF NOT EXISTS carga_horaria INTEGER`);
+  await pool.query(`ALTER TABLE declaracoes ADD COLUMN IF NOT EXISTS emitida_por INTEGER REFERENCES usuarios(id) ON DELETE SET NULL`);
+  // Folha de professores (hora-aula)
+  await pool.query(`CREATE TABLE IF NOT EXISTS professor_horas (
+    id SERIAL PRIMARY KEY,
+    professor_id INTEGER NOT NULL REFERENCES professores(id) ON DELETE CASCADE,
+    data DATE NOT NULL,
+    horas NUMERIC(6,2) NOT NULL,
+    valor_hora NUMERIC(10,2) NOT NULL,
+    observacao TEXT,
+    criado_em TIMESTAMP DEFAULT NOW()
+  )`);
+  await pool.query(`ALTER TABLE professores ADD COLUMN IF NOT EXISTS cpf TEXT`);
+  await pool.query(`ALTER TABLE professores ADD COLUMN IF NOT EXISTS data_ingresso DATE`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS professor_pagamentos (
+    id SERIAL PRIMARY KEY,
+    professor_id INTEGER NOT NULL REFERENCES professores(id) ON DELETE CASCADE,
+    referencia TEXT NOT NULL,
+    data_pagamento DATE NOT NULL,
+    valor NUMERIC(10,2) NOT NULL,
+    forma TEXT,
+    observacao TEXT,
+    criado_em TIMESTAMP DEFAULT NOW()
+  )`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_prof_pag_ref ON professor_pagamentos (professor_id, referencia)`);
+  // ---------- Portal do Professor ----------
+  await pool.query(`ALTER TABLE aulas ADD COLUMN IF NOT EXISTS professor_id INTEGER REFERENCES professores(id) ON DELETE SET NULL`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS ocorrencias (
+    id SERIAL PRIMARY KEY,
+    aluno_id INTEGER NOT NULL REFERENCES alunos(id) ON DELETE CASCADE,
+    turma_id INTEGER REFERENCES turmas(id) ON DELETE SET NULL,
+    professor_id INTEGER REFERENCES professores(id) ON DELETE SET NULL,
+    data DATE NOT NULL DEFAULT CURRENT_DATE,
+    tipo TEXT NOT NULL DEFAULT 'pedagogica' CHECK (tipo IN ('comportamento','pedagogica','elogio','saude','outro')),
+    titulo TEXT NOT NULL,
+    descricao TEXT NOT NULL,
+    visivel_responsavel BOOLEAN NOT NULL DEFAULT TRUE,
+    criado_em TIMESTAMP DEFAULT NOW()
+  )`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS atividades (
+    id SERIAL PRIMARY KEY,
+    turma_id INTEGER NOT NULL REFERENCES turmas(id) ON DELETE CASCADE,
+    professor_id INTEGER REFERENCES professores(id) ON DELETE SET NULL,
+    titulo TEXT NOT NULL,
+    descricao TEXT,
+    link TEXT,
+    data_entrega DATE,
+    criado_em TIMESTAMP DEFAULT NOW()
+  )`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS atividade_arquivos (
+    id SERIAL PRIMARY KEY,
+    atividade_id INTEGER NOT NULL REFERENCES atividades(id) ON DELETE CASCADE,
+    nome TEXT NOT NULL,
+    mime TEXT NOT NULL,
+    tamanho INTEGER NOT NULL,
+    conteudo BYTEA NOT NULL,
+    enviado_em TIMESTAMP DEFAULT NOW()
+  )`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_ocorrencias_aluno ON ocorrencias (aluno_id, data)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_atividades_turma ON atividades (turma_id, criado_em)`);
+  // ---------- Carteira Estudantil (v3.32) ----------
+  await migrar('aluno_fotos', `CREATE TABLE IF NOT EXISTS aluno_fotos (
+    aluno_id INTEGER PRIMARY KEY REFERENCES alunos(id) ON DELETE CASCADE,
+    mime TEXT NOT NULL,
+    tamanho INTEGER NOT NULL,
+    conteudo BYTEA NOT NULL,
+    enviada_por INTEGER REFERENCES responsaveis(id) ON DELETE SET NULL,
+    enviada_em TIMESTAMP DEFAULT NOW()
+  )`);
+  await migrar('carteiras', `CREATE TABLE IF NOT EXISTS carteiras (
+    id SERIAL PRIMARY KEY,
+    codigo TEXT UNIQUE NOT NULL,
+    aluno_id INTEGER REFERENCES alunos(id) ON DELETE SET NULL,
+    aluno_nome TEXT NOT NULL,
+    aluno_cpf TEXT,
+    aluno_codigo TEXT,
+    curso TEXT,
+    modulo TEXT,
+    turma_nome TEXT,
+    turno TEXT,
+    semestre TEXT NOT NULL,
+    validade DATE,
+    emitida_em TIMESTAMP DEFAULT NOW(),
+    emitida_por_responsavel INTEGER REFERENCES responsaveis(id) ON DELETE SET NULL
+  )`);
+  await migrar('carteiras', `ALTER TABLE carteiras ADD COLUMN IF NOT EXISTS aluno_cpf TEXT`);
+  await migrar('idx_carteiras_aluno_semestre', `CREATE UNIQUE INDEX IF NOT EXISTS idx_carteiras_aluno_semestre ON carteiras (aluno_id, semestre)`);
+  // ---------- Documentos do professor: foto, carteira e declaração de vínculo ----------
+  await migrar('professor_fotos', `CREATE TABLE IF NOT EXISTS professor_fotos (
+    professor_id INTEGER PRIMARY KEY REFERENCES professores(id) ON DELETE CASCADE,
+    mime TEXT NOT NULL,
+    tamanho INTEGER NOT NULL,
+    conteudo BYTEA NOT NULL,
+    enviada_em TIMESTAMP DEFAULT NOW()
+  )`);
+  await migrar('carteiras_professor', `CREATE TABLE IF NOT EXISTS carteiras_professor (
+    id SERIAL PRIMARY KEY,
+    codigo TEXT UNIQUE NOT NULL,
+    professor_id INTEGER REFERENCES professores(id) ON DELETE SET NULL,
+    professor_nome TEXT NOT NULL,
+    professor_cpf TEXT,
+    professor_codigo TEXT,
+    formacao TEXT,
+    funcao TEXT,
+    turnos TEXT,
+    semestre TEXT NOT NULL,
+    validade DATE,
+    emitida_em TIMESTAMP DEFAULT NOW()
+  )`);
+  await migrar('idx_cartprof_prof_sem', `CREATE UNIQUE INDEX IF NOT EXISTS idx_cartprof_prof_sem ON carteiras_professor (professor_id, semestre)`);
+  await migrar('declaracoes_professor', `CREATE TABLE IF NOT EXISTS declaracoes_professor (
+    id SERIAL PRIMARY KEY,
+    codigo TEXT UNIQUE NOT NULL,
+    professor_id INTEGER REFERENCES professores(id) ON DELETE SET NULL,
+    professor_nome TEXT NOT NULL,
+    professor_cpf TEXT,
+    formacao TEXT,
+    funcao TEXT,
+    data_ingresso DATE,
+    turmas_resumo TEXT,
+    turnos TEXT,
+    semestre TEXT,
+    vigencia_inicio DATE,
+    vigencia_fim DATE,
+    emitida_em TIMESTAMP DEFAULT NOW()
+  )`);
+  await migrar('idx_declprof_prof_vig', `CREATE UNIQUE INDEX IF NOT EXISTS idx_declprof_prof_vig ON declaracoes_professor (professor_id, vigencia_inicio)`);
+  // ---------- Calendário acadêmico, Circulares e Sistema de Avaliação (v3.33) ----------
+  await migrar('avaliacoes', `ALTER TABLE avaliacoes ADD COLUMN IF NOT EXISTS bimestre INTEGER`);
+  await migrar('calendario', `CREATE TABLE IF NOT EXISTS calendario (
+    id SERIAL PRIMARY KEY,
+    semestre TEXT NOT NULL,
+    data DATE NOT NULL,
+    titulo TEXT NOT NULL,
+    detalhe TEXT,
+    modalidade TEXT NOT NULL DEFAULT 'Presencial',
+    criado_em TIMESTAMP DEFAULT NOW()
+  )`);
+  await migrar('idx_calendario_evento', `CREATE UNIQUE INDEX IF NOT EXISTS idx_calendario_evento ON calendario (semestre, data, titulo)`);
+  await migrar('circulares', `CREATE TABLE IF NOT EXISTS circulares (
+    id SERIAL PRIMARY KEY,
+    numero TEXT,
+    titulo TEXT NOT NULL,
+    corpo TEXT NOT NULL,
+    destino TEXT NOT NULL DEFAULT 'professores',
+    semestre TEXT,
+    publicada BOOLEAN NOT NULL DEFAULT TRUE,
+    criada_em TIMESTAMP DEFAULT NOW(),
+    criada_por INTEGER REFERENCES usuarios(id) ON DELETE SET NULL
+  )`);
+  await migrar('termos_adesao', `CREATE TABLE IF NOT EXISTS termos_adesao (
+    id SERIAL PRIMARY KEY,
+    codigo TEXT UNIQUE,
+    professor_id INTEGER REFERENCES professores(id) ON DELETE SET NULL,
+    usuario_id INTEGER REFERENCES usuarios(id) ON DELETE SET NULL,
+    nome TEXT NOT NULL,
+    cpf TEXT,
+    rg TEXT,
+    data_nascimento DATE,
+    qualificacao TEXT,
+    endereco TEXT,
+    telefone TEXT,
+    email TEXT,
+    turmas_resumo TEXT,
+    turnos TEXT,
+    vigencia_inicio DATE NOT NULL,
+    vigencia_fim DATE NOT NULL,
+    valor_hora NUMERIC(10,2),
+    status TEXT NOT NULL DEFAULT 'pendente' CHECK (status IN ('pendente','aceito')),
+    assinado_em TIMESTAMP DEFAULT NOW(),
+    aceito_em TIMESTAMP,
+    aceito_por INTEGER REFERENCES usuarios(id) ON DELETE SET NULL,
+    aceito_por_nome TEXT
+  )`);
+  await migrar('idx_termo_prof_vigencia', `CREATE UNIQUE INDEX IF NOT EXISTS idx_termo_prof_vigencia ON termos_adesao (professor_id, vigencia_inicio)`);
+  await migrar('circular_leituras', `CREATE TABLE IF NOT EXISTS circular_leituras (
+    circular_id INTEGER NOT NULL REFERENCES circulares(id) ON DELETE CASCADE,
+    usuario_id INTEGER NOT NULL REFERENCES usuarios(id) ON DELETE CASCADE,
+    lida_em TIMESTAMP DEFAULT NOW(),
+    PRIMARY KEY (circular_id, usuario_id)
+  )`);
+  // English Platform: liberação de acesso por aluno.
+  // Fluxo: PIX pago na plataforma -> solicitação (status 'pendente') -> master autoriza aqui -> acesso liberado.
+  await migrar('english_platform_acesso', `CREATE TABLE IF NOT EXISTS english_platform_acesso (
+    id SERIAL PRIMARY KEY,
+    aluno_id INTEGER NOT NULL UNIQUE REFERENCES alunos(id) ON DELETE CASCADE,
+    status TEXT NOT NULL DEFAULT 'pendente' CHECK (status IN ('pendente','autorizado','revogado')),
+    solicitado_por INTEGER REFERENCES responsaveis(id) ON DELETE SET NULL,
+    pago_em TIMESTAMP,
+    pagamento_ref TEXT,
+    valor NUMERIC(10,2),
+    autorizado_por INTEGER REFERENCES usuarios(id) ON DELETE SET NULL,
+    autorizado_em TIMESTAMP,
+    criado_em TIMESTAMP DEFAULT NOW(),
+    atualizado_em TIMESTAMP DEFAULT NOW()
+  )`);
+  await migrar('idx_ep_status', `CREATE INDEX IF NOT EXISTS idx_ep_status ON english_platform_acesso (status)`);
+  // English Platform: cobranças PIX do credenciamento (R$35 × nº de filhos, um pagamento por família).
+  await migrar('english_platform_pagamentos', `CREATE TABLE IF NOT EXISTS english_platform_pagamentos (
+    txid TEXT PRIMARY KEY,
+    responsavel_id INTEGER REFERENCES responsaveis(id) ON DELETE SET NULL,
+    valor NUMERIC(10,2) NOT NULL,
+    copia_cola TEXT,
+    status TEXT NOT NULL DEFAULT 'ATIVA',
+    criado_em TIMESTAMP DEFAULT NOW(),
+    pago_em TIMESTAMP
+  )`);
+  await migrar('idx_ep_pag_resp', `CREATE INDEX IF NOT EXISTS idx_ep_pag_resp ON english_platform_pagamentos (responsavel_id, status)`);
+  // Índices nas FKs mais usadas em JOIN/filtro (login do Portal, EP, boletos): antes só 5 índices p/ 36 tabelas.
+  await migrar('idx_ar_responsavel', `CREATE INDEX IF NOT EXISTS idx_ar_responsavel ON aluno_responsavel (responsavel_id)`);
+  await migrar('idx_ar_aluno', `CREATE INDEX IF NOT EXISTS idx_ar_aluno ON aluno_responsavel (aluno_id)`);
+  await migrar('idx_matriculas_aluno', `CREATE INDEX IF NOT EXISTS idx_matriculas_aluno ON matriculas (aluno_id, status)`);
+  try { await seedCalendario(); } catch (e) { falhasMigracao.push('seed calendario: ' + e.message); console.error('Falha ao semear o calendário:', e.message); }
+  try { await seedConfiguracoes(); } catch (e) { falhasMigracao.push('seed configuracoes: ' + e.message); console.error('Falha ao semear as configurações:', e.message); }
+  await seedCursosNiveis();
+  await seedMaster();
+  console.log('Banco verificado/criado com sucesso.');
+}
+
+// ---------- Seeds de configurações padrão ----------
+// Calendário oficial 2026.2 — semeado uma única vez; edições da Gestão nunca são sobrescritas
+// Migração tolerante: registra a falha e segue, para um erro pontual não derrubar o sistema inteiro
+const falhasMigracao = [];
+async function migrar(rotulo, sql) {
+  try { await pool.query(sql); }
+  catch (e) {
+    falhasMigracao.push(rotulo + ': ' + e.message);
+    console.error(`MIGRAÇÃO FALHOU [${rotulo}] — ${e.message}`);
+  }
+}
+
+async function seedCalendario() {
+  const SEMESTRE = '2026.2';
+  const existe = await pool.query(`SELECT 1 FROM calendario WHERE semestre = $1 LIMIT 1`, [SEMESTRE]);
+  if (existe.rows.length) return;
+  const IEMA = 'Plataforma Virtual · Sábado letivo IEMA Pleno Dr.º João Bacelar Portela';
+  const eventos = [
+    ['2026-08-01', 'TCAA / Acolhimento', 'Aplicação do Teste de Conhecimentos Acumulados dos (as) alunos (as)', 'Presencial'],
+    ['2026-08-08', 'Aula I', null, 'Presencial'],
+    ['2026-08-15', 'Aula II', null, 'Presencial'],
+    ['2026-08-22', 'Aula III', IEMA, 'Online'],
+    ['2026-08-29', 'Aula IV', null, 'Presencial'],
+    ['2026-09-05', 'Aula V', null, 'Presencial'],
+    ['2026-09-12', 'Aula VI', IEMA, 'Online'],
+    ['2026-09-19', 'Aula VII', null, 'Presencial'],
+    ['2026-09-26', 'Aula VIII', null, 'Presencial'],
+    ['2026-10-03', 'Aula IX', 'Plataforma Virtual · Eleições 2026', 'Online'],
+    ['2026-10-10', 'Aula X', IEMA, 'Online'],
+    ['2026-10-17', 'Aula XI', null, 'Presencial'],
+    ['2026-10-24', 'Aula XII', IEMA, 'Online'],
+    ['2026-10-31', 'Aula XIII', null, 'Presencial'],
+    ['2026-11-07', 'Aula XIV', IEMA, 'Online'],
+    ['2026-11-14', 'Aula XV', null, 'Presencial'],
+    ['2026-11-21', 'Aula XVI', null, 'Presencial'],
+    ['2026-11-28', 'Aula XVII', IEMA, 'Online'],
+    ['2026-12-05', 'Aula XVIII', null, 'Presencial'],
+    ['2026-12-12', 'II Avaliação', null, 'Presencial'],
+    ['2026-12-19', 'Recuperação / Prova Final', null, 'Presencial'],
+    ['2027-01-09', 'Rematrícula 2027.1', 'Rematrícula para o semestre 2027.1', 'Presencial'],
+    ['2027-01-16', 'Rematrícula 2027.1', 'Rematrícula para o semestre 2027.1', 'Presencial']
+  ];
+  for (const [data, titulo, detalhe, modalidade] of eventos) {
+    await pool.query(
+      `INSERT INTO calendario (semestre, data, titulo, detalhe, modalidade) VALUES ($1,$2,$3,$4,$5)
+       ON CONFLICT (semestre, data, titulo) DO NOTHING`,
+      [SEMESTRE, data, titulo, detalhe, modalidade]);
+  }
+  console.log('Calendário 2026.2 semeado.');
+}
+
+async function seedConfiguracoes() {
+  const padroes = [
+    ['semestre_vigente', JSON.stringify('2026.2'), 'Semestre letivo vigente (formato AAAA.S)'],
+    ['capacidade_padrao_turma', JSON.stringify(15), 'Capacidade padrão de alunos por turma (ajustável por turma)'],
+    ['media_aprovacao', JSON.stringify(7), 'Média mínima para aprovação (0 a 10)'],
+    ['frequencia_minima', JSON.stringify(75), 'Frequência mínima para aprovação (%)'],
+    ['parcelas_semestre', JSON.stringify(6), 'Quantidade de mensalidades geradas por matrícula no semestre'],
+    ['dia_vencimento', JSON.stringify(10), 'Dia padrão de vencimento das mensalidades'],
+    ['taxa_matricula', JSON.stringify(0), 'Valor padrão da taxa de matrícula (R$) — ajustável no ato, paga sempre no ato'],
+    ['valor_plataforma', JSON.stringify(35), 'Valor da Taxa da Plataforma Acadêmica (R$) — lançada 1x por semestre'],
+    ['desconto_pontualidade', JSON.stringify(30), 'Desconto de pontualidade (R$) abatido da mensalidade paga até o vencimento'],
+    ['multa_atraso', JSON.stringify({ ativa: false, multa_percentual: 2, juros_dia_percentual: 0.033 }), 'Multa e juros por atraso (aplicados quando ativa = true)'],
+    ['descontos_disponiveis', JSON.stringify([25, 50, 100]), 'Percentuais de desconto disponíveis para Pagante Parcial (bolsista = 100)'],
+    ['mensalidades', JSON.stringify({ 'Inglês': 0, 'Espanhol': 0 }), 'Valor da mensalidade integral por curso (R$) — definir antes das matrículas'],
+    ['formas_pagamento', JSON.stringify(['PIX', 'DINHEIRO', 'CARTÃO DE CRÉDITO', 'CARTÃO DE DÉBITO', 'TRANSFERÊNCIA', 'MISTO']), 'Formas de pagamento aceitas'],
+    ['categorias_contas_pagar', JSON.stringify(['Aluguel', 'Energia', 'Água/Internet', 'Salários', 'Material Didático', 'Manutenção', 'Outros']), 'Categorias de contas a pagar'],
+    ['categorias_contas_receber', JSON.stringify(['Mensalidade', 'Matrícula', 'Material', 'Evento', 'Outros']), 'Categorias de contas a receber'],
+    ['dados_instituicao', JSON.stringify({
+      nome: 'Centro Maranhense de Idiomas e Culturas — CEMIC',
+      cnpj: '24.203.264/0001-00', endereco: 'São Luís - MA', telefone: '', email: '', logo_url: ''
+    }), 'Dados institucionais usados em documentos e PDFs'],
+    ['modelo_boletim', JSON.stringify({ titulo: 'Boletim de Desempenho', exibir_frequencia: true, exibir_observacoes: true, rodape: 'Documento emitido pelo CEMIC.' }), 'Modelo do boletim do aluno'],
+    ['modelo_historico', JSON.stringify({ titulo: 'Histórico Escolar', exibir_carga_horaria: true, rodape: 'Documento emitido pelo CEMIC.' }), 'Modelo do histórico do aluno'],
+    ['sistema_avaliacao', JSON.stringify({
+      bimestres: 2,
+      nota_maxima: 10,
+      etapas: {
+        '1': [
+          { nome: 'Participação nas atividades', peso: 1 },
+          { nome: 'Prova escrita', peso: 1 },
+          { nome: 'Desempenho na Plataforma', peso: 1 }
+        ],
+        '2': [
+          { nome: 'Prova escrita', peso: 1 },
+          { nome: 'Prova oral', peso: 1 },
+          { nome: 'Desempenho na Plataforma', peso: 1 }
+        ]
       }
+    }), 'Composição da nota por bimestre (etapas e pesos) — base para as avaliações das turmas'],
+    ['calendario_observacao', JSON.stringify('O presente calendário está sujeito a modificações, considerando o Calendário Escolar Regular do IEMA Pleno Dr.º João Bacelar Portela.'), 'Observação exibida ao pé do calendário acadêmico']
+    ['valor_hora_aula', JSON.stringify(0), 'Valor padrão da hora-aula do professor (R$)']
+  ];
+  for (const [chave, valor, descricao] of padroes) {
+    await pool.query(
+      `INSERT INTO configuracoes (chave, valor, descricao) VALUES ($1, $2, $3) ON CONFLICT (chave) DO NOTHING`,
+      [chave, valor, descricao]
+    );
+  }
+}
+
+// ---------- Seeds de cursos e níveis ----------
+async function seedCursosNiveis() {
+  const cursos = ['Inglês', 'Espanhol'];
+  const niveis = ['Kids', 'Basic', 'Pre-Intermediate', 'Intermediate', 'Advanced'];
+  for (const nomeCurso of cursos) {
+    const c = await pool.query(
+      `INSERT INTO cursos (nome) VALUES ($1) ON CONFLICT (nome) DO UPDATE SET nome = EXCLUDED.nome RETURNING id`,
+      [nomeCurso]
+    );
+    const cursoId = c.rows[0].id;
+    for (let i = 0; i < niveis.length; i++) {
+      await pool.query(
+        `INSERT INTO niveis (curso_id, nome, ordem) VALUES ($1, $2, $3) ON CONFLICT (curso_id, nome) DO NOTHING`,
+        [cursoId, niveis[i], i + 1]
+      );
     }
+  }
+}
 
-    const senhaHash = await bcrypt.hash(senha, 12);
-    const ehProfessor = (professor === 'pendente');
-    const codigoUsuario = gerarCodigo();
+// ---------- Bootstrap do usuário master ----------
+async function seedMaster() {
+  const existe = await pool.query(`SELECT id FROM usuarios WHERE perfil = 'master' LIMIT 1`);
+  if (existe.rows.length > 0) return;
+  if (!MASTER_SENHA) {
+    console.warn('AVISO: nenhum usuário master existe e MASTER_SENHA não foi definida. Defina MASTER_CPF e MASTER_SENHA nas variáveis do Railway e reinicie.');
+    return;
+  }
+  const hash = await bcrypt.hash(MASTER_SENHA, 10);
+  await pool.query(
+    `INSERT INTO usuarios (nome, cpf, senha_hash, perfil, status) VALUES ($1, $2, $3, 'master', 'ativo')`,
+    ['Paulo (Master)', MASTER_CPF, hash]
+  );
+  console.log('Usuário master criado a partir das variáveis de ambiente.');
+}
 
-    // Professor: conta bloqueada até aprovação master — sem código de confirmação
-    // Aluno: código gerado imediatamente
-    const codigoConfirmacao = ehProfessor ? null : gerarCodigoConfirmacao();
-    const codigoExpira = ehProfessor ? null : new Date(Date.now() + 15 * 60 * 1000);
+// ============================================================
+// 2. AUTENTICAÇÃO E MIDDLEWARES
+// ============================================================
+const limiterLogin = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  // Conta tentativas por CPF, não por IP: numa escola, dezenas de professores
+  // saem pelo mesmo IP (Wi-Fi/NAT) e travariam uns aos outros. O CPF isola cada conta.
+  keyGenerator: (req) => {
+    const cpf = String((req.body && req.body.cpf) || '').replace(/\D/g, '');
+    return cpf || (req.ip || 'sem-ip');
+  },
+  // Só tentativas malsucedidas contam; quem acerta a senha nunca é barrado.
+  skipSuccessfulRequests: true,
+  message: { erro: 'Muitas tentativas para este CPF. Aguarde 15 minutos ou peça à secretaria para redefinir seu acesso.' }
+});
 
-    const result = await pool.query(
-      `INSERT INTO usuarios
-         (nome, email, senha_hash, codigo, banca, plano, confirmado,
-          codigo_confirmacao, codigo_expira, whatsapp, whatsapp_mkt,
-          professor, cnd_arquivo)
-       VALUES ($1,$2,$3,$4,$5,$6,FALSE,$7,$8,$9,$10,$11,$12)
-       RETURNING id, nome, email, codigo`,
+const limiterPublico = rateLimit({
+  windowMs: 60 * 1000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { erro: 'Muitas requisições. Aguarde alguns instantes e tente novamente.' }
+});
+
+// Leitura leve dos dados institucionais (nome/CNPJ), chamada 1x ao entrar nos portais.
+// Fica separada e folgada porque dezenas de pais podem cair no mesmo IP público
+// (Wi-Fi da escola numa reunião, ou CGNAT das operadoras móveis) e travariam uns aos
+// outros no limite de 30/min. As rotas sensíveis (pré-inscrição, rematrícula, PIX)
+// continuam no limiterPublico de 30/min.
+const limiterInstitucional = rateLimit({
+  windowMs: 60 * 1000,
+  max: 300,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { erro: 'Muitas requisições. Aguarde alguns instantes e tente novamente.' }
+});
+
+// IA da English Platform (assistente + dicionário): limita custo/abuso mesmo com login.
+const limiterIA = rateLimit({
+  windowMs: 60 * 1000,
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { erro: 'Muitas perguntas em pouco tempo. Aguarde um instante.' }
+});
+
+function autenticar(req, res, next) {
+  const header = req.headers.authorization || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7) : null;
+  if (!token) return res.status(401).json({ erro: 'Token não fornecido.' });
+  try {
+    req.usuario = jwt.verify(token, JWT_SECRET);
+    next();
+  } catch {
+    return res.status(401).json({ erro: 'Token inválido ou expirado.' });
+  }
+}
+
+function exigirPerfil(...perfis) {
+  return (req, res, next) => {
+    if (!perfis.includes(req.usuario.perfil)) {
+      return res.status(403).json({ erro: 'Acesso negado para o seu perfil.' });
+    }
+    next();
+  };
+}
+
+const somenteGestao = exigirPerfil('master', 'secretaria');
+
+function autenticarResponsavel(req, res, next) {
+  const header = req.headers.authorization || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7) : null;
+  if (!token) return res.status(401).json({ erro: 'Sessão não encontrada. Faça login.' });
+  try {
+    const dados = jwt.verify(token, JWT_SECRET);
+    if (dados.perfil !== 'responsavel') return res.status(403).json({ erro: 'Acesso negado.' });
+    req.responsavelId = dados.responsavel_id;
+    req.responsavelNome = dados.nome;
+    next();
+  } catch {
+    return res.status(401).json({ erro: 'Sessão inválida ou expirada. Faça login novamente.' });
+  }
+}
+async function alunosDoResponsavel(respId) {
+  const r = await pool.query(
+    `SELECT a.id, a.nome, a.cpf, a.codigo, a.data_nascimento,
+            t.nome AS turma_nome, t.turno, n.nome AS nivel_nome, c.nome AS curso_nome,
+            p.nome AS professor_nome,
+            COALESCE(ep.status, 'nenhum') AS english_platform_status
+     FROM aluno_responsavel ar
+     JOIN alunos a ON a.id = ar.aluno_id
+     LEFT JOIN matriculas m ON m.aluno_id = a.id AND m.status = 'ativa'
+     LEFT JOIN turmas t ON t.id = m.turma_id
+     LEFT JOIN niveis n ON n.id = t.nivel_id
+     LEFT JOIN cursos c ON c.id = n.curso_id
+     LEFT JOIN professores p ON p.id = t.professor_id
+     LEFT JOIN english_platform_acesso ep ON ep.aluno_id = a.id
+     WHERE ar.responsavel_id = $1
+     ORDER BY a.nome`, [respId]);
+  return r.rows;
+}
+
+function obrigatorios(body, campos) {
+  const faltando = campos.filter(c => body[c] === undefined || body[c] === null || body[c] === '');
+  return faltando.length ? `Campos obrigatórios ausentes: ${faltando.join(', ')}` : null;
+}
+
+const soDigitos = (s) => String(s || '').replace(/\D/g, '');
+
+// Validação matemática de CPF (dígitos verificadores)
+function cpfValido(cpf) {
+  cpf = soDigitos(cpf);
+  if (cpf.length !== 11 || /^(\d)\1{10}$/.test(cpf)) return false;
+  let s = 0;
+  for (let i = 0; i < 9; i++) s += Number(cpf[i]) * (10 - i);
+  if ((s * 10) % 11 % 10 !== Number(cpf[9])) return false;
+  s = 0;
+  for (let i = 0; i < 10; i++) s += Number(cpf[i]) * (11 - i);
+  return (s * 10) % 11 % 10 === Number(cpf[10]);
+}
+
+// ---------- POST /auth/login ----------
+app.post('/auth/login', limiterLogin, async (req, res) => {
+  try {
+    const erro = obrigatorios(req.body, ['cpf', 'senha']);
+    if (erro) return res.status(400).json({ erro });
+    const cpf = soDigitos(req.body.cpf);
+    const r = await pool.query(`SELECT * FROM usuarios WHERE cpf = $1`, [cpf]);
+    const u = r.rows[0];
+    if (!u || u.status !== 'ativo') return res.status(401).json({ erro: 'CPF ou senha inválidos.' });
+    const ok = await bcrypt.compare(req.body.senha, u.senha_hash);
+    if (!ok) return res.status(401).json({ erro: 'CPF ou senha inválidos.' });
+    await pool.query(`UPDATE usuarios SET ultimo_acesso = NOW() WHERE id = $1`, [u.id]);
+    const token = jwt.sign(
+      { id: u.id, nome: u.nome, perfil: u.perfil, referencia_id: u.referencia_id },
+      JWT_SECRET,
+      { expiresIn: '8h' }
+    );
+    res.json({
+      token,
+      usuario: { id: u.id, nome: u.nome, perfil: u.perfil, senha_provisoria: u.senha_provisoria }
+    });
+  } catch (e) {
+    console.error('Erro /auth/login:', e);
+    res.status(500).json({ erro: 'Erro interno no login.' });
+  }
+});
+
+// ---------- POST /auth/trocar-senha ----------
+app.post('/auth/trocar-senha', autenticar, async (req, res) => {
+  try {
+    const erro = obrigatorios(req.body, ['senha_atual', 'senha_nova']);
+    if (erro) return res.status(400).json({ erro });
+    if (String(req.body.senha_nova).length < 8) {
+      return res.status(400).json({ erro: 'A nova senha deve ter ao menos 8 caracteres.' });
+    }
+    const r = await pool.query(`SELECT senha_hash FROM usuarios WHERE id = $1`, [req.usuario.id]);
+    const ok = await bcrypt.compare(req.body.senha_atual, r.rows[0].senha_hash);
+    if (!ok) return res.status(401).json({ erro: 'Senha atual incorreta.' });
+    const hash = await bcrypt.hash(req.body.senha_nova, 10);
+    await pool.query(`UPDATE usuarios SET senha_hash = $1, senha_provisoria = FALSE WHERE id = $2`, [hash, req.usuario.id]);
+    res.json({ mensagem: 'Senha alterada com sucesso.' });
+  } catch (e) {
+    console.error('Erro /auth/trocar-senha:', e);
+    res.status(500).json({ erro: 'Erro interno ao trocar senha.' });
+  }
+});
+
+// ============================================================
+// 3. CONFIGURAÇÕES
+// ============================================================
+app.get('/admin/configuracoes', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const r = await pool.query(`SELECT chave, valor, descricao, atualizado_em FROM configuracoes ORDER BY chave`);
+    res.json(r.rows);
+  } catch (e) {
+    console.error('Erro GET configuracoes:', e);
+    res.status(500).json({ erro: 'Erro ao listar configurações.' });
+  }
+});
+
+app.put('/admin/configuracoes/:chave', autenticar, exigirPerfil('master'), async (req, res) => {
+  try {
+    if (req.body.valor === undefined) return res.status(400).json({ erro: 'Campo "valor" é obrigatório.' });
+    const r = await pool.query(
+      `INSERT INTO configuracoes (chave, valor, atualizado_em, atualizado_por)
+       VALUES ($1, $2, NOW(), $3)
+       ON CONFLICT (chave) DO UPDATE SET valor = EXCLUDED.valor, atualizado_em = NOW(), atualizado_por = EXCLUDED.atualizado_por
+       RETURNING chave, valor`,
+      [req.params.chave, JSON.stringify(req.body.valor), req.usuario.id]
+    );
+    res.json({ mensagem: 'Configuração atualizada.', configuracao: r.rows[0] });
+  } catch (e) {
+    console.error('Erro PUT configuracoes:', e);
+    res.status(500).json({ erro: 'Erro ao atualizar configuração.' });
+  }
+});
+
+async function marcarAtrasados() {
+  await pool.query(`UPDATE contas_receber SET status='atrasada' WHERE status='pendente' AND vencimento < CURRENT_DATE`);
+  await pool.query(`UPDATE contas_pagar SET status='atrasada' WHERE status='pendente' AND vencimento < CURRENT_DATE`);
+}
+
+async function getConfig(chave, padrao = null) {
+  const r = await pool.query(`SELECT valor FROM configuracoes WHERE chave = $1`, [chave]);
+  return r.rows.length ? r.rows[0].valor : padrao;
+}
+
+// ============================================================
+// 4. CRUD — ALUNOS
+// ============================================================
+app.get('/admin/alunos', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const { busca, status, modalidade } = req.query;
+    const cond = [];
+    const params = [];
+    if (busca) { params.push(`%${busca}%`); cond.push(`(a.nome ILIKE $${params.length} OR a.cpf ILIKE $${params.length})`); }
+    if (status) { params.push(status); cond.push(`a.status = $${params.length}`); }
+    if (modalidade) { params.push(modalidade); cond.push(`a.modalidade = $${params.length}`); }
+    const where = cond.length ? `WHERE ${cond.join(' AND ')}` : '';
+    const r = await pool.query(`SELECT a.* FROM alunos a ${where} ORDER BY a.nome`, params);
+    res.json(r.rows);
+  } catch (e) {
+    console.error('Erro GET alunos:', e);
+    res.status(500).json({ erro: 'Erro ao listar alunos.' });
+  }
+});
+
+app.get('/admin/alunos/:id', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const a = await pool.query(`SELECT * FROM alunos WHERE id = $1`, [req.params.id]);
+    if (!a.rows.length) return res.status(404).json({ erro: 'Aluno não encontrado.' });
+    const resp = await pool.query(
+      `SELECT ar.id AS vinculo_id, r.id, r.nome, r.cpf, r.whatsapp, r.email, ar.parentesco, ar.responsavel_financeiro
+       FROM aluno_responsavel ar JOIN responsaveis r ON r.id = ar.responsavel_id
+       WHERE ar.aluno_id = $1`, [req.params.id]
+    );
+    res.json({ ...a.rows[0], responsaveis: resp.rows });
+  } catch (e) {
+    console.error('Erro GET aluno:', e);
+    res.status(500).json({ erro: 'Erro ao buscar aluno.' });
+  }
+});
+
+app.post('/admin/alunos', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const erro = obrigatorios(req.body, ['nome', 'modalidade']);
+    if (erro) return res.status(400).json({ erro });
+    const { nome, data_nascimento, email, whatsapp, modalidade, observacoes } = req.body;
+    const cpf = req.body.cpf ? soDigitos(req.body.cpf) : null;
+    if (cpf && !cpfValido(cpf)) return res.status(400).json({ erro: 'CPF do aluno inválido — confira os dígitos.' });
+
+    // Desconto fixo em R$ na mensalidade (apenas Pagante Parcial; bolsista é isento; taxa de matrícula nunca tem desconto)
+    let desconto = Number(req.body.desconto_valor || 0);
+    if (modalidade !== 'pagante_parcial' || isNaN(desconto) || desconto < 0) desconto = 0;
+
+    const r = await pool.query(
+      `INSERT INTO alunos (nome, data_nascimento, email, cpf, whatsapp, modalidade, desconto_valor, observacoes)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
+      [nome, data_nascimento || null, email || null, cpf, whatsapp || null, modalidade, desconto, observacoes || null]
+    );
+    res.status(201).json(r.rows[0]);
+  } catch (e) {
+    if (e.code === '23505') return res.status(409).json({ erro: 'Já existe aluno com este CPF.' });
+    console.error('Erro POST aluno:', e);
+    res.status(500).json({ erro: 'Erro ao cadastrar aluno.' });
+  }
+});
+
+app.put('/admin/alunos/:id', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const atual = await pool.query(`SELECT * FROM alunos WHERE id = $1`, [req.params.id]);
+    if (!atual.rows.length) return res.status(404).json({ erro: 'Aluno não encontrado.' });
+    const a = atual.rows[0];
+    const modalidade = req.body.modalidade || a.modalidade;
+    let desconto = req.body.desconto_valor !== undefined ? Number(req.body.desconto_valor) : Number(a.desconto_valor || 0);
+    if (modalidade !== 'pagante_parcial' || isNaN(desconto) || desconto < 0) desconto = 0;
+    if (req.body.cpf !== undefined && soDigitos(req.body.cpf) && !cpfValido(soDigitos(req.body.cpf))) {
+      return res.status(400).json({ erro: 'CPF do aluno inválido — confira os dígitos.' });
+    }
+    const r = await pool.query(
+      `UPDATE alunos SET nome=$1, data_nascimento=$2, email=$3, cpf=$4, whatsapp=$5, status=$6, modalidade=$7, desconto_valor=$8, observacoes=$9
+       WHERE id=$10 RETURNING *`,
       [
-        nome, email.toLowerCase(), senhaHash, codigoUsuario,
-        banca || 'ENEM', plano || 'aluno',
-        codigoConfirmacao, codigoExpira,
-        whatsapp || null, whatsapp_mkt || false,
-        professor || 'nao', cnd_arquivo || null
+        req.body.nome ?? a.nome,
+        req.body.data_nascimento ?? a.data_nascimento,
+        req.body.email ?? a.email,
+        req.body.cpf !== undefined ? soDigitos(req.body.cpf) : a.cpf,
+        req.body.whatsapp ?? a.whatsapp,
+        req.body.status ?? a.status,
+        modalidade, desconto,
+        req.body.observacoes ?? a.observacoes,
+        req.params.id
       ]
     );
+    res.json(r.rows[0]);
+  } catch (e) {
+    if (e.code === '23505') return res.status(409).json({ erro: 'Já existe aluno com este CPF.' });
+    console.error('Erro PUT aluno:', e);
+    res.status(500).json({ erro: 'Erro ao atualizar aluno.' });
+  }
+});
 
-    if (escola && result.rows[0]?.id) {
-      await pool.query(
-        `UPDATE usuarios SET escola = $1 WHERE id = $2`,
-        [escola, result.rows[0].id]
-      ).catch(() => {});
+app.delete('/admin/alunos/:id', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const m = await pool.query(`SELECT COUNT(*)::int AS n FROM matriculas WHERE aluno_id = $1`, [req.params.id]);
+    if (m.rows[0].n > 0) {
+      return res.status(409).json({ erro: 'Aluno possui matrículas registradas. Para preservar o histórico, altere o status para "inativo" em vez de excluir.' });
     }
+    const r = await pool.query(`DELETE FROM alunos WHERE id = $1 RETURNING id`, [req.params.id]);
+    if (!r.rows.length) return res.status(404).json({ erro: 'Aluno não encontrado.' });
+    res.json({ mensagem: 'Aluno excluído.' });
+  } catch (e) {
+    console.error('Erro DELETE aluno:', e);
+    res.status(500).json({ erro: 'Erro ao excluir aluno.' });
+  }
+});
 
-    if (indicanteValido && result.rows[0]?.id) {
-      await pool.query(
-        `UPDATE usuarios SET codigo_indicante = $1 WHERE id = $2`,
-        [indicanteValido, result.rows[0].id]
-      ).catch(e => console.warn('[cadastro] codigo_indicante não salvo:', e.message));
-    }
-
-    // ── PROFESSOR: inserir em solicitacoes_professor + log ────────────
-    if (ehProfessor && result.rows[0]?.id) {
-      try {
-        // Verificar se já existe solicitação pendente (segurança extra)
-        const solExiste = await pool.query(
-          `SELECT id FROM solicitacoes_professor WHERE usuario_id = $1 AND status = 'pendente'`,
-          [result.rows[0].id]
+// ---------- Vínculo aluno ↔ responsável ----------
+app.post('/admin/alunos/:id/responsaveis', autenticar, somenteGestao, async (req, res) => {
+  try {
+    // Aceita responsavel_id (vínculo direto) OU dados do responsável (nome + cpf),
+    // com upsert por CPF: se já existe, atualiza contato e apenas vincula.
+    let respId = req.body.responsavel_id || null;
+    if (!respId) {
+      const erro = obrigatorios(req.body, ['nome', 'cpf']);
+      if (erro) return res.status(400).json({ erro });
+      const cpf = soDigitos(req.body.cpf);
+      if (!cpfValido(cpf)) return res.status(400).json({ erro: 'CPF do responsável inválido — confira os dígitos.' });
+      const existe = await pool.query(`SELECT id FROM responsaveis WHERE cpf = $1`, [cpf]);
+      if (existe.rows.length) {
+        respId = existe.rows[0].id;
+        await pool.query(
+          `UPDATE responsaveis SET nome=$1, email=COALESCE(NULLIF($2,''), email), whatsapp=COALESCE(NULLIF($3,''), whatsapp) WHERE id=$4`,
+          [req.body.nome, req.body.email || '', req.body.whatsapp || '', respId]
         );
-        if (solExiste.rows.length === 0) {
-          // Detectar MIME pelo nome do arquivo
-          const nomeArq = cnd_arquivo || 'documento';
-          const mimeDetectado = nomeArq.toLowerCase().endsWith('.pdf') ? 'application/pdf'
-            : nomeArq.toLowerCase().endsWith('.png') ? 'image/png'
-            : nomeArq.toLowerCase().endsWith('.jpg') || nomeArq.toLowerCase().endsWith('.jpeg') ? 'image/jpeg'
-            : nomeArq.toLowerCase().endsWith('.docx') ? 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
-            : nomeArq.toLowerCase().endsWith('.doc') ? 'application/msword'
-            : 'application/pdf';
-          await pool.query(
-            `INSERT INTO solicitacoes_professor
-               (usuario_id, usuario_nome, usuario_email, tipo_documento,
-                arquivo_nome, arquivo_base64, arquivo_mime)
-             VALUES ($1,$2,$3,'CND',$4,$5,$6)`,
-            [result.rows[0].id, nome, email.toLowerCase(),
-             nomeArq, cnd_base64 || '', mimeDetectado]
-          );
-        }
-        await log(result.rows[0].id, email, 'cadastro_professor', 'ok',
-          { status: 'aguardando_aprovacao_master' });
-        console.log(`[cadastro] Professor cadastrado aguardando aprovação: ${email}`);
-      } catch (solErr) {
-        console.error('[cadastro] Erro ao registrar solicitação professor:', solErr.message);
+      } else {
+        const novo = await pool.query(
+          `INSERT INTO responsaveis (nome, cpf, email, whatsapp) VALUES ($1,$2,$3,$4) RETURNING id`,
+          [req.body.nome, cpf, req.body.email || null, req.body.whatsapp || null]
+        );
+        respId = novo.rows[0].id;
       }
+    }
+    const r = await pool.query(
+      `INSERT INTO aluno_responsavel (aluno_id, responsavel_id, parentesco, responsavel_financeiro)
+       VALUES ($1,$2,$3,$4) RETURNING *`,
+      [req.params.id, respId, req.body.parentesco || null, !!req.body.responsavel_financeiro]
+    );
+    res.status(201).json(r.rows[0]);
+  } catch (e) {
+    if (e.code === '23505') return res.status(409).json({ erro: 'Este responsável já está vinculado ao aluno.' });
+    if (e.code === '23503') return res.status(400).json({ erro: 'Aluno ou responsável inexistente.' });
+    console.error('Erro vínculo responsável:', e);
+    res.status(500).json({ erro: 'Erro ao vincular responsável.' });
+  }
+});
 
-      return res.json({
-        ok: true,
-        professor_pendente: true,
-        mensagem: 'Cadastro recebido! Seu documento está em análise. Você receberá um e-mail quando sua conta for aprovada.',
-        usuario: result.rows[0]
-      });
+app.delete('/admin/alunos/:id/responsaveis/:vinculoId', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const r = await pool.query(
+      `DELETE FROM aluno_responsavel WHERE id = $1 AND aluno_id = $2 RETURNING id`,
+      [req.params.vinculoId, req.params.id]
+    );
+    if (!r.rows.length) return res.status(404).json({ erro: 'Vínculo não encontrado.' });
+    res.json({ mensagem: 'Vínculo removido.' });
+  } catch (e) {
+    console.error('Erro remover vínculo:', e);
+    res.status(500).json({ erro: 'Erro ao remover vínculo.' });
+  }
+});
+
+// ============================================================
+// 5. CRUD — RESPONSÁVEIS
+// ============================================================
+app.get('/admin/responsaveis', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const { busca } = req.query;
+    const params = [];
+    let where = '';
+    if (busca) { params.push(`%${busca}%`); where = `WHERE nome ILIKE $1 OR cpf ILIKE $1`; }
+    // Nunca devolver senha_hash ao frontend — apenas se o acesso ao portal já foi criado
+    const r = await pool.query(
+      `SELECT id, nome, cpf, email, whatsapp, (senha_hash IS NOT NULL) AS cadastrado
+       FROM responsaveis ${where} ORDER BY nome`, params);
+    res.json(r.rows);
+  } catch (e) {
+    console.error('Erro GET responsaveis:', e);
+    res.status(500).json({ erro: 'Erro ao listar responsáveis.' });
+  }
+});
+
+app.post('/admin/responsaveis', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const erro = obrigatorios(req.body, ['nome', 'cpf']);
+    if (erro) return res.status(400).json({ erro });
+    if (!cpfValido(soDigitos(req.body.cpf))) return res.status(400).json({ erro: 'CPF do responsável inválido — confira os dígitos.' });
+    const r = await pool.query(
+      `INSERT INTO responsaveis (nome, cpf, email, whatsapp) VALUES ($1,$2,$3,$4) RETURNING *`,
+      [req.body.nome, soDigitos(req.body.cpf), req.body.email || null, req.body.whatsapp || null]
+    );
+    res.status(201).json(r.rows[0]);
+  } catch (e) {
+    if (e.code === '23505') return res.status(409).json({ erro: 'Já existe responsável com este CPF.' });
+    console.error('Erro POST responsavel:', e);
+    res.status(500).json({ erro: 'Erro ao cadastrar responsável.' });
+  }
+});
+
+app.put('/admin/responsaveis/:id', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const atual = await pool.query(`SELECT * FROM responsaveis WHERE id = $1`, [req.params.id]);
+    if (!atual.rows.length) return res.status(404).json({ erro: 'Responsável não encontrado.' });
+    const x = atual.rows[0];
+    const r = await pool.query(
+      `UPDATE responsaveis SET nome=$1, cpf=$2, email=$3, whatsapp=$4 WHERE id=$5 RETURNING *`,
+      [
+        req.body.nome ?? x.nome,
+        req.body.cpf !== undefined ? soDigitos(req.body.cpf) : x.cpf,
+        req.body.email ?? x.email,
+        req.body.whatsapp ?? x.whatsapp,
+        req.params.id
+      ]
+    );
+    res.json(r.rows[0]);
+  } catch (e) {
+    if (e.code === '23505') return res.status(409).json({ erro: 'Já existe responsável com este CPF.' });
+    console.error('Erro PUT responsavel:', e);
+    res.status(500).json({ erro: 'Erro ao atualizar responsável.' });
+  }
+});
+
+// Redefinir acesso: apaga a senha para o responsável refazer o primeiro acesso
+app.post('/admin/responsaveis/:id/redefinir-acesso', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const r = await pool.query(
+      `UPDATE responsaveis SET senha_hash = NULL WHERE id = $1 RETURNING nome, cpf`, [Number(req.params.id)]);
+    if (!r.rowCount) return res.status(404).json({ erro: 'Responsável não encontrado.' });
+    console.log(`Acesso ao Portal redefinido: responsável ${r.rows[0].nome} por usuário ${req.usuario.id}`);
+    res.json({ ok: true, nome: r.rows[0].nome });
+  } catch (e) { console.error('Erro redefinir acesso:', e); res.status(500).json({ erro: 'Erro ao redefinir o acesso.' }); }
+});
+
+app.delete('/admin/responsaveis/:id', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const r = await pool.query(`DELETE FROM responsaveis WHERE id = $1 RETURNING id`, [req.params.id]);
+    if (!r.rows.length) return res.status(404).json({ erro: 'Responsável não encontrado.' });
+    res.json({ mensagem: 'Responsável excluído (vínculos com alunos removidos automaticamente).' });
+  } catch (e) {
+    console.error('Erro DELETE responsavel:', e);
+    res.status(500).json({ erro: 'Erro ao excluir responsável.' });
+  }
+});
+
+// ============================================================
+// 6. CRUD — PROFESSORES
+// ============================================================
+app.get('/admin/professores', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const r = await pool.query(`SELECT * FROM professores ORDER BY nome`);
+    res.json(r.rows);
+  } catch (e) {
+    console.error('Erro GET professores:', e);
+    res.status(500).json({ erro: 'Erro ao listar professores.' });
+  }
+});
+
+app.post('/admin/professores', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const erro = obrigatorios(req.body, ['nome']);
+    if (erro) return res.status(400).json({ erro });
+    const r = await pool.query(
+      `INSERT INTO professores (nome, cpf, email, formacao, whatsapp, data_nascimento, data_ingresso) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
+      [req.body.nome, req.body.cpf || null, req.body.email || null, req.body.formacao || null, req.body.whatsapp || null, req.body.data_nascimento || null, req.body.data_ingresso || null]
+    );
+    res.status(201).json(r.rows[0]);
+  } catch (e) {
+    console.error('Erro POST professor:', e);
+    res.status(500).json({ erro: 'Erro ao cadastrar professor.' });
+  }
+});
+
+app.put('/admin/professores/:id', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const atual = await pool.query(`SELECT * FROM professores WHERE id = $1`, [req.params.id]);
+    if (!atual.rows.length) return res.status(404).json({ erro: 'Professor não encontrado.' });
+    const x = atual.rows[0];
+    const r = await pool.query(
+      `UPDATE professores SET nome=$1, cpf=$2, email=$3, formacao=$4, whatsapp=$5, data_nascimento=$6, data_ingresso=$7, status=$8 WHERE id=$9 RETURNING *`,
+      [
+        req.body.nome ?? x.nome, req.body.cpf ?? x.cpf, req.body.email ?? x.email, req.body.formacao ?? x.formacao,
+        req.body.whatsapp ?? x.whatsapp, req.body.data_nascimento ?? x.data_nascimento,
+        req.body.data_ingresso ?? x.data_ingresso, req.body.status ?? x.status, req.params.id
+      ]
+    );
+    res.json(r.rows[0]);
+  } catch (e) {
+    console.error('Erro PUT professor:', e);
+    res.status(500).json({ erro: 'Erro ao atualizar professor.' });
+  }
+});
+
+app.delete('/admin/professores/:id', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const t = await pool.query(`SELECT COUNT(*)::int AS n FROM turmas WHERE professor_id = $1`, [req.params.id]);
+    if (t.rows[0].n > 0) {
+      return res.status(409).json({ erro: 'Professor vinculado a turmas. Altere o status para "inativo" ou troque o professor das turmas antes de excluir.' });
+    }
+    const r = await pool.query(`DELETE FROM professores WHERE id = $1 RETURNING id`, [req.params.id]);
+    if (!r.rows.length) return res.status(404).json({ erro: 'Professor não encontrado.' });
+    res.json({ mensagem: 'Professor excluído.' });
+  } catch (e) {
+    console.error('Erro DELETE professor:', e);
+    res.status(500).json({ erro: 'Erro ao excluir professor.' });
+  }
+});
+
+// ============================================================
+// 7. CRUD — CURSOS E NÍVEIS
+// ============================================================
+app.get('/admin/cursos', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const cursos = await pool.query(`SELECT * FROM cursos ORDER BY nome`);
+    const niveis = await pool.query(`SELECT * FROM niveis ORDER BY curso_id, ordem`);
+    res.json(cursos.rows.map(c => ({ ...c, niveis: niveis.rows.filter(n => n.curso_id === c.id) })));
+  } catch (e) {
+    console.error('Erro GET cursos:', e);
+    res.status(500).json({ erro: 'Erro ao listar cursos.' });
+  }
+});
+
+app.post('/admin/cursos', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const erro = obrigatorios(req.body, ['nome']);
+    if (erro) return res.status(400).json({ erro });
+    const r = await pool.query(`INSERT INTO cursos (nome) VALUES ($1) RETURNING *`, [req.body.nome]);
+    res.status(201).json(r.rows[0]);
+  } catch (e) {
+    if (e.code === '23505') return res.status(409).json({ erro: 'Já existe curso com este nome.' });
+    console.error('Erro POST curso:', e);
+    res.status(500).json({ erro: 'Erro ao cadastrar curso.' });
+  }
+});
+
+app.post('/admin/niveis', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const erro = obrigatorios(req.body, ['curso_id', 'nome', 'ordem']);
+    if (erro) return res.status(400).json({ erro });
+    const r = await pool.query(
+      `INSERT INTO niveis (curso_id, nome, ordem, carga_horaria) VALUES ($1,$2,$3,$4) RETURNING *`,
+      [req.body.curso_id, req.body.nome, req.body.ordem, req.body.carga_horaria || null]
+    );
+    res.status(201).json(r.rows[0]);
+  } catch (e) {
+    if (e.code === '23505') return res.status(409).json({ erro: 'Já existe nível com este nome neste curso.' });
+    if (e.code === '23503') return res.status(400).json({ erro: 'Curso inexistente.' });
+    console.error('Erro POST nivel:', e);
+    res.status(500).json({ erro: 'Erro ao cadastrar nível.' });
+  }
+});
+
+app.put('/admin/niveis/:id', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const atual = await pool.query(`SELECT * FROM niveis WHERE id = $1`, [req.params.id]);
+    if (!atual.rows.length) return res.status(404).json({ erro: 'Nível não encontrado.' });
+    const x = atual.rows[0];
+    const r = await pool.query(
+      `UPDATE niveis SET nome=$1, ordem=$2, carga_horaria=$3 WHERE id=$4 RETURNING *`,
+      [req.body.nome ?? x.nome, req.body.ordem ?? x.ordem, req.body.carga_horaria ?? x.carga_horaria, req.params.id]
+    );
+    res.json(r.rows[0]);
+  } catch (e) {
+    console.error('Erro PUT nivel:', e);
+    res.status(500).json({ erro: 'Erro ao atualizar nível.' });
+  }
+});
+
+app.delete('/admin/niveis/:id', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const t = await pool.query(`SELECT COUNT(*)::int AS n FROM turmas WHERE nivel_id = $1`, [req.params.id]);
+    if (t.rows[0].n > 0) return res.status(409).json({ erro: 'Nível vinculado a turmas existentes. Exclusão bloqueada para preservar o histórico.' });
+    const r = await pool.query(`DELETE FROM niveis WHERE id = $1 RETURNING id`, [req.params.id]);
+    if (!r.rows.length) return res.status(404).json({ erro: 'Nível não encontrado.' });
+    res.json({ mensagem: 'Nível excluído.' });
+  } catch (e) {
+    console.error('Erro DELETE nivel:', e);
+    res.status(500).json({ erro: 'Erro ao excluir nível.' });
+  }
+});
+
+// ============================================================
+// 8. CRUD — TURMAS
+// ============================================================
+// Folha física de chamada por professor: turmas, alunos ativos e sábados letivos do calendário
+app.get('/admin/professores/:id/folha-chamada', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const profId = Number(req.params.id);
+    const semestre = req.query.semestre || await getConfig('semestre_vigente', '2026.2');
+    const prof = await pool.query(`SELECT nome, codigo FROM professores WHERE id = $1`, [profId]);
+    if (!prof.rows.length) return res.status(404).json({ erro: 'Professor não encontrado.' });
+    const inst = (await getConfig('dados_instituicao', {})) || {};
+
+    const turmasQ = await pool.query(
+      `SELECT t.id, t.nome, t.turno, t.horario, n.nome AS nivel_nome
+         FROM turmas t JOIN niveis n ON n.id = t.nivel_id
+        WHERE t.professor_id = $1 AND t.semestre = $2 AND t.status <> 'encerrada'
+        ORDER BY t.turno, t.nome`, [profId, semestre]);
+    const turmas = [];
+    for (const t of turmasQ.rows) {
+      const al = await pool.query(
+        `SELECT a.nome FROM matriculas m JOIN alunos a ON a.id = m.aluno_id
+          WHERE m.turma_id = $1 AND m.status = 'ativa' ORDER BY a.nome`, [t.id]);
+      turmas.push({ nome: t.nome, turno: t.turno, horario: t.horario, nivel_nome: t.nivel_nome, alunos: al.rows.map(r => r.nome) });
     }
 
-    // ── ALUNO: enviar e-mail de confirmação normalmente ───────────────
-    try {
-      await enviarEmailConfirmacao(email, nome, codigoConfirmacao);
-      console.log('[cadastro] E-mail enviado para:', email);
-    } catch (emailErr) {
-      console.error('[cadastro] FALHA e-mail:', emailErr.message);
-    }
+    // Dias de aula do semestre (exclui rematrícula, que é do semestre seguinte)
+    const cal = await pool.query(
+      `SELECT to_char(data, 'YYYY-MM-DD') AS data, titulo, modalidade
+         FROM calendario
+        WHERE semestre = $1 AND titulo NOT ILIKE '%rematr%'
+        ORDER BY data`, [semestre]);
 
     res.json({
-      ok: true,
-      mensagem: 'Cadastro realizado! Verifique seu e-mail e insira o código de confirmação.',
-      usuario: result.rows[0]
+      professor: prof.rows[0],
+      semestre,
+      instituicao: { nome: inst.nome || 'CEMIC — Centro Maranhense de Idiomas e Culturas', cnpj: inst.cnpj || '' },
+      sabados: cal.rows,
+      turmas
     });
+  } catch (e) { console.error('Erro folha de chamada:', e); res.status(500).json({ erro: 'Erro ao montar a folha de chamada.' }); }
+});
 
-  } catch (err) {
-    console.error('Erro no cadastro:', err.message);
-    res.status(500).json({ erro: 'Erro ao realizar cadastro.' });
+app.get('/admin/turmas', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const { semestre, status } = req.query;
+    const cond = []; const params = [];
+    if (semestre) { params.push(semestre); cond.push(`t.semestre = $${params.length}`); }
+    if (status) { params.push(status); cond.push(`t.status = $${params.length}`); }
+    const where = cond.length ? `WHERE ${cond.join(' AND ')}` : '';
+    const r = await pool.query(
+      `SELECT t.*, n.nome AS nivel_nome, c.nome AS curso_nome, p.nome AS professor_nome,
+              (SELECT COUNT(*)::int FROM matriculas m WHERE m.turma_id = t.id AND m.status = 'ativa') AS matriculados
+       FROM turmas t
+       JOIN niveis n ON n.id = t.nivel_id
+       JOIN cursos c ON c.id = n.curso_id
+       LEFT JOIN professores p ON p.id = t.professor_id
+       ${where}
+       ORDER BY t.semestre DESC, c.nome, n.ordem, t.nome`, params
+    );
+    res.json(r.rows);
+  } catch (e) {
+    console.error('Erro GET turmas:', e);
+    res.status(500).json({ erro: 'Erro ao listar turmas.' });
   }
 });
 
-app.post('/confirmar', async (req, res) => {
+app.post('/admin/turmas', autenticar, somenteGestao, async (req, res) => {
   try {
-    const { email, codigo } = req.body;
-    if (!email || !codigo)
-      return res.status(400).json({ erro: 'E-mail e código são obrigatórios.' });
-
-    const result = await pool.query(
-      `SELECT id, nome, email, codigo, banca, plano, confirmado,
-              codigo_confirmacao, codigo_expira, codigo_indicante,
-              avaliacoes_disponiveis, total_indicacoes
-       FROM usuarios WHERE email = $1`,
-      [email.toLowerCase()]
+    const erro = obrigatorios(req.body, ['nivel_id', 'nome', 'semestre']);
+    if (erro) return res.status(400).json({ erro });
+    let capacidade = req.body.capacidade;
+    if (capacidade === undefined || capacidade === null || capacidade === '') {
+      capacidade = (await getConfig('capacidade_padrao_turma', 15)) || 15;
+    }
+    const r = await pool.query(
+      `INSERT INTO turmas (nivel_id, nome, semestre, turno, horario, professor_id, capacidade)
+       VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
+      [req.body.nivel_id, req.body.nome, req.body.semestre, req.body.turno || null,
+       req.body.horario || null, req.body.professor_id || null, Number(capacidade)]
     );
-    if (!result.rows.length)
-      return res.status(404).json({ erro: 'E-mail não encontrado.' });
+    res.status(201).json(r.rows[0]);
+  } catch (e) {
+    if (e.code === '23505') return res.status(409).json({ erro: 'Já existe turma com este nome neste semestre.' });
+    if (e.code === '23503') return res.status(400).json({ erro: 'Nível ou professor inexistente.' });
+    console.error('Erro POST turma:', e);
+    res.status(500).json({ erro: 'Erro ao cadastrar turma.' });
+  }
+});
 
-    const usuario = result.rows[0];
+app.put('/admin/turmas/:id', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const atual = await pool.query(`SELECT * FROM turmas WHERE id = $1`, [req.params.id]);
+    if (!atual.rows.length) return res.status(404).json({ erro: 'Turma não encontrada.' });
+    const x = atual.rows[0];
+    const r = await pool.query(
+      `UPDATE turmas SET nivel_id=$1, nome=$2, semestre=$3, turno=$4, horario=$5, professor_id=$6, capacidade=$7, status=$8
+       WHERE id=$9 RETURNING *`,
+      [
+        req.body.nivel_id ?? x.nivel_id, req.body.nome ?? x.nome, req.body.semestre ?? x.semestre,
+        req.body.turno ?? x.turno, req.body.horario ?? x.horario,
+        req.body.professor_id !== undefined ? req.body.professor_id : x.professor_id,
+        req.body.capacidade ?? x.capacidade, req.body.status ?? x.status, req.params.id
+      ]
+    );
+    res.json(r.rows[0]);
+  } catch (e) {
+    if (e.code === '23505') return res.status(409).json({ erro: 'Já existe turma com este nome neste semestre.' });
+    console.error('Erro PUT turma:', e);
+    res.status(500).json({ erro: 'Erro ao atualizar turma.' });
+  }
+});
 
-    if (usuario.confirmado) {
-      return res.json({
-        ok: true,
-        mensagem: 'Conta já confirmada.',
-        usuario: {
-          id: usuario.id, nome: usuario.nome, email: usuario.email,
-          codigo: usuario.codigo, banca: usuario.banca, plano: usuario.plano,
-          avaliacoes_disponiveis: usuario.avaliacoes_disponiveis || 0,
-          total_indicacoes: usuario.total_indicacoes || 0
-        }
-      });
+app.post('/admin/turmas/padronizar-horarios', autenticar, exigirPerfil('master'), async (req, res) => {
+  try {
+    const PADRAO = {
+      Matutino: '8h às 11h45',
+      Vespertino: '13h30 às 17h15',
+      Noturno: '19h20 às 21h30'
+    };
+    // sobrescrever=false (padrão): só ajusta turmas cujo horário está vazio ou diferente do padrão do turno.
+    // sobrescrever=true: força o padrão em todas as turmas ativas com turno reconhecido.
+    const somenteVazias = req.body.somente_vazias === true;
+    const cond = somenteVazias ? "AND (horario IS NULL OR horario = '')" : '';
+    let total = 0;
+    for (const [turno, horario] of Object.entries(PADRAO)) {
+      const r = await pool.query(
+        `UPDATE turmas SET horario = $1
+         WHERE turno = $2 AND status <> 'encerrada' AND (horario IS DISTINCT FROM $1) ${cond}`,
+        [horario, turno]);
+      total += r.rowCount;
+    }
+    console.log(`Horários padronizados em ${total} turma(s) por ${req.usuario.nome}`);
+    res.json({ atualizadas: total });
+  } catch (e) { console.error('Erro padronizar horários:', e); res.status(500).json({ erro: 'Erro ao padronizar horários.' }); }
+});
+
+app.delete('/admin/turmas/:id', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const m = await pool.query(`SELECT COUNT(*)::int AS n FROM matriculas WHERE turma_id = $1`, [req.params.id]);
+    if (m.rows[0].n > 0) return res.status(409).json({ erro: 'Turma possui matrículas. Altere o status para "encerrada" em vez de excluir.' });
+    const r = await pool.query(`DELETE FROM turmas WHERE id = $1 RETURNING id`, [req.params.id]);
+    if (!r.rows.length) return res.status(404).json({ erro: 'Turma não encontrada.' });
+    res.json({ mensagem: 'Turma excluída.' });
+  } catch (e) {
+    console.error('Erro DELETE turma:', e);
+    res.status(500).json({ erro: 'Erro ao excluir turma.' });
+  }
+});
+
+// ============================================================
+// 8B. MATRÍCULAS (Fase 2) — vaga validada, valores congelados,
+//     mensalidades geradas automaticamente (R$ 0 para bolsistas)
+// ============================================================
+app.get('/admin/turmas/:id', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const t = await pool.query(
+      `SELECT t.*, n.nome AS nivel_nome, c.nome AS curso_nome, p.nome AS professor_nome
+       FROM turmas t JOIN niveis n ON n.id = t.nivel_id JOIN cursos c ON c.id = n.curso_id
+       LEFT JOIN professores p ON p.id = t.professor_id WHERE t.id = $1`, [req.params.id]);
+    if (!t.rows.length) return res.status(404).json({ erro: 'Turma não encontrada.' });
+    const m = await pool.query(
+      `SELECT m.*, a.nome AS aluno_nome, a.modalidade
+       FROM matriculas m JOIN alunos a ON a.id = m.aluno_id
+       WHERE m.turma_id = $1 ORDER BY a.nome`, [req.params.id]);
+    res.json({ ...t.rows[0], matriculas: m.rows });
+  } catch (e) { console.error('Erro GET turma:', e); res.status(500).json({ erro: 'Erro ao buscar turma.' }); }
+});
+
+app.get('/admin/matriculas', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const cond = []; const params = [];
+    if (req.query.aluno_id) { params.push(req.query.aluno_id); cond.push(`m.aluno_id = $${params.length}`); }
+    if (req.query.turma_id) { params.push(req.query.turma_id); cond.push(`m.turma_id = $${params.length}`); }
+    const where = cond.length ? `WHERE ${cond.join(' AND ')}` : '';
+    const r = await pool.query(
+      `SELECT m.*, a.nome AS aluno_nome, a.data_nascimento AS aluno_nascimento, t.nome AS turma_nome, t.semestre, t.turno, t.horario,
+              n.nome AS nivel_nome, c.nome AS curso_nome
+       FROM matriculas m
+       JOIN alunos a ON a.id = m.aluno_id
+       JOIN turmas t ON t.id = m.turma_id
+       JOIN niveis n ON n.id = t.nivel_id
+       JOIN cursos c ON c.id = n.curso_id
+       ${where} ORDER BY t.semestre DESC, a.nome`, params);
+    res.json(r.rows);
+  } catch (e) { console.error('Erro GET matriculas:', e); res.status(500).json({ erro: 'Erro ao listar matrículas.' }); }
+});
+
+app.delete('/admin/contas-receber/:id', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const r = await pool.query(`DELETE FROM contas_receber WHERE id = $1 RETURNING id`, [req.params.id]);
+    if (!r.rows.length) return res.status(404).json({ erro: 'Parcela não encontrada.' });
+    res.json({ mensagem: 'Parcela excluída.' });
+  } catch (e) { console.error('Erro DELETE contas-receber:', e); res.status(500).json({ erro: 'Erro ao excluir a parcela.' }); }
+});
+
+app.post('/admin/turmas/:id/encerrar', autenticar, somenteGestao, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const t = await client.query(`UPDATE turmas SET status='encerrada' WHERE id = $1 RETURNING id, nome`, [req.params.id]);
+    if (!t.rows.length) { await client.query('ROLLBACK'); client.release(); return res.status(404).json({ erro: 'Turma não encontrada.' }); }
+    const m = await client.query(`UPDATE matriculas SET status='concluida' WHERE turma_id = $1 AND status = 'ativa' RETURNING id`, [req.params.id]);
+    await client.query('COMMIT'); client.release();
+    res.json({ mensagem: 'Turma encerrada.', matriculas_concluidas: m.rows.length });
+  } catch (e) {
+    try { await client.query('ROLLBACK'); } catch {}
+    client.release();
+    console.error('Erro encerrar turma:', e);
+    res.status(500).json({ erro: 'Erro ao encerrar a turma.' });
+  }
+});
+
+app.post('/admin/matriculas', autenticar, somenteGestao, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const erro = obrigatorios(req.body, ['aluno_id', 'turma_id']);
+    if (erro) { client.release(); return res.status(400).json({ erro }); }
+
+    await client.query('BEGIN');
+    const tq = await client.query(
+      `SELECT t.*, n.nome AS nivel_nome, c.nome AS curso_nome
+       FROM turmas t JOIN niveis n ON n.id = t.nivel_id JOIN cursos c ON c.id = n.curso_id
+       WHERE t.id = $1 FOR UPDATE OF t`, [req.body.turma_id]);
+    if (!tq.rows.length) { await client.query('ROLLBACK'); client.release(); return res.status(404).json({ erro: 'Turma não encontrada.' }); }
+    const turma = tq.rows[0];
+    if (turma.status === 'encerrada') { await client.query('ROLLBACK'); client.release(); return res.status(409).json({ erro: 'Turma encerrada não recebe matrículas.' }); }
+
+    const aq = await client.query(`SELECT * FROM alunos WHERE id = $1`, [req.body.aluno_id]);
+    if (!aq.rows.length) { await client.query('ROLLBACK'); client.release(); return res.status(404).json({ erro: 'Aluno não encontrado.' }); }
+    const aluno = aq.rows[0];
+    if (aluno.status !== 'ativo') { await client.query('ROLLBACK'); client.release(); return res.status(409).json({ erro: 'Aluno inativo não pode ser matriculado. Reative o cadastro primeiro.' }); }
+
+    const dupq = await client.query(`SELECT 1 FROM matriculas WHERE aluno_id = $1 AND turma_id = $2 AND status IN ('ativa','trancada')`, [aluno.id, turma.id]);
+    if (dupq.rows.length) { await client.query('ROLLBACK'); client.release(); return res.status(409).json({ erro: 'O aluno já possui matrícula ativa nesta turma.' }); }
+
+    const ocup = await client.query(`SELECT COUNT(*)::int AS n FROM matriculas WHERE turma_id = $1 AND status = 'ativa'`, [turma.id]);
+    if (ocup.rows[0].n >= turma.capacidade) {
+      await client.query('ROLLBACK'); client.release();
+      return res.status(409).json({ erro: `Turma lotada — capacidade de ${turma.capacidade} alunos atingida.` });
     }
 
-    if (usuario.codigo_confirmacao !== codigo)
-      return res.status(400).json({ erro: 'Código incorreto. Verifique e tente novamente.' });
-    if (new Date() > new Date(usuario.codigo_expira))
-      return res.status(400).json({ erro: 'Código expirado. Solicite um novo código.' });
+    const bolsista = aluno.modalidade === 'bolsista';
+    // Bolsista IEMA e Desconto Especial: isentos de mensalidade e taxa de matrícula, mas pagam a Plataforma
+    const isentoMensTaxa = aluno.modalidade === 'bolsista_iema' || aluno.modalidade === 'desconto_especial';
+    const hoje = new Date();
+    const diaVenc = Math.min(Number(await getConfig('dia_vencimento', 10)) || 10, 28);
 
-    const ehProfessorAprovado = usuario.professor === 'aprovado';
+    // Esquema de lançamento financeiro escolhido no ato:
+    // '1' = 1º semestre (fev–jun) · '2' = 2º semestre (ago–dez) · 'sem' = sem financeiro (bolsista)
+    let semLanc = String(req.body.semestre_lancamento || '').trim();
+    if (!['1', '2', 'sem'].includes(semLanc)) {
+      semLanc = (bolsista || isentoMensTaxa) ? 'sem' : (String(turma.semestre || '').endsWith('.1') ? '1' : '2');
+    }
+    const anoBase = parseInt(String(turma.semestre || '').split('.')[0], 10) || hoje.getFullYear();
+    const mesesSem = semLanc === '1' ? [1, 2, 3, 4, 5] : semLanc === '2' ? [7, 8, 9, 10, 11] : [];
+
+    // Valor da mensalidade (necessário apenas quando há lançamento de parcelas)
+    const tabela = (await getConfig('mensalidades', {})) || {};
+    const valor = Number(tabela[turma.curso_nome] || 0);
+    if (mesesSem.length && !valor) {
+      await client.query('ROLLBACK'); client.release();
+      return res.status(400).json({ erro: `Defina o valor da mensalidade do curso ${turma.curso_nome} em Configurações antes de matricular.` });
+    }
+    const descontoAluno = Number(aluno.desconto_valor || 0);
+    const vDesc = bolsista ? valor : +Math.min(descontoAluno, valor).toFixed(2);
+    const vFinal = +(valor - vDesc).toFixed(2);
+
+    // Taxa de matrícula: geral, paga sempre no ato (bolsista também paga)
+    const taxa = isentoMensTaxa ? 0 : (req.body.taxa_matricula !== undefined
+      ? Number(req.body.taxa_matricula) || 0
+      : Number(await getConfig('taxa_matricula', 0)) || 0);
+    const formaTaxa = String(req.body.forma_pagamento_taxa || '').trim();
+    if (taxa > 0 && !formaTaxa) {
+      await client.query('ROLLBACK'); client.release();
+      return res.status(400).json({ erro: 'A taxa de matrícula é paga no ato — informe a forma de pagamento.' });
+    }
+
+    const mIns = await client.query(
+      `INSERT INTO matriculas (aluno_id, turma_id, valor_mensalidade, desconto_aplicado)
+       VALUES ($1,$2,$3,$4) RETURNING *`, [aluno.id, turma.id, valor, vDesc]);
+    const matricula = mIns.rows[0];
+
+    // Mensalidades do semestre escolhido (5 parcelas; bolsista usa "sem financeiro")
+    for (const mes of mesesSem) {
+      const venc = new Date(anoBase, mes, diaVenc);
+      const comp = `${anoBase}-${String(mes + 1).padStart(2, '0')}`;
+      await client.query(
+        `INSERT INTO contas_receber
+           (aluno_id, matricula_id, descricao, competencia, valor_original, desconto, valor_final,
+            vencimento, status, data_pagamento, forma_pagamento, recebido_por)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+        [aluno.id, matricula.id,
+         `Mensalidade ${String(mes + 1).padStart(2, '0')}/${anoBase} — ${turma.curso_nome} ${turma.nivel_nome}`,
+         comp, valor, vDesc, vFinal, venc,
+         bolsista ? 'paga' : 'pendente',
+         bolsista ? hoje : null,
+         bolsista ? 'Bolsa integral' : null,
+         bolsista ? req.usuario.id : null]);
+    }
+    const parcelas = mesesSem.length;
+
+    // Taxa da Plataforma Acadêmica (campo separado): 01/02, 01/08 ou bolsista (não lançar)
+    let plataformaLancada = false;
+    let platMes = String(req.body.plataforma_mes || '').trim(); // '2' | '8' | 'sem'
+    if (!['2', '8', 'sem'].includes(platMes)) {
+      const querPlat = req.body.plataforma === true || req.body.plataforma === 'true';
+      const platSemestre = String(turma.semestre || '').endsWith('.1') ? '2' : '8';
+      if (isentoMensTaxa) { platMes = platSemestre; }        // IEMA/Especial pagam a Plataforma
+      else { platMes = querPlat && semLanc !== 'sem' ? platSemestre : 'sem'; }
+    }
+    if (platMes === '2' || platMes === '8') {
+      const valorPlat = Number(req.body.valor_plataforma) || Number(await getConfig('valor_plataforma', 35)) || 35;
+      const mesPlat = platMes === '2' ? 1 : 7;
+      const vencPlat = new Date(anoBase, mesPlat, 5); // 05/02 ou 05/08 — mesma data impressa no termo
+      const compPlat = `${anoBase}-${String(mesPlat + 1).padStart(2, '0')}`;
+      await client.query(
+        `INSERT INTO contas_receber
+           (aluno_id, matricula_id, descricao, competencia, valor_original, desconto, valor_final,
+            vencimento, status, data_pagamento, forma_pagamento, recebido_por)
+         VALUES ($1,$2,$3,$4,$5,0,$5,$6,'pendente',NULL,NULL,NULL)`,
+        [aluno.id, matricula.id,
+         `Taxa da Plataforma Acadêmica — ${turma.curso_nome} ${turma.nivel_nome}`,
+         compPlat, valorPlat, vencPlat]);
+      plataformaLancada = true;
+    }
+
+    // Lançamento da taxa (já quitada) + dados do recibo automático
+    let recibo = null;
+    if (taxa > 0) {
+      const comp0 = `${hoje.getFullYear()}-${String(hoje.getMonth() + 1).padStart(2, '0')}`;
+      const tIns = await client.query(
+        `INSERT INTO contas_receber
+           (aluno_id, matricula_id, descricao, competencia, valor_original, desconto, valor_final,
+            vencimento, status, data_pagamento, forma_pagamento, recebido_por)
+         VALUES ($1,$2,$3,$4,$5,0,$5,$6,'paga',$6,$7,$8) RETURNING id`,
+        [aluno.id, matricula.id,
+         `Taxa de Matrícula — ${turma.curso_nome} ${turma.nivel_nome} (${turma.nome})`,
+         comp0, taxa, hoje, formaTaxa, req.usuario.id]);
+      recibo = {
+        numero: tIns.rows[0].id, aluno_nome: aluno.nome,
+        curso: turma.curso_nome, nivel: turma.nivel_nome, turma: turma.nome,
+        turno: turma.turno, horario: turma.horario, semestre: turma.semestre,
+        valor: taxa, forma: formaTaxa, data: hoje
+      };
+    }
+    await client.query('COMMIT'); client.release();
+    res.status(201).json({ matricula, mensalidades_geradas: parcelas, plataforma_lancada: plataformaLancada, bolsista, recibo });
+  } catch (e) {
+    try { await client.query('ROLLBACK'); } catch {}
+    client.release();
+    if (e.code === '23505') return res.status(409).json({ erro: 'Este aluno já está matriculado nesta turma.' });
+    console.error('Erro POST matricula:', e);
+    res.status(500).json({ erro: 'Erro ao efetivar matrícula.' });
+  }
+});
+
+app.put('/admin/matriculas/:id', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const novo = req.body.status;
+    if (!['ativa', 'trancada', 'cancelada'].includes(novo)) return res.status(400).json({ erro: 'Status inválido.' });
+    const r = await pool.query(
+      `UPDATE matriculas SET status = $1 WHERE id = $2 AND status <> 'concluida' RETURNING *`,
+      [novo, req.params.id]);
+    if (!r.rows.length) return res.status(404).json({ erro: 'Matrícula não encontrada (ou já concluída).' });
+    if (novo === 'cancelada' || novo === 'trancada') {
+      await pool.query(`UPDATE contas_receber SET status = 'cancelada' WHERE matricula_id = $1 AND status = 'pendente'`, [req.params.id]);
+    }
+    res.json({ mensagem: 'Matrícula atualizada.', matricula: r.rows[0] });
+  } catch (e) { console.error('Erro PUT matricula:', e); res.status(500).json({ erro: 'Erro ao atualizar matrícula.' }); }
+});
+
+// ============================================================
+// 8C. CONTAS A RECEBER — extrato e baixa com pontualidade (Fase 3)
+// ============================================================
+app.get('/admin/contas-receber', autenticar, somenteGestao, async (req, res) => {
+  try {
+    await marcarAtrasados();
+    const cond = []; const params = [];
+    if (req.query.aluno_id) { params.push(req.query.aluno_id); cond.push(`cr.aluno_id = $${params.length}`); }
+    if (req.query.status) { params.push(req.query.status); cond.push(`cr.status = $${params.length}`); }
+    if (req.query.competencia) { params.push(req.query.competencia); cond.push(`cr.competencia = $${params.length}`); }
+    if (req.query.busca) {
+      params.push(`%${req.query.busca}%`);
+      cond.push(`(a.nome ILIKE $${params.length} OR cr.cliente_nome ILIKE $${params.length} OR cr.numero_documento ILIKE $${params.length} OR EXISTS (
+        SELECT 1 FROM aluno_responsavel arb JOIN responsaveis rb ON rb.id = arb.responsavel_id
+        WHERE arb.aluno_id = cr.aluno_id AND rb.nome ILIKE $${params.length}))`);
+    }
+    const where = cond.length ? `WHERE ${cond.join(' AND ')}` : '';
+    const r = await pool.query(
+      `SELECT cr.*, COALESCE(a.nome, cr.cliente_nome) AS aluno_nome, t.nome AS turma_nome, t.turno, t.horario, t.semestre,
+              n.nome AS nivel_nome, c.nome AS curso_nome, pgt.nome AS pagante_nome
+       FROM contas_receber cr
+       LEFT JOIN alunos a ON a.id = cr.aluno_id
+       LEFT JOIN matriculas m ON m.id = cr.matricula_id
+       LEFT JOIN turmas t ON t.id = m.turma_id
+       LEFT JOIN niveis n ON n.id = t.nivel_id
+       LEFT JOIN cursos c ON c.id = n.curso_id
+       LEFT JOIN LATERAL (
+         SELECT r2.nome FROM aluno_responsavel ar2
+         JOIN responsaveis r2 ON r2.id = ar2.responsavel_id
+         WHERE ar2.aluno_id = cr.aluno_id AND ar2.responsavel_financeiro = TRUE
+         ORDER BY ar2.id LIMIT 1
+       ) pgt ON TRUE
+       ${where} ORDER BY cr.vencimento, cr.id`, params);
+    res.json(r.rows);
+  } catch (e) { console.error('Erro GET contas-receber:', e); res.status(500).json({ erro: 'Erro ao listar cobranças.' }); }
+});
+
+app.post('/admin/contas-receber', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const descricao = String(req.body.descricao || '').trim();
+    const valor = Number(req.body.valor || 0);
+    const vencimento = String(req.body.vencimento || '').trim();
+    if (!descricao) return res.status(400).json({ erro: 'Informe a descrição da cobrança.' });
+    if (!(valor > 0)) return res.status(400).json({ erro: 'Informe um valor maior que zero.' });
+    if (!vencimento) return res.status(400).json({ erro: 'Informe o vencimento.' });
+    const alunoId = req.body.aluno_id ? Number(req.body.aluno_id) : null;
+    const clienteNome = String(req.body.cliente_nome || '').trim() || null;
+    if (!alunoId && !clienteNome) return res.status(400).json({ erro: 'Informe um aluno ou o nome do cliente.' });
+    const competencia = String(req.body.competencia || '').trim() || vencimento.slice(0, 7);
+    const r = await pool.query(
+      `INSERT INTO contas_receber
+         (aluno_id, matricula_id, descricao, competencia, valor_original, desconto, valor_final, vencimento, status, cliente_nome)
+       VALUES ($1, NULL, $2, $3, $4, 0, $4, $5, 'pendente', $6) RETURNING *`,
+      [alunoId, descricao, competencia, valor, vencimento, clienteNome]);
+    res.status(201).json(r.rows[0]);
+  } catch (e) { console.error('Erro POST conta avulsa:', e); res.status(500).json({ erro: 'Erro ao lançar a conta a receber.' }); }
+});
+
+app.post('/admin/contas-receber/:id/baixa', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const forma = String(req.body.forma_pagamento || '').trim();
+    if (!forma) return res.status(400).json({ erro: 'Informe a forma de pagamento.' });
+
+    const cq = await pool.query(
+      `SELECT cr.*, COALESCE(a.nome, cr.cliente_nome) AS aluno_nome, t.nome AS turma_nome, t.turno, t.horario, t.semestre,
+              n.nome AS nivel_nome, c.nome AS curso_nome
+       FROM contas_receber cr
+       LEFT JOIN alunos a ON a.id = cr.aluno_id
+       LEFT JOIN matriculas m ON m.id = cr.matricula_id
+       LEFT JOIN turmas t ON t.id = m.turma_id
+       LEFT JOIN niveis n ON n.id = t.nivel_id
+       LEFT JOIN cursos c ON c.id = n.curso_id
+       WHERE cr.id = $1`, [req.params.id]);
+    if (!cq.rows.length) return res.status(404).json({ erro: 'Cobrança não encontrada.' });
+    const conta = cq.rows[0];
+    if (!['pendente', 'atrasada'].includes(conta.status)) {
+      return res.status(409).json({ erro: `Esta cobrança já está ${conta.status}.` });
+    }
+
+    const dataPg = req.body.data_pagamento
+      ? new Date(req.body.data_pagamento + 'T12:00:00') : new Date();
+    const valorFinal = Number(conta.valor_final);
+
+    // Desconto: usa o informado na baixa; se ausente, sugere a pontualidade (mensalidade paga até o vencimento)
+    const ehMensalidade = String(conta.descricao || '').startsWith('Mensalidade');
+    const pontual = dataPg.toISOString().slice(0, 10) <= new Date(conta.vencimento).toISOString().slice(0, 10);
+    const descCfg = Number(await getConfig('desconto_pontualidade', 0)) || 0;
+    const sugestao = (ehMensalidade && pontual) ? Math.min(descCfg, valorFinal) : 0;
+    let desconto = req.body.desconto !== undefined ? Number(req.body.desconto) || 0 : sugestao;
+    desconto = +Math.max(0, Math.min(desconto, valorFinal)).toFixed(2);
+    const juros = +Math.max(0, Number(req.body.juros || 0)).toFixed(2);
+    let valorRecebido = req.body.valor_recebido !== undefined
+      ? Number(req.body.valor_recebido) || 0
+      : +(valorFinal - desconto + juros).toFixed(2);
+    valorRecebido = +Math.max(0, valorRecebido).toFixed(2);
 
     await pool.query(
-      `UPDATE usuarios
-       SET confirmado = TRUE,
-           codigo_confirmacao = NULL,
-           codigo_expira = NULL,
-           avaliacoes_disponiveis = COALESCE(avaliacoes_disponiveis, 0) + 1,
-           updated_at = NOW()
-       WHERE email = $1`,
-      [email.toLowerCase()]
-    );
-
-    if (ehProfessorAprovado) {
-      await log(usuario.id, email, 'professor_conta_ativada', 'ok', { bonus: 1 });
-    } else {
-      await log(usuario.id, email, 'confirmacao_email', 'ok', { bonus_boas_vindas: 1 });
-    }
-    await log(usuario.id, email, 'credito', 'ok', { origem: ehProfessorAprovado ? 'bonus_professor_ativacao' : 'bonus_cadastro', qtd: 1, saldo_antes: usuario.avaliacoes_disponiveis || 0, saldo_depois: (usuario.avaliacoes_disponiveis || 0) + 1 });
-
-    if (usuario.codigo_indicante) {
-      try {
-        const updInd = await pool.query(
-          `UPDATE usuarios
-           SET total_indicacoes = COALESCE(total_indicacoes, 0) + 1,
-               updated_at = NOW()
-           WHERE codigo = $1 AND confirmado = TRUE
-           RETURNING id, total_indicacoes`,
-          [usuario.codigo_indicante]
-        );
-
-        if (updInd.rows.length > 0) {
-          const novoTotal = updInd.rows[0].total_indicacoes;
-          const indicanteId = updInd.rows[0].id;
-          if (novoTotal === 10 || novoTotal === 20) {
-            await pool.query(
-              `UPDATE usuarios
-               SET avaliacoes_disponiveis = COALESCE(avaliacoes_disponiveis, 0) + 1,
-                   updated_at = NOW()
-               WHERE id = $1`,
-              [indicanteId]
-            );
-            console.log(`[indicacao] Bônus creditado ao indicante id=${indicanteId}, total_indicacoes=${novoTotal}`);
-            await log(indicanteId, null, 'credito', 'ok', { origem: 'bonus_indicacao', indicacao_numero: novoTotal, qtd: 1, indicado_email: email });
-          }
-        }
-      } catch (indErr) {
-        console.error('[indicacao] Erro:', indErr.message);
-      }
-    }
-
-    const atualizado = await pool.query('SELECT * FROM usuarios WHERE email = $1', [email.toLowerCase()]);
-    const u = atualizado.rows[0];
-
-    const msgConfirmacao = ehProfessorAprovado
-      ? 'Conta ativada! Bem-vindo ao RedaCheck Professor. Seu desconto de 50% já está ativo!'
-      : 'E-mail confirmado! Bem-vindo ao RedaCheck. Você ganhou 1 avaliação bônus!';
+      `UPDATE contas_receber SET status='paga', data_pagamento=$1, forma_pagamento=$2,
+              desconto_pontualidade=$3, juros=$4, valor_recebido=$5, recebido_por=$6 WHERE id=$7`,
+      [dataPg, forma, desconto, juros, valorRecebido, req.usuario.id, req.params.id]);
 
     res.json({
-      ok: true,
-      mensagem: msgConfirmacao,
-      professor_ativado: ehProfessorAprovado,
-      usuario: {
-        id: u.id, nome: u.nome, email: u.email,
-        codigo: u.codigo, banca: u.banca, plano: u.plano,
-        avaliacoes_disponiveis: u.avaliacoes_disponiveis || 0,
-        total_indicacoes: u.total_indicacoes || 0
+      mensagem: 'Pagamento registrado.',
+      recibo: {
+        numero: conta.numero_documento, aluno_nome: conta.aluno_nome,
+        referente: conta.descricao + (conta.semestre ? ` · Semestre ${conta.semestre}` : ''),
+        turma: conta.turma_nome, turno: conta.turno, horario: conta.horario,
+        valor_base: valorFinal, desconto, juros, desconto_pontualidade: desconto,
+        valor: valorRecebido, forma, data: dataPg
       }
     });
+  } catch (e) { console.error('Erro baixa contas-receber:', e); res.status(500).json({ erro: 'Erro ao registrar o pagamento.' }); }
+});
 
-  } catch (err) {
-    console.error('Erro na confirmação:', err.message);
-    res.status(500).json({ erro: 'Erro ao confirmar e-mail.' });
+// ============================================================
+// 9. CRUD — FORNECEDORES
+// ============================================================
+app.get('/admin/fornecedores', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const r = await pool.query(`SELECT * FROM fornecedores ORDER BY nome`);
+    res.json(r.rows);
+  } catch (e) {
+    console.error('Erro GET fornecedores:', e);
+    res.status(500).json({ erro: 'Erro ao listar fornecedores.' });
   }
 });
 
-app.post('/reenviar-codigo', async (req, res) => {
+app.post('/admin/fornecedores', autenticar, somenteGestao, async (req, res) => {
   try {
-    const { email } = req.body;
-    if (!email) return res.status(400).json({ erro: 'E-mail obrigatório.' });
-    const result = await pool.query('SELECT * FROM usuarios WHERE email = $1', [email.toLowerCase()]);
-    if (!result.rows.length) return res.status(404).json({ erro: 'E-mail não encontrado.' });
-    const usuario = result.rows[0];
-    // Professor pendente não pode reenviar código — aguarda aprovação master
-    if (usuario.professor === 'pendente') {
-      return res.status(403).json({
-        erro: 'Seu cadastro está em análise pelo operador. Aguarde o e-mail de aprovação.',
-        professor_pendente: true
-      });
+    const erro = obrigatorios(req.body, ['nome']);
+    if (erro) return res.status(400).json({ erro });
+    const r = await pool.query(
+      `INSERT INTO fornecedores (nome, cpf_cnpj, email, whatsapp, categoria, observacoes)
+       VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
+      [req.body.nome, req.body.cpf_cnpj || null, req.body.email || null,
+       req.body.whatsapp || null, req.body.categoria || null, req.body.observacoes || null]
+    );
+    res.status(201).json(r.rows[0]);
+  } catch (e) {
+    console.error('Erro POST fornecedor:', e);
+    res.status(500).json({ erro: 'Erro ao cadastrar fornecedor.' });
+  }
+});
+
+app.put('/admin/fornecedores/:id', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const atual = await pool.query(`SELECT * FROM fornecedores WHERE id = $1`, [req.params.id]);
+    if (!atual.rows.length) return res.status(404).json({ erro: 'Fornecedor não encontrado.' });
+    const x = atual.rows[0];
+    const r = await pool.query(
+      `UPDATE fornecedores SET nome=$1, cpf_cnpj=$2, email=$3, whatsapp=$4, categoria=$5, observacoes=$6, status=$7
+       WHERE id=$8 RETURNING *`,
+      [
+        req.body.nome ?? x.nome, req.body.cpf_cnpj ?? x.cpf_cnpj, req.body.email ?? x.email,
+        req.body.whatsapp ?? x.whatsapp, req.body.categoria ?? x.categoria,
+        req.body.observacoes ?? x.observacoes, req.body.status ?? x.status, req.params.id
+      ]
+    );
+    res.json(r.rows[0]);
+  } catch (e) {
+    console.error('Erro PUT fornecedor:', e);
+    res.status(500).json({ erro: 'Erro ao atualizar fornecedor.' });
+  }
+});
+
+app.delete('/admin/fornecedores/:id', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const c = await pool.query(`SELECT COUNT(*)::int AS n FROM contas_pagar WHERE fornecedor_id = $1`, [req.params.id]);
+    if (c.rows[0].n > 0) return res.status(409).json({ erro: 'Fornecedor possui contas registradas. Altere o status para "inativo" em vez de excluir.' });
+    const r = await pool.query(`DELETE FROM fornecedores WHERE id = $1 RETURNING id`, [req.params.id]);
+    if (!r.rows.length) return res.status(404).json({ erro: 'Fornecedor não encontrado.' });
+    res.json({ mensagem: 'Fornecedor excluído.' });
+  } catch (e) {
+    console.error('Erro DELETE fornecedor:', e);
+    res.status(500).json({ erro: 'Erro ao excluir fornecedor.' });
+  }
+});
+
+// ============================================================
+// 9B. CONTAS A PAGAR (Fase 3) + marcação automática de atrasados
+// ============================================================
+app.get('/admin/contas-pagar', autenticar, somenteGestao, async (req, res) => {
+  try {
+    await marcarAtrasados();
+    const cond = []; const params = [];
+    if (req.query.status) { params.push(req.query.status); cond.push(`cp.status = $${params.length}`); }
+    if (req.query.categoria) { params.push(req.query.categoria); cond.push(`cp.categoria = $${params.length}`); }
+    if (req.query.busca) { params.push(`%${req.query.busca}%`); cond.push(`(cp.descricao ILIKE $${params.length} OR f.nome ILIKE $${params.length})`); }
+    const where = cond.length ? `WHERE ${cond.join(' AND ')}` : '';
+    const r = await pool.query(
+      `SELECT cp.*, f.nome AS fornecedor_nome
+       FROM contas_pagar cp LEFT JOIN fornecedores f ON f.id = cp.fornecedor_id
+       ${where} ORDER BY cp.vencimento, cp.id`, params);
+    res.json(r.rows);
+  } catch (e) { console.error('Erro GET contas-pagar:', e); res.status(500).json({ erro: 'Erro ao listar contas a pagar.' }); }
+});
+
+app.post('/admin/contas-pagar', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const erro = obrigatorios(req.body, ['descricao', 'valor', 'vencimento']);
+    if (erro) return res.status(400).json({ erro });
+    const r = await pool.query(
+      `INSERT INTO contas_pagar (fornecedor_id, descricao, categoria, valor, vencimento, criado_por)
+       VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
+      [req.body.fornecedor_id || null, req.body.descricao, req.body.categoria || null,
+       Number(req.body.valor), req.body.vencimento, req.usuario.id]);
+    res.status(201).json(r.rows[0]);
+  } catch (e) { console.error('Erro POST contas-pagar:', e); res.status(500).json({ erro: 'Erro ao cadastrar conta a pagar.' }); }
+});
+
+app.put('/admin/contas-pagar/:id', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const atual = await pool.query(`SELECT * FROM contas_pagar WHERE id = $1`, [req.params.id]);
+    if (!atual.rows.length) return res.status(404).json({ erro: 'Conta não encontrada.' });
+    const x = atual.rows[0];
+    const r = await pool.query(
+      `UPDATE contas_pagar SET fornecedor_id=$1, descricao=$2, categoria=$3, valor=$4, vencimento=$5 WHERE id=$6 RETURNING *`,
+      [req.body.fornecedor_id !== undefined ? req.body.fornecedor_id : x.fornecedor_id,
+       req.body.descricao ?? x.descricao, req.body.categoria ?? x.categoria,
+       req.body.valor !== undefined ? Number(req.body.valor) : x.valor,
+       req.body.vencimento ?? x.vencimento, req.params.id]);
+    res.json(r.rows[0]);
+  } catch (e) { console.error('Erro PUT contas-pagar:', e); res.status(500).json({ erro: 'Erro ao atualizar conta a pagar.' }); }
+});
+
+app.post('/admin/contas-pagar/:id/baixa', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const forma = String(req.body.forma_pagamento || '').trim();
+    if (!forma) return res.status(400).json({ erro: 'Informe a forma de pagamento.' });
+    const dataPg = req.body.data_pagamento ? new Date(req.body.data_pagamento + 'T12:00:00') : new Date();
+    const r = await pool.query(
+      `UPDATE contas_pagar SET status='paga', data_pagamento=$1, forma_pagamento=$2 WHERE id=$3 AND status <> 'cancelada' RETURNING *`,
+      [dataPg, forma, req.params.id]);
+    if (!r.rows.length) return res.status(404).json({ erro: 'Conta não encontrada (ou cancelada).' });
+    res.json({ mensagem: 'Conta paga.', conta: r.rows[0] });
+  } catch (e) { console.error('Erro baixa contas-pagar:', e); res.status(500).json({ erro: 'Erro ao pagar a conta.' }); }
+});
+
+app.delete('/admin/contas-pagar/:id', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const r = await pool.query(`DELETE FROM contas_pagar WHERE id = $1 RETURNING id`, [req.params.id]);
+    if (!r.rows.length) return res.status(404).json({ erro: 'Conta não encontrada.' });
+    res.json({ mensagem: 'Conta a pagar excluída.' });
+  } catch (e) { console.error('Erro DELETE contas-pagar:', e); res.status(500).json({ erro: 'Erro ao excluir conta a pagar.' }); }
+});
+
+// ============================================================
+// 9C. RELATÓRIOS (Fase 5 — núcleo financeiro e de turmas)
+// ============================================================
+app.get('/admin/relatorios/financeiro', autenticar, somenteGestao, async (req, res) => {
+  try {
+    await marcarAtrasados();
+    const hoje = new Date();
+    const ini = req.query.inicio || `${hoje.getFullYear()}-${String(hoje.getMonth() + 1).padStart(2, '0')}-01`;
+    const fim = req.query.fim || hoje.toISOString().slice(0, 10);
+
+    const recebido = await pool.query(
+      `SELECT COALESCE(SUM(COALESCE(valor_recebido, valor_final - desconto_pontualidade)),0)::numeric AS total, COUNT(*)::int AS qtd
+       FROM contas_receber WHERE status='paga' AND data_pagamento::date BETWEEN $1 AND $2`, [ini, fim]);
+    const porForma = await pool.query(
+      `SELECT forma_pagamento, COALESCE(SUM(COALESCE(valor_recebido, valor_final - desconto_pontualidade)),0)::numeric AS total, COUNT(*)::int AS qtd
+       FROM contas_receber WHERE status='paga' AND data_pagamento::date BETWEEN $1 AND $2
+       GROUP BY forma_pagamento ORDER BY total DESC`, [ini, fim]);
+    const aberto = await pool.query(
+      `SELECT COALESCE(SUM(valor_final),0)::numeric AS total, COUNT(*)::int AS qtd,
+              COALESCE(SUM(valor_final) FILTER (WHERE status='atrasada'),0)::numeric AS total_atrasado,
+              COUNT(*) FILTER (WHERE status='atrasada')::int AS qtd_atrasado
+       FROM contas_receber WHERE status IN ('pendente','atrasada')`);
+    const pontualidade = await pool.query(
+      `SELECT COALESCE(SUM(desconto_pontualidade),0)::numeric AS total
+       FROM contas_receber WHERE status='paga' AND data_pagamento::date BETWEEN $1 AND $2`, [ini, fim]);
+    const bolsas = await pool.query(
+      `SELECT COALESCE(SUM(valor_original),0)::numeric AS total, COUNT(*)::int AS qtd
+       FROM contas_receber WHERE forma_pagamento='Bolsa integral' AND data_pagamento::date BETWEEN $1 AND $2`, [ini, fim]);
+    const pago = await pool.query(
+      `SELECT COALESCE(SUM(valor),0)::numeric AS total, COUNT(*)::int AS qtd
+       FROM contas_pagar WHERE status='paga' AND data_pagamento::date BETWEEN $1 AND $2`, [ini, fim]);
+    const aPagar = await pool.query(
+      `SELECT COALESCE(SUM(valor),0)::numeric AS total, COUNT(*)::int AS qtd,
+              COALESCE(SUM(valor) FILTER (WHERE status='atrasada'),0)::numeric AS total_atrasado
+       FROM contas_pagar WHERE status IN ('pendente','atrasada')`);
+
+    res.json({
+      periodo: { inicio: ini, fim },
+      recebido: recebido.rows[0], por_forma: porForma.rows, a_receber: aberto.rows[0],
+      pontualidade_concedida: pontualidade.rows[0].total, bolsas: bolsas.rows[0],
+      pago: pago.rows[0], a_pagar: aPagar.rows[0]
+    });
+  } catch (e) { console.error('Erro relatório financeiro:', e); res.status(500).json({ erro: 'Erro ao gerar relatório financeiro.' }); }
+});
+
+app.get('/admin/relatorios/turmas', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const cond = []; const params = [];
+    if (req.query.semestre) { params.push(req.query.semestre); cond.push(`t.semestre = $${params.length}`); }
+    const where = cond.length ? `WHERE ${cond.join(' AND ')}` : '';
+    const r = await pool.query(
+      `SELECT t.id, t.nome, t.semestre, t.turno, t.horario, t.capacidade, t.status,
+              c.nome AS curso_nome, n.nome AS nivel_nome, p.nome AS professor_nome,
+              (SELECT COUNT(*)::int FROM matriculas m WHERE m.turma_id=t.id AND m.status='ativa') AS matriculados,
+              (SELECT COUNT(*)::int FROM matriculas m JOIN alunos a ON a.id=m.aluno_id WHERE m.turma_id=t.id AND m.status='ativa' AND a.modalidade='bolsista') AS bolsistas
+       FROM turmas t JOIN niveis n ON n.id=t.nivel_id JOIN cursos c ON c.id=n.curso_id
+       LEFT JOIN professores p ON p.id=t.professor_id
+       ${where} ORDER BY t.semestre DESC, c.nome, n.ordem, t.nome`, params);
+    res.json(r.rows);
+  } catch (e) { console.error('Erro relatório turmas:', e); res.status(500).json({ erro: 'Erro ao gerar relatório de turmas.' });
+
+app.get('/admin/relatorios/financeiro-detalhado', autenticar, somenteGestao, async (req, res) => {
+  try {
+    await marcarAtrasados();
+    const hoje = new Date();
+    const ini = req.query.inicio || `${hoje.getFullYear()}-${String(hoje.getMonth() + 1).padStart(2, '0')}-01`;
+    const fim = req.query.fim || hoje.toISOString().slice(0, 10);
+
+    const SELECT = `
+      SELECT cr.id, cr.descricao, cr.competencia, cr.vencimento, cr.valor_final, cr.desconto_pontualidade,
+             cr.data_pagamento, cr.forma_pagamento, cr.status,
+             COALESCE(a.nome, cr.cliente_nome) AS aluno_nome, pgt.nome AS pagante_nome,
+             CASE WHEN cr.descricao LIKE 'Mensalidade%' THEN
+               (SELECT COUNT(*) FROM contas_receber x WHERE x.matricula_id = cr.matricula_id
+                 AND x.descricao LIKE 'Mensalidade%' AND x.vencimento <= cr.vencimento) END AS parcela_num,
+             CASE WHEN cr.descricao LIKE 'Mensalidade%' THEN
+               (SELECT COUNT(*) FROM contas_receber x WHERE x.matricula_id = cr.matricula_id
+                 AND x.descricao LIKE 'Mensalidade%') END AS parcela_total
+      FROM contas_receber cr
+      LEFT JOIN alunos a ON a.id = cr.aluno_id
+      LEFT JOIN LATERAL (
+        SELECT r2.nome FROM aluno_responsavel ar2 JOIN responsaveis r2 ON r2.id = ar2.responsavel_id
+        WHERE ar2.aluno_id = cr.aluno_id AND ar2.responsavel_financeiro = TRUE ORDER BY ar2.id LIMIT 1
+      ) pgt ON TRUE `;
+
+    const recebidas = await pool.query(
+      `${SELECT} WHERE cr.status='paga' AND cr.data_pagamento::date BETWEEN $1 AND $2
+       ORDER BY cr.data_pagamento, pgt.nome NULLS LAST, a.nome`, [ini, fim]);
+    const aReceber = await pool.query(
+      `${SELECT} WHERE cr.status='pendente' AND cr.vencimento BETWEEN $1 AND $2
+       ORDER BY cr.vencimento, pgt.nome NULLS LAST, a.nome`, [ini, fim]);
+    const vencidas = await pool.query(
+      `${SELECT} WHERE cr.status='atrasada' AND cr.vencimento <= $1
+       ORDER BY cr.vencimento, pgt.nome NULLS LAST, a.nome`, [fim]);
+
+    const soma = (rows, campo) => rows.reduce((s, r) => s + Number(r[campo] || 0), 0);
+    res.json({
+      periodo: { inicio: ini, fim },
+      recebidas: recebidas.rows, a_receber: aReceber.rows, vencidas: vencidas.rows,
+      totais: {
+        recebido: recebidas.rows.reduce((s, r) => s + (Number(r.valor_final) - Number(r.desconto_pontualidade || 0)), 0),
+        a_receber: soma(aReceber.rows, 'valor_final'),
+        vencido: soma(vencidas.rows, 'valor_final')
+      }
+    });
+  } catch (e) { console.error('Erro relatório detalhado:', e); res.status(500).json({ erro: 'Erro ao gerar relatório detalhado.' }); }
+}); }
+});
+
+// ============================================================
+// 10. CRUD — USUÁRIOS (apenas master)
+// ============================================================
+app.get('/admin/usuarios', autenticar, exigirPerfil('master'), async (req, res) => {
+  try {
+    const r = await pool.query(
+      `SELECT id, codigo, nome, cpf, email, whatsapp, data_nascimento, perfil, referencia_id, status, senha_provisoria, criado_em, ultimo_acesso
+       FROM usuarios ORDER BY nome`
+    );
+    res.json(r.rows);
+  } catch (e) {
+    console.error('Erro GET usuarios:', e);
+    res.status(500).json({ erro: 'Erro ao listar usuários.' });
+  }
+});
+
+app.post('/admin/usuarios', autenticar, exigirPerfil('master'), async (req, res) => {
+  try {
+    const erro = obrigatorios(req.body, ['nome', 'cpf', 'senha', 'perfil']);
+    if (erro) return res.status(400).json({ erro });
+    if (String(req.body.senha).length < 8) return res.status(400).json({ erro: 'A senha deve ter ao menos 8 caracteres.' });
+    if (!cpfValido(soDigitos(req.body.cpf))) return res.status(400).json({ erro: 'CPF do usuário inválido — confira os dígitos.' });
+    const hash = await bcrypt.hash(req.body.senha, 10);
+    const r = await pool.query(
+      `INSERT INTO usuarios (nome, cpf, email, whatsapp, senha_hash, data_nascimento, perfil, referencia_id, senha_provisoria)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,TRUE)
+       RETURNING id, nome, cpf, perfil, referencia_id, status`,
+      [req.body.nome, soDigitos(req.body.cpf), req.body.email || null, req.body.whatsapp || null,
+       hash, req.body.data_nascimento || null, req.body.perfil, req.body.referencia_id || null]
+    );
+    res.status(201).json(r.rows[0]);
+  } catch (e) {
+    if (e.code === '23505') return res.status(409).json({ erro: 'Já existe usuário com este CPF.' });
+    console.error('Erro POST usuario:', e);
+    res.status(500).json({ erro: 'Erro ao cadastrar usuário.' });
+  }
+});
+
+app.put('/admin/usuarios/:id', autenticar, exigirPerfil('master'), async (req, res) => {
+  try {
+    const atual = await pool.query(`SELECT * FROM usuarios WHERE id = $1`, [req.params.id]);
+    if (!atual.rows.length) return res.status(404).json({ erro: 'Usuário não encontrado.' });
+    const x = atual.rows[0];
+    if (req.body.cpf !== undefined && !cpfValido(soDigitos(req.body.cpf))) {
+      return res.status(400).json({ erro: 'CPF do usuário inválido — confira os dígitos.' });
     }
-    if (usuario.confirmado) return res.json({ ok: true, mensagem: 'Conta já confirmada.' });
-    const novoCodigo = gerarCodigoConfirmacao();
-    const novaExpiracao = new Date(Date.now() + 15 * 60 * 1000);
-    await pool.query(
-      'UPDATE usuarios SET codigo_confirmacao = $1, codigo_expira = $2 WHERE email = $3',
-      [novoCodigo, novaExpiracao, email.toLowerCase()]
-    );
-    await enviarEmailConfirmacao(email, usuario.nome, novoCodigo);
-    res.json({ ok: true, mensagem: 'Novo código enviado para seu e-mail.' });
-  } catch (err) {
-    res.status(500).json({ erro: 'Erro ao reenviar código.' });
-  }
-});
 
-app.post('/recuperar-senha', async (req, res) => {
-  try {
-    const { email } = req.body;
-    if (!email) return res.status(400).json({ erro: 'E-mail obrigatório.' });
-    const result = await pool.query('SELECT * FROM usuarios WHERE email = $1', [email.toLowerCase()]);
-    if (!result.rows.length)
-      return res.status(404).json({ erro: 'E-mail não encontrado. Verifique e tente novamente.' });
-    const codigo = gerarCodigoConfirmacao();
-    const expira = new Date(Date.now() + 15 * 60 * 1000);
-    await pool.query(
-      'UPDATE usuarios SET codigo_confirmacao = $1, codigo_expira = $2 WHERE email = $3',
-      [codigo, expira, email.toLowerCase()]
-    );
-    const ano = new Date().getFullYear();
-    await enviarEmail(email, 'RedaCheck — Redefinição de senha', `
-      <div style="font-family:-apple-system,sans-serif;max-width:480px;margin:0 auto;padding:32px 24px;background:#FAF9F7">
-        <div style="text-align:center;margin-bottom:24px">
-          <span style="font-size:22px;font-weight:700;letter-spacing:3px;color:#1A1A1A">REDA<span style="color:#C96A3A">CHECK</span></span>
-          <div style="font-size:10px;color:#9B9080;letter-spacing:1.5px;margin-top:4px">MAIS QUE CORRIGIR — APERFEIÇOAR</div>
-        </div>
-        <h2 style="font-size:20px;color:#1A1A1A;margin-bottom:8px">Redefinição de senha</h2>
-        <p style="font-size:14px;color:#6B6255;line-height:1.7;margin-bottom:24px">
-          Recebemos uma solicitação para redefinir a senha da conta <strong>${email}</strong>. Use o código abaixo:
-        </p>
-        <div style="background:#1A1A1A;border-radius:16px;padding:24px;text-align:center;margin-bottom:24px">
-          <div style="font-size:11px;color:rgba(255,255,255,0.5);text-transform:uppercase;letter-spacing:1px;margin-bottom:10px">Código de redefinição</div>
-          <div style="font-size:40px;font-weight:700;color:#FAF9F7;letter-spacing:8px">${codigo}</div>
-          <div style="font-size:11px;color:rgba(255,255,255,0.4);margin-top:10px">Válido por 15 minutos</div>
-        </div>
-        <p style="font-size:12px;color:#9B9080;line-height:1.6">Se você não solicitou a redefinição, ignore este e-mail.</p>
-        <div style="border-top:1px solid #E5E0D8;margin-top:24px;padding-top:16px;text-align:center">
-          <span style="font-size:11px;color:#9B9080">© ${ano} RedaCheck — redacheck.com.br</span>
-        </div>
-      </div>
-    `);
-    res.json({ ok: true, mensagem: 'Código enviado para seu e-mail.' });
-  } catch (err) {
-    console.error('Erro na recuperação:', err.message);
-    res.status(500).json({ erro: 'Erro ao processar recuperação.' });
-  }
-});
-
-app.post('/redefinir-senha', async (req, res) => {
-  try {
-    const { email, codigo, novaSenha } = req.body;
-    if (!email || !codigo || !novaSenha) return res.status(400).json({ erro: 'Dados incompletos.' });
-    if (novaSenha.length < 6) return res.status(400).json({ erro: 'A senha deve ter no mínimo 6 caracteres.' });
-    const result = await pool.query('SELECT * FROM usuarios WHERE email = $1', [email.toLowerCase()]);
-    if (!result.rows.length) return res.status(404).json({ erro: 'E-mail não encontrado.' });
-    const usuario = result.rows[0];
-    if (usuario.codigo_confirmacao !== codigo)
-      return res.status(400).json({ erro: 'Código incorreto. Verifique e tente novamente.' });
-    if (new Date() > new Date(usuario.codigo_expira))
-      return res.status(400).json({ erro: 'Código expirado. Solicite um novo código.' });
-    const novaSenhaHash = await bcrypt.hash(novaSenha, 12);
-    await pool.query(
-      'UPDATE usuarios SET senha_hash = $1, codigo_confirmacao = NULL, codigo_expira = NULL, confirmado = TRUE, updated_at = NOW() WHERE email = $2',
-      [novaSenhaHash, email.toLowerCase()]
-    );
-    res.json({ ok: true, mensagem: 'Senha redefinida com sucesso.' });
-  } catch (err) {
-    console.error('Erro ao redefinir senha:', err.message);
-    res.status(500).json({ erro: 'Erro ao redefinir senha.' });
-  }
-});
-
-const _loginAttempts = new Map();
-function loginRateLimit(req, res, next) {
-  const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket.remoteAddress || 'unknown';
-  const now = Date.now(), windowMs = 15*60*1000, maxAttempts = 10;
-  const entry = _loginAttempts.get(ip);
-  if (entry) {
-    entry.times = entry.times.filter(t => now - t < windowMs);
-    if (entry.times.length >= maxAttempts) {
-      const restMin = Math.ceil((windowMs - (now - entry.times[0])) / 60000);
-      return res.status(429).json({ erro: `Muitas tentativas. Tente em ${restMin} minuto(s).` });
+    // Proteção: não permitir inativar/rebaixar o último master ativo
+    const novoPerfil = req.body.perfil ?? x.perfil;
+    const novoStatus = req.body.status ?? x.status;
+    if (x.perfil === 'master' && (novoPerfil !== 'master' || novoStatus !== 'ativo')) {
+      const outros = await pool.query(`SELECT COUNT(*)::int AS n FROM usuarios WHERE perfil='master' AND status='ativo' AND id <> $1`, [x.id]);
+      if (outros.rows[0].n === 0) return res.status(409).json({ erro: 'Não é possível inativar ou rebaixar o único usuário master ativo.' });
     }
-    entry.times.push(now);
-  } else { _loginAttempts.set(ip, { times: [now] }); }
-  next();
+
+    let senha_hash = x.senha_hash;
+    let senha_provisoria = x.senha_provisoria;
+    if (req.body.senha) {
+      if (String(req.body.senha).length < 8) return res.status(400).json({ erro: 'A senha deve ter ao menos 8 caracteres.' });
+      senha_hash = await bcrypt.hash(req.body.senha, 10);
+      senha_provisoria = true;
+    }
+    const r = await pool.query(
+      `UPDATE usuarios SET nome=$1, cpf=$2, email=$3, whatsapp=$4, data_nascimento=$5, perfil=$6, referencia_id=$7, status=$8, senha_hash=$9, senha_provisoria=$10
+       WHERE id=$11 RETURNING id, nome, cpf, perfil, referencia_id, status`,
+      [
+        req.body.nome ?? x.nome,
+        req.body.cpf !== undefined ? soDigitos(req.body.cpf) : x.cpf,
+        req.body.email ?? x.email, req.body.whatsapp ?? x.whatsapp,
+        req.body.data_nascimento ?? x.data_nascimento,
+        novoPerfil, req.body.referencia_id ?? x.referencia_id, novoStatus,
+        senha_hash, senha_provisoria, req.params.id
+      ]
+    );
+    res.json(r.rows[0]);
+  } catch (e) {
+    if (e.code === '23505') return res.status(409).json({ erro: 'Já existe usuário com este CPF.' });
+    console.error('Erro PUT usuario:', e);
+    res.status(500).json({ erro: 'Erro ao atualizar usuário.' });
+  }
+});
+
+app.delete('/admin/usuarios/:id', autenticar, exigirPerfil('master'), async (req, res) => {
+  try {
+    if (Number(req.params.id) === req.usuario.id) {
+      return res.status(409).json({ erro: 'Você não pode excluir o próprio usuário em uso.' });
+    }
+    const alvo = await pool.query(`SELECT perfil, status FROM usuarios WHERE id = $1`, [req.params.id]);
+    if (!alvo.rows.length) return res.status(404).json({ erro: 'Usuário não encontrado.' });
+    if (alvo.rows[0].perfil === 'master') {
+      const outros = await pool.query(`SELECT COUNT(*)::int AS n FROM usuarios WHERE perfil='master' AND status='ativo' AND id <> $1`, [req.params.id]);
+      if (outros.rows[0].n === 0) return res.status(409).json({ erro: 'Não é possível excluir o único usuário master ativo.' });
+    }
+    await pool.query(`DELETE FROM usuarios WHERE id = $1`, [req.params.id]);
+    res.json({ mensagem: 'Usuário excluído.' });
+  } catch (e) {
+    console.error('Erro DELETE usuario:', e);
+    res.status(500).json({ erro: 'Erro ao excluir usuário.' });
+  }
+});
+
+// ============================================================
+// 11. FRONTEND SERVIDO PELO BACKEND (pasta /public no repositório)
+// ============================================================
+const PASTA_PUBLIC = path.join(__dirname, 'public');
+// ============================================================
+// PORTAL DOS PAIS — PRÉ-INSCRIÇÃO ONLINE (públicas, sem autenticação)
+// ============================================================
+app.get('/publico/instituicao', limiterInstitucional, async (req, res) => {
+  try {
+    const inst = await getConfig('dados_instituicao', {}) || {};
+    res.json({
+      nome: inst.nome || 'Centro Maranhense de Idiomas e Culturas — CEMIC',
+      cnpj: inst.cnpj || '',
+      endereco: inst.endereco || '',
+      telefone: inst.telefone || '',
+      email: inst.email || ''
+    });
+  } catch (e) { console.error('Erro GET instituicao:', e); res.status(500).json({ erro: 'Erro ao carregar os dados institucionais.' }); }
+});
+
+app.get('/publico/opcoes', limiterPublico, async (req, res) => {
+  try {
+    const taxa = Number(await getConfig('taxa_matricula', 0)) || 0;
+    const semestre = String(await getConfig('semestre_vigente', '') || '');
+    const t = await pool.query(
+      `SELECT DISTINCT turno FROM turmas WHERE status <> 'encerrada' AND turno IS NOT NULL AND turno <> '' ORDER BY turno`);
+    let turnos = t.rows.map(r => r.turno);
+    if (!turnos.length) turnos = ['Matutino', 'Vespertino'];
+    res.json({ taxa_matricula: taxa, semestre, turnos });
+  } catch (e) { console.error('Erro /publico/opcoes:', e); res.status(500).json({ erro: 'Erro ao carregar as opções de inscrição.' }); }
+});
+
+app.post('/publico/pre-inscricao', limiterPublico, async (req, res) => {
+  try {
+    const alunoNome = String(req.body.aluno_nome || '').trim();
+    const nasc = String(req.body.aluno_data_nascimento || '').trim();
+    const turno = String(req.body.turno || '').trim();
+    const respNome = String(req.body.responsavel_nome || '').trim();
+    const respZap = String(req.body.responsavel_whatsapp || '').trim();
+    const respEmail = String(req.body.responsavel_email || '').trim();
+    const respCpf = String(req.body.responsavel_cpf || '').trim();
+    const alunoCpf = String(req.body.aluno_cpf || '').trim();
+    const parentesco = String(req.body.parentesco || '').trim();
+    const aceite = req.body.aceite_termos === true || req.body.aceite_termos === 'true';
+
+    if (!alunoNome) return res.status(400).json({ erro: 'Informe o nome do aluno.' });
+    if (!nasc) return res.status(400).json({ erro: 'Informe a data de nascimento do aluno.' });
+    if (!turno) return res.status(400).json({ erro: 'Escolha o turno.' });
+    if (!respNome) return res.status(400).json({ erro: 'Informe o nome do responsável.' });
+    if (!respZap && !respEmail) return res.status(400).json({ erro: 'Informe ao menos um contato (WhatsApp ou e-mail).' });
+    if (!aceite) return res.status(400).json({ erro: 'É necessário aceitar os Termos e a Política de Privacidade.' });
+
+    const dn = new Date(nasc + 'T12:00:00');
+    if (isNaN(dn.getTime())) return res.status(400).json({ erro: 'Data de nascimento inválida.' });
+    const hoje = new Date();
+    let idade = hoje.getFullYear() - dn.getFullYear();
+    const dm = hoje.getMonth() - dn.getMonth();
+    if (dm < 0 || (dm === 0 && hoje.getDate() < dn.getDate())) idade--;
+    if (idade < 0 || idade > 120) return res.status(400).json({ erro: 'Data de nascimento inválida.' });
+    const programa = idade < 10 ? 'kids' : 'basico';
+
+    const taxa = Number(await getConfig('taxa_matricula', 0)) || 0;
+
+    const r = await pool.query(
+      `INSERT INTO pre_inscricoes
+         (aluno_nome, aluno_data_nascimento, aluno_cpf, programa, turno,
+          responsavel_nome, responsavel_cpf, responsavel_whatsapp, responsavel_email, parentesco, valor_taxa)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING id`,
+      [alunoNome.toUpperCase(), nasc, alunoCpf || null, programa, turno,
+       respNome.toUpperCase(), respCpf || null, respZap || null, respEmail || null, parentesco || null, taxa]);
+    const id = r.rows[0].id;
+    const protocolo = `PRE-${hoje.getFullYear()}-${String(id).padStart(6, '0')}`;
+    await pool.query(`UPDATE pre_inscricoes SET protocolo = $1 WHERE id = $2`, [protocolo, id]);
+
+    res.status(201).json({
+      id, protocolo, programa, programa_label: programa === 'kids' ? 'KIDS' : 'Básico',
+      turno, idade, valor_taxa: taxa,
+      mensagem: 'Pré-inscrição registrada. O pagamento da taxa via PIX será habilitado na próxima etapa.'
+    });
+  } catch (e) { console.error('Erro /publico/pre-inscricao:', e); res.status(500).json({ erro: 'Erro ao registrar a pré-inscrição.' }); }
+});
+
+app.post('/publico/rematricula', limiterPublico, async (req, res) => {
+  try {
+    const alunoNome = String(req.body.aluno_nome || '').trim();
+    const alunoCpf = String(req.body.aluno_cpf || '').trim();
+    const nasc = String(req.body.aluno_data_nascimento || '').trim();
+    const turno = String(req.body.turno || '').trim();
+    const semestre = String(req.body.semestre || '').trim();
+    const respNome = String(req.body.responsavel_nome || '').trim();
+    const respCpf = String(req.body.responsavel_cpf || '').trim();
+    const respZap = String(req.body.responsavel_whatsapp || '').trim();
+    const respEmail = String(req.body.responsavel_email || '').trim();
+    const parentesco = String(req.body.parentesco || '').trim();
+    const aceite = req.body.aceite_termos === true || req.body.aceite_termos === 'true';
+
+    if (!alunoNome) return res.status(400).json({ erro: 'Informe o nome do aluno.' });
+    if (!alunoCpf) return res.status(400).json({ erro: 'Informe o CPF do aluno.' });
+    if (!semestre) return res.status(400).json({ erro: 'Selecione o semestre.' });
+    if (turno !== 'Matutino' && turno !== 'Vespertino') return res.status(400).json({ erro: 'Selecione o turno (Matutino ou Vespertino).' });
+    if (!respNome) return res.status(400).json({ erro: 'Informe o nome do responsável.' });
+    if (!respZap && !respEmail) return res.status(400).json({ erro: 'Informe ao menos um contato do responsável (WhatsApp ou e-mail).' });
+    if (!aceite) return res.status(400).json({ erro: 'É necessário estar ciente do Termo do semestre.' });
+
+    let nascVal = null;
+    if (nasc) { const dn = new Date(nasc + 'T12:00:00'); if (!isNaN(dn.getTime())) nascVal = nasc; }
+    const taxa = Number(await getConfig('taxa_matricula', 0)) || 0;
+
+    const r = await pool.query(
+      `INSERT INTO pre_inscricoes
+         (tipo, semestre, aluno_nome, aluno_data_nascimento, aluno_cpf, turno,
+          responsavel_nome, responsavel_cpf, responsavel_whatsapp, responsavel_email, parentesco, valor_taxa)
+       VALUES ('rematriculaonline',$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING id`,
+      [semestre, alunoNome.toUpperCase(), nascVal, alunoCpf, turno,
+       respNome.toUpperCase(), respCpf || null, respZap || null, respEmail || null, parentesco || null, taxa]);
+    const id = r.rows[0].id;
+    const protocolo = `REM-${new Date().getFullYear()}-${String(id).padStart(6, '0')}`;
+    await pool.query(`UPDATE pre_inscricoes SET protocolo = $1 WHERE id = $2`, [protocolo, id]);
+
+    res.status(201).json({
+      id, protocolo, semestre, turno, valor_taxa: taxa,
+      mensagem: 'Rematrícula registrada. Prossiga para o pagamento da taxa via PIX.'
+    });
+  } catch (e) { console.error('Erro /publico/rematricula:', e); res.status(500).json({ erro: 'Erro ao registrar a rematrícula.' }); }
+});
+
+app.post('/publico/portal/primeiro-acesso', limiterLogin, async (req, res) => {
+  try {
+    const cpf = soDigitos(req.body.cpf);
+    const senha = String(req.body.senha || '');
+    if (!cpf) return res.status(400).json({ erro: 'Informe o CPF.' });
+    if (senha.length < 6) return res.status(400).json({ erro: 'A senha deve ter ao menos 6 caracteres.' });
+    const r = await pool.query(`SELECT id, senha_hash FROM responsaveis WHERE cpf = $1`, [cpf]);
+    const resp = r.rows[0];
+    if (!resp) return res.status(404).json({ erro: 'CPF não encontrado. Confirme com a secretaria se você está cadastrado como responsável do aluno.' });
+    if (resp.senha_hash) return res.status(409).json({ erro: 'Você já possui senha cadastrada. Faça login.' });
+    const hash = await bcrypt.hash(senha, 10);
+    await pool.query(`UPDATE responsaveis SET senha_hash = $1 WHERE id = $2`, [hash, resp.id]);
+    res.status(201).json({ mensagem: 'Senha cadastrada com sucesso. Agora é só fazer login.' });
+  } catch (e) { console.error('Erro portal primeiro-acesso:', e); res.status(500).json({ erro: 'Erro ao cadastrar a senha.' }); }
+});
+
+app.post('/publico/portal/login', limiterLogin, async (req, res) => {
+  try {
+    const cpf = soDigitos(req.body.cpf);
+    const senha = String(req.body.senha || '');
+    if (!cpf || !senha) return res.status(400).json({ erro: 'Informe CPF e senha.' });
+    const r = await pool.query(`SELECT id, nome, senha_hash FROM responsaveis WHERE cpf = $1`, [cpf]);
+    const resp = r.rows[0];
+    if (!resp) return res.status(401).json({ erro: 'CPF ou senha inválidos.' });
+    if (!resp.senha_hash) return res.status(409).json({ erro: 'Primeiro acesso necessário. Toque em "Primeiro acesso" para cadastrar sua senha.' });
+    const ok = await bcrypt.compare(senha, resp.senha_hash);
+    if (!ok) return res.status(401).json({ erro: 'CPF ou senha inválidos.' });
+    const token = jwt.sign({ responsavel_id: resp.id, nome: resp.nome, perfil: 'responsavel' }, JWT_SECRET, { expiresIn: '12h' });
+    res.json({ token, responsavel: { nome: resp.nome }, alunos: await alunosDoResponsavel(resp.id) });
+  } catch (e) { console.error('Erro portal login:', e); res.status(500).json({ erro: 'Erro ao entrar.' }); }
+});
+
+app.get('/publico/portal/alunos', autenticarResponsavel, async (req, res) => {
+  try { res.json(await alunosDoResponsavel(req.responsavelId)); }
+  catch (e) { console.error('Erro portal alunos:', e); res.status(500).json({ erro: 'Erro ao carregar os alunos.' }); }
+});
+
+// ================= English Platform — liberação de acesso =================
+// Fluxo: PIX pago na plataforma -> este endpoint registra a solicitação (status 'pendente')
+// -> o master vê na tela "English Platform" do Gestão e autoriza -> acesso liberado.
+// Em produção, quem confirma o pagamento é o webhook do Mercado Pago (fonte da verdade);
+// aqui o responsável autenticado registra o pedido após o PIX, restrito aos seus próprios filhos.
+async function statusEnglishPlatform(respId) {
+  const r = await pool.query(
+    `SELECT a.id AS aluno_id, a.nome, COALESCE(ep.status,'nenhum') AS status,
+            ep.pago_em, ep.autorizado_em
+       FROM aluno_responsavel ar
+       JOIN alunos a ON a.id = ar.aluno_id
+       LEFT JOIN english_platform_acesso ep ON ep.aluno_id = a.id
+      WHERE ar.responsavel_id = $1
+      ORDER BY a.nome`, [respId]);
+  return r.rows;
 }
-
-app.post('/login', loginRateLimit, async (req, res) => {
+app.get('/publico/portal/english-platform/status', autenticarResponsavel, async (req, res) => {
+  try { res.json(await statusEnglishPlatform(req.responsavelId)); }
+  catch (e) { console.error('Erro EP status:', e); res.status(500).json({ erro: 'Erro ao consultar o acesso.' }); }
+});
+app.post('/publico/portal/english-platform/solicitar', autenticarResponsavel, async (req, res) => {
   try {
-    const { email, senha } = req.body;
-    if (!email || !senha) return res.status(400).json({ erro: 'E-mail e senha são obrigatórios.' });
-    const result = await pool.query(
-      `SELECT id, nome, email, senha_hash, codigo, banca, plano, saldo,
-              total_redacoes, avaliacoes_disponiveis, desconto_professor,
-              professor, total_indicacoes, confirmado
-       FROM usuarios WHERE email = $1`,
-      [email.toLowerCase()]
-    );
-    if (!result.rows.length) return res.status(401).json({ erro: 'E-mail não cadastrado.' });
-    const usuario = result.rows[0];
-    const senhaCorreta = await bcrypt.compare(senha, usuario.senha_hash);
-    if (!senhaCorreta) {
-      await log(usuario.id, email, 'login', 'erro', { motivo: 'senha_incorreta' }, req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket.remoteAddress);
-      return res.status(401).json({ erro: 'Senha incorreta.' });
+    const ref = req.body && req.body.pagamento_ref ? String(req.body.pagamento_ref).slice(0, 120) : null;
+    const valor = req.body && req.body.valor != null ? Number(req.body.valor) : null;
+    // Filhos vinculados a este responsável (a solicitação abrange todos, pois o PIX é por família)
+    const filhos = await pool.query(
+      `SELECT aluno_id FROM aluno_responsavel WHERE responsavel_id = $1`, [req.responsavelId]);
+    let pedidos = filhos.rows.map(f => f.aluno_id);
+    if (Array.isArray(req.body && req.body.aluno_ids) && req.body.aluno_ids.length) {
+      const permitidos = new Set(pedidos);
+      pedidos = req.body.aluno_ids.map(Number).filter(id => permitidos.has(id));
     }
-    // Professor pendente — bloqueado até aprovação master
-    if (usuario.professor === 'pendente') {
-      await log(usuario.id, email, 'login', 'erro', { motivo: 'professor_pendente' }, req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket.remoteAddress);
-      return res.status(403).json({
-        erro: 'Seu cadastro de professor está em análise. Você receberá um e-mail quando for aprovado.',
-        professor_pendente: true
-      });
+    if (!pedidos.length) return res.status(400).json({ erro: 'Nenhum aluno vinculado para solicitar acesso.' });
+    for (const alunoId of pedidos) {
+      // Já autorizado permanece autorizado; caso contrário (novo ou revogado) vira 'pendente'
+      await pool.query(
+        `INSERT INTO english_platform_acesso (aluno_id, status, solicitado_por, pago_em, pagamento_ref, valor)
+         VALUES ($1,'pendente',$2, NOW(), $3, $4)
+         ON CONFLICT (aluno_id) DO UPDATE SET
+           status = CASE WHEN english_platform_acesso.status = 'autorizado' THEN 'autorizado' ELSE 'pendente' END,
+           solicitado_por = EXCLUDED.solicitado_por,
+           pago_em = NOW(),
+           pagamento_ref = COALESCE(EXCLUDED.pagamento_ref, english_platform_acesso.pagamento_ref),
+           valor = COALESCE(EXCLUDED.valor, english_platform_acesso.valor),
+           atualizado_em = NOW()`,
+        [alunoId, req.responsavelId, ref, (valor != null && !isNaN(valor)) ? valor : null]);
     }
-    if (!usuario.confirmado) {
-      await log(usuario.id, email, 'login', 'erro', { motivo: 'conta_nao_confirmada' }, req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket.remoteAddress);
-      return res.status(403).json({ erro: 'Conta não confirmada.', precisaConfirmar: true, email: usuario.email });
-    }
-    await log(usuario.id, email, 'login', 'ok', {}, req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket.remoteAddress);
-    res.json({
-      ok: true,
-      usuario: {
-        id: usuario.id,
-        nome: usuario.nome,
-        email: usuario.email,
-        codigo: usuario.codigo,
-        banca: usuario.banca,
-        plano: usuario.plano,
-        saldo: parseFloat(usuario.saldo),
-        total_redacoes: usuario.total_redacoes,
-        avaliacoes_disponiveis: usuario.avaliacoes_disponiveis || 0,
-        desconto_professor: usuario.desconto_professor || false,
-        professor: usuario.professor || 'nao',
-        total_indicacoes: usuario.total_indicacoes || 0
-      }
-    });
-  } catch (err) {
-    console.error('Erro no login:', err.message);
-    res.status(500).json({ erro: 'Erro ao realizar login.' });
-  }
+    res.status(201).json({ ok: true, solicitados: pedidos.length, alunos: await statusEnglishPlatform(req.responsavelId) });
+  } catch (e) { console.error('Erro EP solicitar:', e); res.status(500).json({ erro: 'Erro ao registrar a solicitação de acesso.' }); }
 });
 
-// ══════════════════════════════════════════════════════════════════════
-// PROMPTS DAS BANCAS
-// ══════════════════════════════════════════════════════════════════════
-
-const PROMPT_BASE = `Você é o RedaCheck, o mais rigoroso e preciso avaliador de redações dissertativas do Brasil. Sua análise é sempre fundamentada nas seguintes fontes:
-
-GRAMÁTICAS DE BASE:
-[A] CEGALLA, Domingos Paschoal. Novíssima Gramática da Língua Portuguesa. São Paulo: Nacional.
-[B] CUNHA, Celso; CINTRA, Lindley. Nova Gramática do Português Contemporâneo. 7ª ed. Rio de Janeiro: Lexikon, 2016.
-[I] CUNHA, Celso. Gramática Essencial da Língua Portuguesa. Rio de Janeiro: Nova Fronteira.
-
-DICIONÁRIOS E VOCABULÁRIOS:
-[C] Aulete Digital: https://aulete.com.br/wap/
-[D] DLP/ABL: servbib.academia.org.br/dlp
-[E] VOLP/ABL: www.academia.org.br/nossa-lingua/busca-no-vocabulario
-
-LINGUÍSTICA TEXTUAL E TEORIA DOS GÊNEROS:
-[F] MARCUSCHI, Luiz Antônio. Gêneros Textuais: definição e funcionalidade. In: DIONÍSIO, A. P. et al. (orgs.). Gêneros Textuais e Ensino. Rio de Janeiro: Lucerna, 2002.
-[G] MARCUSCHI, Luiz Antônio. Produção Textual, Análise de Gêneros e Compreensão. São Paulo: Parábola Editorial, 2008.
-[H] ANTUNES, Irandé. Língua, Texto e Ensino: outra escola possível. São Paulo: Parábola Editorial, 2009.
-
-FUNDAMENTO FILOSÓFICO-PEDAGÓGICO:
-[I] FREIRE, Paulo. A Importância do Ato de Ler: em três artigos que se completam. São Paulo: Autores Associados/Cortez, 1989.
-    Princípio central: "A leitura do mundo precede a leitura da palavra" — antes de avaliar a gramática, avalia-se se o texto expressa um pensamento coerente sobre o mundo.
-    Implicações para avaliação: (a) a escrita é um ato criador e político, não mecânico; (b) o erro gramatical não anula o pensamento — deve ser apontado com respeito e orientação; (c) o feedback deve ser dialógico, não sentenciador.
-
-DOCUMENTOS NORMATIVOS DO MINISTÉRIO DA EDUCAÇÃO:
-[J] BRASIL. Base Nacional Comum Curricular (BNCC). Área de Linguagens e suas Tecnologias — Língua Portuguesa no Ensino Médio. Brasília: MEC, 2018.
-    Competências e habilidades centrais: EM13LP01 a EM13LP28.
-    Eixos organizadores: Leitura, Produção Textual, Oralidade, Análise Linguística e Semiótica.
-    Campos de atuação: artístico-literário, jornalístico-midiático, práticas de estudo e pesquisa, atuação na vida pública.
-[K] BRASIL. Parâmetros Curriculares Nacionais — Língua Portuguesa — Ensino Médio. Brasília: MEC, 1998/2000.
-    Eixos organizadores: uso da língua em situações comunicativas reais, reflexão sobre a língua e a linguagem, leitura de textos de diferentes gêneros e esferas discursivas.
-
-ALINHAMENTO BNCC × ENEM:
-- A Cartilha do ENEM e a BNCC são documentos do mesmo ministério e compartilham a mesma filosofia pedagógica.
-- C1 (domínio da norma culta) alinha-se às habilidades EM13LP06, EM13LP07 (análise linguística, norma-padrão).
-- C2 (repertório sociocultural) alinha-se às habilidades EM13LP02, EM13LP03 (leitura crítica, intertextualidade).
-- C3 (organização argumentativa) alinha-se às habilidades EM13LP15, EM13LP16 (produção textual, argumentação).
-- C4 (coesão textual) alinha-se às habilidades EM13LP08, EM13LP09 (coesão, coerência, progressão temática).
-- C5 (proposta de intervenção) alinha-se às habilidades EM13LP20, EM13LP21 (participação cidadã, práticas de vida pública).
-
-OS 10 EIXOS DE ANÁLISE:
-
-EIXO 1 — CRASE: [A] Cegalla pp.275–284
-EIXO 2 — CONCORDÂNCIA VERBAL E NOMINAL: [A] Cegalla pp.438–472
-EIXO 3 — PONTUAÇÃO: [A] Cegalla pp.428–435
-EIXO 4 — REGÊNCIA VERBAL E NOMINAL: [A] Cegalla pp.483–515
-EIXO 5 — ACENTUAÇÃO E ORTOGRAFIA: [E] VOLP/ABL
-EIXO 6 — MAIÚSCULAS E HÍFEN: [A] Cegalla pp.52–75
-EIXO 7 — COLOCAÇÃO PRONOMINAL: [A] Cegalla pp.538–545
-EIXO 8 — COESÃO TEXTUAL: Analise os mecanismos de coesão referencial (pronomes, substituição lexical, elipse) e coesão sequencial (conectivos, operadores argumentativos). Fundamento: [G] Marcuschi cap. 1.10.1; [H] Antunes cap. 4–5; [J] BNCC EM13LP08, EM13LP09.
-EIXO 9 — COERÊNCIA E TEXTUALIDADE: Avalie os 7 critérios de Beaugrande & Dressler — coesão, coerência, intencionalidade, aceitabilidade, situacionalidade, informatividade e intertextualidade. Fundamento: [G] Marcuschi cap. 1.10–1.11; [H] Antunes cap. 5–6; [J] BNCC EM13LP02, EM13LP03; [K] PCNs — Leitura e produção de sentidos.
-EIXO 10 — ADEQUAÇÃO AO GÊNERO DISCURSIVO: Verifique se o texto respeita as características sociocomunicativas do gênero solicitado (tipo textual, finalidade, interlocutores, suporte). Fundamento: [F] Marcuschi; [G] Marcuschi cap. 1.8; [J] BNCC EM13LP14, EM13LP15 (produção textual em diferentes gêneros); [K] PCNs — Gêneros e esferas discursivas.
-
-REGRAS INVIOLÁVEIS:
-- Nunca use a Wikipedia como referência
-- Sempre cite obra e, quando possível, página ao referenciar gramática ou teoria
-- Nunca invente citações ou referências bibliográficas
-- Mantenha tom pedagógico, rigoroso e construtivo
-- Nos campos "referencia" do JSON, cite sempre pelo código [A]–[I] e o conceito aplicado
-
-IMPORTANTE:
-- Avalie o texto apresentado com rigor e imparcialidade
-- Para aproveitar ao máximo o RedaCheck, recomenda-se o envio de redações originais
-
-ORIENTAÇÃO PEDAGÓGICA PARA TEXTOS COM DESVIOS DE GÊNERO:
-O RedaCheck é uma plataforma pedagógica. Diante de qualquer texto enviado — seja ele
-uma receita, uma lista, uma narrativa, um texto sem nexo ou com baixa densidade argumentativa —
-sua função é SEMPRE orientar, nunca apenas punir.
-
-Se identificar que o texto apresenta baixa densidade dissertativa:
-  • Vocabulário restrito, repetitivo ou coloquial em excesso
-  • Ausência de conectivos argumentativos e operadores lógicos
-  • Ausência de repertório sociocultural pertinente
-  • Estrutura sem tese, desenvolvimento ou conclusão reconhecíveis
-  • Gênero claramente diferente do dissertativo-argumentativo
-
-PROCEDA DA SEGUINTE FORMA:
-  1. Avalie o que há de aproveitável — nunca ignore o esforço do estudante
-  2. Penalize C2 (compreensão da proposta) e C3 (argumentação) de forma proporcional ao desvio
-  3. No comentarioGeral, explique com clareza e gentileza o que foi identificado
-  4. Oriente como o estudante pode transformar aquele texto em uma dissertação
-  5. Encerre sempre com encorajamento — o erro é parte do aprendizado
-
-LEMBRE-SE: não somos a banca do ENEM nem de nenhum concurso.
-Somos um instrumento de formação. Nossa nota não elimina ninguém —
-ela mostra o caminho para quem quer evoluir.`;
-
-const PROMPT_ENEM = `${PROMPT_BASE}
-
-CRITÉRIOS ENEM 2025 — 5 COMPETÊNCIAS:
-C1 (0–200): 200=excelente domínio; 160=bom; 120=mediano; 80=insuficiente; 40=precário; 0=desconhecimento
-C2 (0–200): 200=argumentação consistente+repertório produtivo; 160=bom; 120=previsível; 80=cópia/insuficiente; 40=tangenciamento; 0=fuga
-C3 (0–200): 200=consistente+autoria; 160=organizada+indícios autoria; 120=limitada+pouco organizada; 80=desorganizada; 40=pouco relacionada; 0=não relacionada
-C4 (0–200): 200=articula bem+repertório diversificado; 160=poucas inadequações; 120=mediana+inadequações; 80=insuficiente; 40=precária; 0=não articula
-C5 (0–200): 200=muito bem elaborada+detalhada; 160=bem elaborada; 120=mediana; 80=insuficiente; 40=vaga; 0=ausente/desrespeita DH
-C5 OBRIGATÓRIO — 5 elementos: agente + ação + modo/meio + finalidade + efeito esperado`;
-
-
-const SCHEMA_JSON = `
-RESPONDA EXCLUSIVAMENTE COM JSON VÁLIDO, sem texto antes ou depois, sem markdown, sem backticks:
-{
-  "notaGeral": <0-1000>,
-  "nivel": "<string>",
-  "banca": "<string>",
-  "competencias": [{"codigo":"C1","descricao":"<string>","nota":<int>,"notaMaxima":200,"percentual":<0-100>,"justificativa":"<string>"}],
-  "paragrafos": [{"numero":<int>,"titulo":"<string>","classificacao":"BOM|REGULAR|ATENÇÃO","texto_trecho":"<string>","recursosCoesivos":"<string>","estruturaArgumentativa":"<string>","desvios":"<string>","sugestao":"<string>","referencia":"<string>"}],
-  "pontosFortes": [{"descricao":"<string>","referencia":"<string>"}],
-  "desviosIdentificados": [{"eixo":"<string>","trecho":"<string>","correcao":"<string>","explicacao":"<string>","referencia":"<string>"}],
-  "comentarioGeral": "<string>",
-  "assinatura": "Avaliação fundamentada nos critérios do INEP/ENEM, nas gramáticas de Cegalla, Celso Cunha & Cintra, na teoria dos gêneros textuais de Marcuschi, na linguística textual de Irandé Antunes e nos dicionários Aulete, DLP/ABL e VOLP/ABL."
-}`
-
-// ── PROMPT UnB (Vestibular) ─────────────────────────────────────────
-const PROMPT_UNB = `${PROMPT_BASE}
-
-BANCA: UnB — Vestibular da Universidade de Brasília
-CRITÉRIOS OFICIAIS (Edital UnB):
-
-DOMÍNIO DO CONTEÚDO (NC) — máximo 10,00 pontos:
-  • Apresentação textual (clareza, objetividade, legibilidade da escrita): até 3,0 pts
-  • Estrutura textual (introdução, desenvolvimento, conclusão articulados): até 3,0 pts
-  • Desenvolvimento do tema (pertinência, profundidade, coerência argumentativa): até 4,0 pts
-
-DOMÍNIO DA MODALIDADE ESCRITA (NE):
-  Contabilize cada erro individualmente nas categorias:
-  • Ortografia: grafia incorreta de palavras, acentuação, hífen
-  • Morfossintaxe: concordância verbal/nominal, regência, colocação pronominal, conjugação
-  • Propriedade vocabular: uso inadequado, ambiguidade, imprecisão lexical
-
-FÓRMULA OFICIAL UnB: NR = NC – 2 × (NE ÷ TL)
-  Onde TL = total de linhas efetivamente escritas
-  Nota mínima: 0,000 | Nota máxima: 10,000
-  Eliminação: NR < 4,000
-
-CONVERSÃO PARA ESCALA 0–1000:
-  • NR 0,0 a 4,0 → 0 a 700 (abaixo da média — seria eliminado)
-  • NR 4,0 a 7,0 → 700 a 900 (aprovado — regular a bom)
-  • NR 7,0 a 10,0 → 900 a 1000 (aprovado — excelente, critérios rígidos)
-
-ATENÇÃO: aplique rigor normativo. O fator 2 na fórmula penaliza erros proporcionalmente ao texto.
-Informe no campo "notaGeral" a nota já convertida para escala 0–1000.
-Informe no campo "formulaDetalhada" os valores NC, NE e TL utilizados.
-` + SCHEMA_JSON;
-
-// ── PROMPT CEBRASPE (Concurso Público) ──────────────────────────────
-const PROMPT_CEBRASPE = `${PROMPT_BASE}
-
-BANCA: CEBRASPE — Concurso Público (vinculada à UnB)
-CRITÉRIOS OFICIAIS (Edital CEBRASPE):
-
-DOMÍNIO DO CONTEÚDO (NC) — máximo 30,00 pontos:
-  • Apresentação textual (clareza, objetividade, coerência global): até 8,0 pts
-  • Estrutura textual (organização do texto dissertativo, articulação entre partes): até 8,0 pts
-  • Desenvolvimento do tema (pertinência ao tema proposto, profundidade argumentativa,
-    uso adequado de repertório, proposta de intervenção quando exigida): até 14,0 pts
-
-DOMÍNIO DA MODALIDADE ESCRITA (NE) — CRITÉRIO ELIMINATÓRIO:
-  Contabilize CADA erro individualmente com MÁXIMO RIGOR:
-  • Grafia: ortografia, acentuação gráfica, hífen, uso de maiúsculas
-  • Morfossintaxe: concordância verbal e nominal, regência verbal e nominal,
-    colocação pronominal, uso de tempos e modos verbais, paralelismo sintático
-  • Propriedade vocabular: inadequação lexical, ambiguidade, pleonasmo vicioso,
-    cacofonia, barbarismo, solecismo
-
-FÓRMULA OFICIAL CEBRASPE: NPD = NC – 6 × (NE ÷ TL)
-  Onde TL = total de linhas efetivamente escritas (máximo 30 linhas)
-  Nota mínima: 0,000 | Nota máxima: 30,000
-  Eliminação: NPD < 15,000
-  ATENÇÃO: fator 6 — cada erro tem impacto 3x maior que no vestibular UnB
-
-CONVERSÃO PARA ESCALA 0–1000:
-  • NPD 0 a 15,0 → 0 a 700 (abaixo da média — seria eliminado no concurso)
-  • NPD 15,0 a 24,0 → 700 a 900 (aprovado — regular a bom)
-  • NPD 24,0 a 30,0 → 900 a 1000 (aprovado — excelente, critérios rígidos)
-
-ATENÇÃO MÁXIMA: o texto dissertativo para concurso CEBRASPE exige:
-  - Linguagem formal e objetiva ao longo de todo o texto
-  - Argumentação fundamentada em conhecimentos específicos do tema
-  - Coesão e coerência rigorosas entre parágrafos
-  - Ausência de marcas de identificação do candidato
-  - Respeito ao limite de linhas (até 30 linhas)
-Informe no campo "notaGeral" a nota já convertida para escala 0–1000.
-Informe no campo "formulaDetalhada" os valores NC, NE e TL utilizados.
-` + SCHEMA_JSON;
-
-
-;
-
-// ── ROTA DE AVALIAÇÃO ─────────────────────────────────────────────────
-
-const PROMPTS = {
-  ENEM: PROMPT_ENEM,
-  ITA: `${PROMPT_BASE}\nCRITÉRIOS ITA: 4 critérios — desenvolvimento do tema (0–30), argumentação (0–30), domínio da língua (0–25), coesão e coerência (0–15). Total 0–100, escalar para 0–1000.`,
-  UNICAMP: `${PROMPT_BASE}\nCRITÉRIOS UNICAMP: proposta temática (0–4), gênero discursivo (0–4), norma culta (0–4). Total 0–12. Atenção especial ao Eixo 10 — adequação ao gênero discursivo é critério central na Unicamp [F][G].`,
-  FUVEST: `${PROMPT_BASE}\nCRITÉRIOS FUVEST: cumprimento da proposta (0–5), desenvolvimento (0–5), domínio da língua (0–5), coesão (0–5). Total 0–20, escalar para 0–100. Use os Eixos 8 e 9 para avaliar coesão e coerência com fundamentação em [G][H].`,
-  CONCURSO_PUBLICO: `${PROMPT_BASE}\nCRITÉRIOS CONCURSO: adequação ao tema (0–30), argumentação (0–30), domínio da norma culta (0–25), coesão (0–15). Total 0–100. Aplique todos os 10 eixos com rigor normativo.`,
-  UNB: PROMPT_UNB,
-  CEBRASPE: PROMPT_CEBRASPE
-};
-
-
-// ── WINSTON AI — detecção de texto gerado por IA ──────────────────────
-// Retorna score 0-1 (probabilidade de ser IA) ou null em caso de falha
-// Não bloqueia — apenas informa. Timeout: 5s para não atrasar avaliação
-async function winstonDetect(texto) {
+// English Platform · IA (assistente + dicionário). Proxy server-side para não expor a chave no navegador.
+// Só para responsáveis autenticados e com limite de uso. Configure ANTHROPIC_API_KEY no ambiente (Railway).
+app.post('/publico/portal/assistant', autenticarResponsavel, limiterIA, async (req, res) => {
   try {
-    const key = process.env.WINSTON_API_KEY;
-    if (!key || !texto || texto.trim().length < 50) return null;
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 8000);
-    const resp = await fetch('https://api.gowinston.ai/v2/ai-content-detection', {
+    const key = process.env.ANTHROPIC_API_KEY;
+    if (!key) return res.status(503).json({ erro: 'Assistente indisponível: falta configurar a chave da IA no servidor.' });
+    const system = String((req.body && req.body.system) || '').slice(0, 4000);
+    const user = String((req.body && req.body.user) || '').slice(0, 4000);
+    if (!user) return res.status(400).json({ erro: 'Mensagem vazia.' });
+    const r = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${key}`
-      },
-      body: JSON.stringify({ text: texto.trim().substring(0, 4000), language: 'pt', sentences: false }),
-      signal: ctrl.signal
-    });
-    clearTimeout(timer);
-    if (!resp.ok) {
-      console.warn('[Winston] Resposta não OK:', resp.status, await resp.text().catch(()=>''));
-      return null;
-    }
-    const data = await resp.json();
-    console.log('[Winston] Resposta:', JSON.stringify(data).substring(0, 200));
-    // Winston retorna "score" = Human Score (0=IA pura, 100=humano puro)
-    // Convertemos para probabilidade de IA: ia_score = 1 - (humanScore/100)
-    const humanScore = data?.score ?? data?.result?.score ?? data?.human_score ?? null;
-    if (humanScore === null) return null;
-    const iaScore = 1 - (humanScore / 100);
-    return iaScore; // 0=humano, 1=IA
-  } catch(e) {
-    console.warn('[Winston] Erro:', e.message);
-    return null; // Falha silenciosa — não afeta a avaliação
-  }
-}
-
-app.post('/avaliar', async (req, res) => {
-  try {
-    const { redacao, banca, tipoProva, usuario, imagem, mediaType, usuarioId } = req.body;
-
-    const temImagem = imagem && imagem.length > 100;
-    if (!temImagem && (!redacao || redacao.trim().length < 50))
-      return res.status(400).json({ erro: 'Redação não enviada ou muito curta (mínimo 50 caracteres).' });
-
-    const bancaNorm = (banca || tipoProva || 'ENEM').toUpperCase().replace(/ /g, '_');
-    const promptSistema = PROMPTS[bancaNorm] || PROMPTS['ENEM'];
-    const bancaFinal = PROMPTS[bancaNorm] ? bancaNorm : 'ENEM';
-
-    const MIME_VALIDOS = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'];
-    const mimeRaw = mediaType || 'image/jpeg';
-
-    if (temImagem && mimeRaw === 'application/pdf') {
-      return res.status(400).json({
-        erro: 'PDF escaneado não é suportado. Use o modo Foto (JPG/PNG) para redações manuscritas, ou modo Arquivo para PDFs com texto selecionável.'
-      });
-    }
-
-    const mimeFinal = MIME_VALIDOS.includes(mimeRaw) ? mimeRaw : 'image/jpeg';
-
-    if (temImagem && imagem.length > 6_000_000)
-      return res.status(400).json({ erro: 'Imagem muito grande. Reduza a resolução e tente novamente.' });
-
-    let mensagemConteudo;
-    if (temImagem) {
-      mensagemConteudo = [
-        { type: 'image', source: { type: 'base64', media_type: mimeFinal, data: imagem } },
-        {
-          type: 'text',
-          text: `${promptSistema}\n${SCHEMA_JSON}\n\nAnalise a imagem acima. Ela contém uma redação manuscrita. Transcreva mentalmente o texto e avalie para a banca ${bancaFinal}. Se a imagem estiver ilegível, informe no campo "comentarioGeral".`
-        }
-      ];
-    } else {
-      mensagemConteudo = `${promptSistema}\n${SCHEMA_JSON}\n\nAvalie para a banca ${bancaFinal}:\n\nREDAÇÃO:\n${redacao}`;
-    }
-
-    console.log(`[/avaliar] modo=${temImagem?'foto':'texto'} banca=${bancaFinal} usuario=${usuario||'?'} mime=${mimeFinal} tam=${temImagem?imagem.length:redacao?.length}`);
-
-    if (!usuarioId) return res.status(401).json({ erro: 'É necessário estar logado para enviar uma redação.' });
-
-    // Garantir usuarioIdFinal antes do débito — previne INSERT null
-    let _uidPreDebito = usuarioId;
-    if (!_uidPreDebito) {
-      return res.status(401).json({ erro: 'Identificação do usuário não encontrada. Faça login novamente.' });
-    }
-
-    // ══════════════════════════════════════════════════════════════════
-    // CACHE v9.3 — 3 camadas
-    // Camada A: foto/PDF — hash SHA256 exato → retorna sem cobrar
-    // Camada B: texto idêntico — fingerprint exato → retorna sem cobrar
-    // Camada C: texto similar (Jaccard ≥ 0.82) → pergunta ao usuário
-    // ══════════════════════════════════════════════════════════════════
-
-    // ── CAMADA A: foto/PDF — hash SHA256 ─────────────────────────────
-    if (temImagem && imagem && imagem.length > 100) {
-      const imgHash = hashBase64(imagem);
-      // Verificar saldo antes do cache — se saldo=0, bypass (cobra e reavalia)
-      const saldoCheckA = await pool.query('SELECT avaliacoes_disponiveis FROM usuarios WHERE id = $1', [usuarioId]);
-      const saldoAtualA = saldoCheckA.rows[0]?.avaliacoes_disponiveis || 0;
-
-      if (saldoAtualA > 0) {
-        const cachedImg = await pool.query(
-          `SELECT id, resultado, nota_geral, banca, created_at
-           FROM avaliacoes
-           WHERE usuario_id = $1 AND imagem_hash = $2 AND banca = $3
-           ORDER BY created_at DESC LIMIT 1`,
-          [usuarioId, imgHash, bancaFinal]
-        );
-        if (cachedImg.rows.length > 0) {
-          const c = cachedImg.rows[0];
-          await pool.query(`UPDATE avaliacoes SET created_at = NOW() WHERE id = $1`, [c.id]).catch(() => {});
-          console.log(`[/avaliar] Cache imagem hit — avaliação ${c.id} reutilizada para usuário ${usuarioId}`);
-          await log(usuarioId, null, 'avaliar_cache', 'ok', { tipo: 'imagem_hash', avaliacao_id: c.id, banca: bancaFinal });
-          return res.json({
-            avaliacao: typeof c.resultado === 'string' ? JSON.parse(c.resultado) : c.resultado,
-            formato: 'json', banca: c.banca, cache: true, cache_tipo: 'identica'
-          });
-        }
-      }
-      // Guardar hash para usos futuros (injetado antes do INSERT final)
-      req._imgHash = imgHash;
-    }
-
-    // ── CAMADA B: texto idêntico — SHA256 completo ─────────────────────
-    if (!temImagem && redacao && redacao.trim().length >= 50) {
-      // Verificar saldo antes do cache — se saldo=0, bypass (cobra e reavalia)
-      const saldoCheck = await pool.query('SELECT avaliacoes_disponiveis FROM usuarios WHERE id = $1', [usuarioId]);
-      const saldoAtual = saldoCheck.rows[0]?.avaliacoes_disponiveis || 0;
-
-      if (saldoAtual > 0) {
-        // SHA256 do texto normalizado completo — muito mais preciso que fingerprint 500 chars
-        const textoNorm = redacao.trim().toLowerCase().replace(/\s+/g, ' ');
-        const textoHash = require('crypto').createHash('sha256').update(textoNorm).digest('hex');
-        const cached = await pool.query(
-          `SELECT id, resultado, nota_geral, banca, created_at
-           FROM avaliacoes
-           WHERE usuario_id = $1
-             AND MD5(LOWER(TRIM(REGEXP_REPLACE(COALESCE(redacao,''), '\\s+', ' ', 'g')))) = $2
-             AND banca = $3
-           ORDER BY created_at DESC LIMIT 1`,
-          [usuarioId, require('crypto').createHash('md5').update(textoNorm).digest('hex'), bancaFinal]
-        );
-        if (cached.rows.length > 0) {
-          const c = cached.rows[0];
-          await pool.query(`UPDATE avaliacoes SET created_at = NOW() WHERE id = $1`, [c.id]).catch(() => {});
-          console.log(`[/avaliar] Cache texto hit — avaliação ${c.id} reutilizada para usuário ${usuarioId}`);
-          await log(usuarioId, null, 'avaliar_cache', 'ok', { tipo: 'texto_identico', avaliacao_id: c.id, banca: bancaFinal });
-          return res.json({
-            avaliacao: typeof c.resultado === 'string' ? JSON.parse(c.resultado) : c.resultado,
-            formato: 'json', banca: c.banca, cache: true, cache_tipo: 'identica'
-          });
-        }
-      }
-
-      // ── CAMADA C (Jaccard similar) removida — responsabilidade do usuário
-    }
-
-    // ── WINSTON AI — detecção de possível texto gerado por IA ────────────
-    // Apenas para texto digitado — não para foto/manuscrito
-    // Não bloqueia, não altera nota — apenas flag pedagógica
-    let possivel_ia = false;
-    if (!temImagem && redacao && redacao.trim().length >= 50) {
-      const wScore = await winstonDetect(redacao);
-      if (wScore !== null && wScore >= 0.80) {
-        possivel_ia = true;
-        console.log(`[/avaliar] Winston IA detectada — score=${(wScore*100).toFixed(0)}% usuario=${usuario||'?'}`);
-      }
-    }
-
-    const debitoResult = await pool.query(
-      `UPDATE usuarios SET avaliacoes_disponiveis = avaliacoes_disponiveis - 1, total_redacoes = COALESCE(total_redacoes,0) + 1, updated_at = NOW() WHERE id = $1 AND avaliacoes_disponiveis > 0 RETURNING avaliacoes_disponiveis`,
-      [usuarioId]
-    );
-    if (debitoResult.rowCount === 0) {
-      const uCheck = await pool.query('SELECT avaliacoes_disponiveis FROM usuarios WHERE id = $1', [usuarioId]);
-      if (!uCheck.rows.length) return res.status(401).json({ erro: 'Usuário não encontrado.' });
-      await log(usuarioId, null, 'avaliar_erro', 'erro', { motivo: 'saldo_insuficiente', banca: bancaFinal });
-      return res.status(402).json({ erro: 'Você não possui avaliações disponíveis.', saldo: 0 });
-    }
-    const saldoAposDebito = debitoResult.rows[0]?.avaliacoes_disponiveis ?? null;
-    await log(usuarioId, null, 'avaliar_inicio', 'ok', { banca: bancaFinal, modo: temImagem ? 'foto' : 'texto', saldo_depois: saldoAposDebito });
-
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': process.env.ANTHROPIC_API_KEY,
-        'anthropic-version': '2023-06-01'
-      },
+      headers: { 'content-type': 'application/json', 'x-api-key': key, 'anthropic-version': '2023-06-01' },
       body: JSON.stringify({
-        model: 'claude-sonnet-4-5',
-        max_tokens: 8000,
-        system: 'Você é o RedaCheck. Responda SEMPRE e SOMENTE com JSON válido, sem nenhum texto adicional.',
-        messages: [{ role: 'user', content: mensagemConteudo }]
+        model: process.env.EP_AI_MODEL || 'claude-sonnet-4-5',
+        max_tokens: 1000,
+        ...(system ? { system } : {}),
+        messages: [{ role: 'user', content: user }]
       })
     });
+    const data = await r.json();
+    if (!r.ok) { console.error('Erro IA upstream:', data && data.error); return res.status(502).json({ erro: 'A IA não respondeu agora. Tente novamente.' }); }
+    const text = (data.content || []).filter(b => b.type === 'text').map(b => b.text).join('\n').trim();
+    res.json({ text });
+  } catch (e) { console.error('Erro assistant:', e); res.status(500).json({ erro: 'Erro no assistente.' }); }
+});
 
-    const data = await response.json();
-
-    if (data.error) {
-      console.error('[/avaliar] Erro API Anthropic:', JSON.stringify(data.error));
-      return res.status(500).json({ erro: `Erro na API de avaliação: ${data.error.message || data.error.type || 'desconhecido'}` });
+// ---------- English Platform · painel do master ----------
+app.get('/admin/english-platform/solicitacoes', autenticar, exigirPerfil('master'), async (req, res) => {
+  try {
+    const filtro = ['pendente', 'autorizado', 'revogado'].includes(req.query.status) ? req.query.status : null;
+    const params = [];
+    let where = '';
+    if (filtro) { params.push(filtro); where = 'WHERE ep.status = $1'; }
+    const r = await pool.query(
+      `SELECT ep.aluno_id, ep.status, ep.pago_em, ep.pagamento_ref, ep.valor,
+              ep.autorizado_em, a.nome AS aluno_nome, a.codigo AS aluno_codigo,
+              t.nome AS turma_nome, t.turno,
+              r.nome AS solicitante_nome, r.cpf AS solicitante_cpf,
+              u.nome AS autorizado_por_nome
+         FROM english_platform_acesso ep
+         JOIN alunos a ON a.id = ep.aluno_id
+         LEFT JOIN matriculas m ON m.aluno_id = a.id AND m.status = 'ativa'
+         LEFT JOIN turmas t ON t.id = m.turma_id
+         LEFT JOIN responsaveis r ON r.id = ep.solicitado_por
+         LEFT JOIN usuarios u ON u.id = ep.autorizado_por
+         ${where}
+        ORDER BY CASE ep.status WHEN 'pendente' THEN 0 WHEN 'autorizado' THEN 1 ELSE 2 END,
+                 ep.pago_em DESC NULLS LAST, a.nome`, params);
+    const contagem = await pool.query(
+      `SELECT status, COUNT(*)::int AS n FROM english_platform_acesso GROUP BY status`);
+    const cont = { pendente: 0, autorizado: 0, revogado: 0 };
+    contagem.rows.forEach(x => { cont[x.status] = x.n; });
+    res.json({ solicitacoes: r.rows, contagem: cont });
+  } catch (e) { console.error('Erro EP solicitacoes:', e); res.status(500).json({ erro: 'Erro ao listar as solicitações.' }); }
+});
+app.post('/admin/english-platform/:alunoId/autorizar', autenticar, exigirPerfil('master'), async (req, res) => {
+  try {
+    const alunoId = Number(req.params.alunoId);
+    if (!alunoId) return res.status(400).json({ erro: 'Aluno inválido.' });
+    const existe = await pool.query(`SELECT id FROM alunos WHERE id = $1`, [alunoId]);
+    if (!existe.rows.length) return res.status(404).json({ erro: 'Aluno não encontrado.' });
+    // Autoriza o pedido pago ou, se não houver, cria já autorizado (liberação manual pelo master)
+    await pool.query(
+      `INSERT INTO english_platform_acesso (aluno_id, status, autorizado_por, autorizado_em)
+       VALUES ($1,'autorizado',$2, NOW())
+       ON CONFLICT (aluno_id) DO UPDATE SET
+         status = 'autorizado', autorizado_por = $2, autorizado_em = NOW(), atualizado_em = NOW()`,
+      [alunoId, req.usuario.id]);
+    res.json({ ok: true, aluno_id: alunoId, status: 'autorizado' });
+  } catch (e) { console.error('Erro EP autorizar:', e); res.status(500).json({ erro: 'Erro ao autorizar o acesso.' }); }
+});
+app.post('/admin/english-platform/autorizar-lote', autenticar, exigirPerfil('master'), async (req, res) => {
+  try {
+    const ids = Array.isArray(req.body && req.body.aluno_ids) ? req.body.aluno_ids.map(Number).filter(Boolean) : [];
+    if (!ids.length) return res.status(400).json({ erro: 'Selecione ao menos um aluno.' });
+    let n = 0;
+    for (const alunoId of ids) {
+      const e = await pool.query(`SELECT id FROM alunos WHERE id = $1`, [alunoId]);
+      if (!e.rows.length) continue;
+      await pool.query(
+        `INSERT INTO english_platform_acesso (aluno_id, status, autorizado_por, autorizado_em)
+         VALUES ($1,'autorizado',$2, NOW())
+         ON CONFLICT (aluno_id) DO UPDATE SET
+           status = 'autorizado', autorizado_por = $2, autorizado_em = NOW(), atualizado_em = NOW()`,
+        [alunoId, req.usuario.id]);
+      n++;
     }
-    if (!data.content || !data.content[0]) {
-      console.error('[/avaliar] Resposta vazia:', JSON.stringify(data));
-      return res.status(500).json({ erro: 'API retornou resposta vazia.' });
+    res.json({ ok: true, autorizados: n });
+  } catch (e) { console.error('Erro EP autorizar-lote:', e); res.status(500).json({ erro: 'Erro ao autorizar em lote.' }); }
+});
+app.post('/admin/english-platform/:alunoId/revogar', autenticar, exigirPerfil('master'), async (req, res) => {
+  try {
+    const alunoId = Number(req.params.alunoId);
+    if (!alunoId) return res.status(400).json({ erro: 'Aluno inválido.' });
+    const r = await pool.query(
+      `UPDATE english_platform_acesso
+          SET status = 'revogado', autorizado_por = NULL, autorizado_em = NULL, atualizado_em = NOW()
+        WHERE aluno_id = $1 RETURNING aluno_id`, [alunoId]);
+    if (!r.rows.length) return res.status(404).json({ erro: 'Este aluno não tem solicitação de acesso.' });
+    res.json({ ok: true, aluno_id: alunoId, status: 'revogado' });
+  } catch (e) { console.error('Erro EP revogar:', e); res.status(500).json({ erro: 'Erro ao revogar o acesso.' }); }
+});
+
+// ---------- Avisos (coordenação publica; pais leem no portal) ----------
+app.post('/admin/avisos', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const escopo = ['geral', 'turma', 'aluno'].includes(req.body.escopo) ? req.body.escopo : 'geral';
+    const titulo = String(req.body.titulo || '').trim();
+    const mensagem = String(req.body.mensagem || '').trim();
+    if (!titulo) return res.status(400).json({ erro: 'Informe o título.' });
+    if (!mensagem) return res.status(400).json({ erro: 'Informe a mensagem.' });
+    let turmaId = null, alunoId = null;
+    if (escopo === 'turma') { turmaId = Number(req.body.turma_id) || null; if (!turmaId) return res.status(400).json({ erro: 'Selecione a turma.' }); }
+    if (escopo === 'aluno') { alunoId = Number(req.body.aluno_id) || null; if (!alunoId) return res.status(400).json({ erro: 'Selecione o aluno.' }); }
+    const r = await pool.query(
+      `INSERT INTO avisos (autor_id, escopo, turma_id, aluno_id, titulo, mensagem)
+       VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
+      [req.usuario.id, escopo, turmaId, alunoId, titulo, mensagem]);
+    res.status(201).json({ id: r.rows[0].id });
+  } catch (e) { console.error('Erro POST avisos:', e); res.status(500).json({ erro: 'Erro ao publicar o aviso.' }); }
+});
+
+app.get('/admin/avisos', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const r = await pool.query(
+      `SELECT av.id, av.escopo, av.titulo, av.mensagem, av.criado_em, av.turma_id, av.aluno_id,
+              t.nome AS turma_nome, a.nome AS aluno_nome, u.nome AS autor_nome
+       FROM avisos av
+       LEFT JOIN turmas t ON t.id = av.turma_id
+       LEFT JOIN alunos a ON a.id = av.aluno_id
+       LEFT JOIN usuarios u ON u.id = av.autor_id
+       ORDER BY av.criado_em DESC LIMIT 200`);
+    res.json(r.rows);
+  } catch (e) { console.error('Erro GET avisos:', e); res.status(500).json({ erro: 'Erro ao listar avisos.' }); }
+});
+
+app.delete('/admin/avisos/:id', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const r = await pool.query(`DELETE FROM avisos WHERE id = $1 RETURNING id`, [req.params.id]);
+    if (!r.rows.length) return res.status(404).json({ erro: 'Aviso não encontrado.' });
+    res.json({ ok: true });
+  } catch (e) { console.error('Erro DELETE avisos:', e); res.status(500).json({ erro: 'Erro ao remover o aviso.' }); }
+});
+
+app.get('/publico/portal/aluno/:id/avisos', autenticarResponsavel, async (req, res) => {
+  try {
+    const alunoId = Number(req.params.id);
+    const vinc = await pool.query(
+      `SELECT 1 FROM aluno_responsavel WHERE responsavel_id = $1 AND aluno_id = $2`,
+      [req.responsavelId, alunoId]);
+    if (!vinc.rows.length) return res.status(403).json({ erro: 'Acesso negado a este aluno.' });
+    const r = await pool.query(
+      `SELECT av.id, av.escopo, av.titulo, av.mensagem, av.criado_em, t.nome AS turma_nome
+       FROM avisos av
+       LEFT JOIN turmas t ON t.id = av.turma_id
+       WHERE av.escopo = 'geral'
+          OR (av.escopo = 'aluno' AND av.aluno_id = $1)
+          OR (av.escopo = 'turma' AND av.turma_id IN (
+                SELECT turma_id FROM matriculas WHERE aluno_id = $1 AND status = 'ativa'))
+       ORDER BY av.criado_em DESC LIMIT 100`, [alunoId]);
+    res.json(r.rows);
+  } catch (e) { console.error('Erro portal avisos:', e); res.status(500).json({ erro: 'Erro ao carregar os avisos.' }); }
+});
+
+// ---------- Declaração de Vínculo verificável ----------
+app.post('/publico/portal/aluno/:id/declaracao', autenticarResponsavel, async (req, res) => {
+  try {
+    const alunoId = Number(req.params.id);
+    const vinc = await pool.query(`SELECT 1 FROM aluno_responsavel WHERE responsavel_id = $1 AND aluno_id = $2`, [req.responsavelId, alunoId]);
+    if (!vinc.rows.length) return res.status(403).json({ erro: 'Acesso negado a este aluno.' });
+    const dr = await pool.query(
+      `SELECT a.nome, a.cpf, t.turno, t.semestre, n.nome AS nivel_nome
+       FROM alunos a
+       LEFT JOIN matriculas m ON m.aluno_id = a.id AND m.status = 'ativa'
+       LEFT JOIN turmas t ON t.id = m.turma_id
+       LEFT JOIN niveis n ON n.id = t.nivel_id
+       WHERE a.id = $1 LIMIT 1`, [alunoId]);
+    const d = dr.rows[0];
+    if (!d) return res.status(404).json({ erro: 'Aluno não encontrado.' });
+    const curso = 'Língua e Cultura Inglesa';
+    let codigo, ok = false;
+    for (let i = 0; i < 6 && !ok; i++) {
+      codigo = 'CEMIC-' + crypto.randomBytes(2).toString('hex').toUpperCase() + '-' + crypto.randomBytes(2).toString('hex').toUpperCase();
+      const ex = await pool.query(`SELECT 1 FROM declaracoes WHERE codigo = $1`, [codigo]);
+      if (!ex.rows.length) ok = true;
     }
+    const ins = await pool.query(
+      `INSERT INTO declaracoes (codigo, tipo, aluno_id, aluno_nome, aluno_cpf, curso, modulo, turno, semestre, responsavel_id)
+       VALUES ($1, 'vinculo', $2, $3, $4, $5, $6, $7, $8, $9) RETURNING codigo, emitida_em`,
+      [codigo, alunoId, d.nome, d.cpf, curso, d.nivel_nome || null, d.turno || null, d.semestre || null, req.responsavelId]);
+    res.status(201).json({
+      codigo: ins.rows[0].codigo, emitida_em: ins.rows[0].emitida_em,
+      aluno_nome: d.nome, aluno_cpf: d.cpf, curso, modulo: d.nivel_nome || null, turno: d.turno || null, semestre: d.semestre || null
+    });
+  } catch (e) { console.error('Erro gerar declaração:', e); res.status(500).json({ erro: 'Erro ao gerar a declaração.' }); }
+});
 
-    const textoResposta = data.content[0].text;
-    if (data.stop_reason === 'max_tokens') console.warn('[/avaliar] Resposta truncada por max_tokens!');
+// ============================================================
+// PORTAL DO PROFESSOR
+// ============================================================
+const somenteProfessor = exigirPerfil('professor', 'master', 'secretaria');
 
-    let avaliacaoJSON;
-    try {
-      let limpo = textoResposta.replace(/^```json\s*/i,'').replace(/^```\s*/i,'').replace(/\s*```\s*$/i,'').trim();
-      const jsonStart = limpo.indexOf('{');
-      const jsonEnd = limpo.lastIndexOf('}');
-      if (jsonStart >= 0 && jsonEnd > jsonStart) limpo = limpo.substring(jsonStart, jsonEnd + 1);
-      avaliacaoJSON = JSON.parse(limpo);
-    } catch {
-      try {
-        const match = textoResposta.match(/\{[\s\S]*\}/);
-        if (match) avaliacaoJSON = JSON.parse(match[0]);
-        else throw new Error('JSON não encontrado');
-      } catch {
-        return res.json({ avaliacao: textoResposta, formato: 'texto', banca: bancaFinal });
+// professor -> só as próprias turmas; gestão -> acesso amplo (null)
+function escopoProfessor(req) {
+  if (req.usuario.perfil === 'professor') return Number(req.usuario.referencia_id) || -1;
+  return null;
+}
+async function podeTurma(req, turmaId) {
+  const prof = escopoProfessor(req);
+  if (prof === null) return true;
+  const r = await pool.query(`SELECT 1 FROM turmas WHERE id = $1 AND professor_id = $2`, [turmaId, prof]);
+  return r.rows.length > 0;
+}
+async function turmaDaAula(aulaId) {
+  const r = await pool.query(`SELECT turma_id FROM aulas WHERE id = $1`, [aulaId]);
+  return r.rows.length ? r.rows[0].turma_id : null;
+}
+async function turmaDaAvaliacao(avId) {
+  const r = await pool.query(`SELECT turma_id FROM avaliacoes WHERE id = $1`, [avId]);
+  return r.rows.length ? r.rows[0].turma_id : null;
+}
+const MIMES_OK = {
+  'image/jpeg': 1, 'image/png': 1, 'image/webp': 1, 'image/gif': 1, 'application/pdf': 1,
+  'application/msword': 1,
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 1
+};
+const LIMITE_ARQUIVO = 5 * 1024 * 1024;
+
+// --- Turmas do professor ---
+app.get('/professor/turmas', autenticar, somenteProfessor, async (req, res) => {
+  try {
+    const prof = escopoProfessor(req);
+    const cond = prof === null ? '' : 'WHERE t.professor_id = $1';
+    const params = prof === null ? [] : [prof];
+    const r = await pool.query(
+      `SELECT t.id, t.nome, t.semestre, t.turno, t.horario, t.status,
+              n.nome AS nivel_nome, c.nome AS curso_nome,
+              (SELECT COUNT(*) FROM matriculas m WHERE m.turma_id = t.id AND m.status = 'ativa') AS alunos
+       FROM turmas t
+       JOIN niveis n ON n.id = t.nivel_id
+       JOIN cursos c ON c.id = n.curso_id
+       ${cond}
+       ORDER BY t.semestre DESC, t.nome`, params);
+    res.json(r.rows);
+  } catch (e) { console.error('Erro GET professor/turmas:', e); res.status(500).json({ erro: 'Erro ao listar as turmas.' }); }
+});
+
+app.get('/professor/turmas/:id/alunos', autenticar, somenteProfessor, async (req, res) => {
+  try {
+    if (!await podeTurma(req, req.params.id)) return res.status(403).json({ erro: 'Turma não vinculada ao seu cadastro.' });
+    const r = await pool.query(
+      `SELECT m.id AS matricula_id, a.id AS aluno_id, a.nome, a.cpf
+       FROM matriculas m JOIN alunos a ON a.id = m.aluno_id
+       WHERE m.turma_id = $1 AND m.status = 'ativa'
+       ORDER BY a.nome`, [req.params.id]);
+    res.json(r.rows);
+  } catch (e) { console.error('Erro GET alunos da turma:', e); res.status(500).json({ erro: 'Erro ao listar os alunos.' }); }
+});
+
+// --- Aulas / conteúdos ---
+app.get('/professor/turmas/:id/aulas', autenticar, somenteProfessor, async (req, res) => {
+  try {
+    if (!await podeTurma(req, req.params.id)) return res.status(403).json({ erro: 'Turma não vinculada ao seu cadastro.' });
+    const r = await pool.query(
+      `SELECT au.id, au.data, au.conteudo,
+              (SELECT COUNT(*) FROM frequencias f WHERE f.aula_id = au.id) AS chamada_lancada,
+              (SELECT COUNT(*) FROM frequencias f WHERE f.aula_id = au.id AND f.presente = FALSE) AS faltas
+       FROM aulas au WHERE au.turma_id = $1 ORDER BY au.data DESC, au.id DESC`, [req.params.id]);
+    res.json(r.rows);
+  } catch (e) { console.error('Erro GET aulas:', e); res.status(500).json({ erro: 'Erro ao listar as aulas.' }); }
+});
+
+app.post('/professor/turmas/:id/aulas', autenticar, somenteProfessor, async (req, res) => {
+  try {
+    if (!await podeTurma(req, req.params.id)) return res.status(403).json({ erro: 'Turma não vinculada ao seu cadastro.' });
+    const data = req.body.data;
+    const conteudo = (req.body.conteudo || '').trim();
+    if (!data) return res.status(400).json({ erro: 'Informe a data da aula.' });
+    if (!conteudo) return res.status(400).json({ erro: 'Descreva o conteúdo trabalhado.' });
+    const prof = escopoProfessor(req);
+    const r = await pool.query(
+      `INSERT INTO aulas (turma_id, data, conteudo, professor_id) VALUES ($1,$2,$3,$4) RETURNING id`,
+      [req.params.id, data, conteudo, prof]);
+    res.status(201).json({ id: r.rows[0].id });
+  } catch (e) { console.error('Erro POST aula:', e); res.status(500).json({ erro: 'Erro ao registrar a aula.' }); }
+});
+
+app.put('/professor/aulas/:id', autenticar, somenteProfessor, async (req, res) => {
+  try {
+    const tId = await turmaDaAula(req.params.id);
+    if (!tId) return res.status(404).json({ erro: 'Aula não encontrada.' });
+    if (!await podeTurma(req, tId)) return res.status(403).json({ erro: 'Aula de turma não vinculada ao seu cadastro.' });
+    const conteudo = (req.body.conteudo || '').trim();
+    if (!conteudo) return res.status(400).json({ erro: 'Descreva o conteúdo trabalhado.' });
+    await pool.query(`UPDATE aulas SET conteudo = $1, data = COALESCE($2, data) WHERE id = $3`,
+      [conteudo, req.body.data || null, req.params.id]);
+    res.json({ ok: true });
+  } catch (e) { console.error('Erro PUT aula:', e); res.status(500).json({ erro: 'Erro ao atualizar a aula.' }); }
+});
+
+app.delete('/professor/aulas/:id', autenticar, somenteProfessor, async (req, res) => {
+  try {
+    const tId = await turmaDaAula(req.params.id);
+    if (!tId) return res.status(404).json({ erro: 'Aula não encontrada.' });
+    if (!await podeTurma(req, tId)) return res.status(403).json({ erro: 'Aula de turma não vinculada ao seu cadastro.' });
+    await pool.query(`DELETE FROM aulas WHERE id = $1`, [req.params.id]);
+    res.json({ ok: true });
+  } catch (e) { console.error('Erro DELETE aula:', e); res.status(500).json({ erro: 'Erro ao remover a aula.' }); }
+});
+
+// --- Chamada (frequência) ---
+app.get('/professor/aulas/:id/chamada', autenticar, somenteProfessor, async (req, res) => {
+  try {
+    const tId = await turmaDaAula(req.params.id);
+    if (!tId) return res.status(404).json({ erro: 'Aula não encontrada.' });
+    if (!await podeTurma(req, tId)) return res.status(403).json({ erro: 'Aula de turma não vinculada ao seu cadastro.' });
+    const r = await pool.query(
+      `SELECT m.id AS matricula_id, a.nome,
+              COALESCE(f.presente, TRUE) AS presente, f.justificativa,
+              (f.id IS NOT NULL) AS lancado
+       FROM matriculas m
+       JOIN alunos a ON a.id = m.aluno_id
+       LEFT JOIN frequencias f ON f.matricula_id = m.id AND f.aula_id = $2
+       WHERE m.turma_id = $1 AND m.status = 'ativa'
+       ORDER BY a.nome`, [tId, req.params.id]);
+    res.json(r.rows);
+  } catch (e) { console.error('Erro GET chamada:', e); res.status(500).json({ erro: 'Erro ao carregar a chamada.' }); }
+});
+
+app.post('/professor/aulas/:id/chamada', autenticar, somenteProfessor, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const tId = await turmaDaAula(req.params.id);
+    if (!tId) { client.release(); return res.status(404).json({ erro: 'Aula não encontrada.' }); }
+    if (!await podeTurma(req, tId)) { client.release(); return res.status(403).json({ erro: 'Aula de turma não vinculada ao seu cadastro.' }); }
+    const lista = Array.isArray(req.body.presencas) ? req.body.presencas : [];
+    if (!lista.length) { client.release(); return res.status(400).json({ erro: 'Nenhuma presença informada.' }); }
+    await client.query('BEGIN');
+    for (const p of lista) {
+      await client.query(
+        `INSERT INTO frequencias (aula_id, matricula_id, presente, justificativa)
+         VALUES ($1,$2,$3,$4)
+         ON CONFLICT (aula_id, matricula_id)
+         DO UPDATE SET presente = EXCLUDED.presente, justificativa = EXCLUDED.justificativa`,
+        [req.params.id, Number(p.matricula_id), p.presente !== false, (p.justificativa || '').trim() || null]);
+    }
+    await client.query('COMMIT');
+    client.release();
+    res.json({ ok: true, registros: lista.length });
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {}); client.release();
+    console.error('Erro POST chamada:', e); res.status(500).json({ erro: 'Erro ao salvar a chamada.' });
+  }
+});
+
+// --- Avaliações e notas ---
+app.get('/professor/turmas/:id/avaliacoes', autenticar, somenteProfessor, async (req, res) => {
+  try {
+    if (!await podeTurma(req, req.params.id)) return res.status(403).json({ erro: 'Turma não vinculada ao seu cadastro.' });
+    const r = await pool.query(
+      `SELECT av.id, av.nome, av.peso, av.data,
+              (SELECT COUNT(*) FROM notas n WHERE n.avaliacao_id = av.id) AS notas_lancadas
+       FROM avaliacoes av WHERE av.turma_id = $1 ORDER BY av.data NULLS LAST, av.id`, [req.params.id]);
+    res.json(r.rows);
+  } catch (e) { console.error('Erro GET avaliacoes:', e); res.status(500).json({ erro: 'Erro ao listar as avaliações.' }); }
+});
+
+app.post('/professor/turmas/:id/avaliacoes', autenticar, somenteProfessor, async (req, res) => {
+  try {
+    if (!await podeTurma(req, req.params.id)) return res.status(403).json({ erro: 'Turma não vinculada ao seu cadastro.' });
+    if (req.usuario.perfil === 'professor') {
+      return res.status(403).json({ erro: 'As avaliações são definidas pela coordenação. Use os botões do Sistema de Avaliação para criar as etapas do bimestre.' });
+    }
+    const nome = (req.body.nome || '').trim();
+    if (!nome) return res.status(400).json({ erro: 'Informe o nome da avaliação.' });
+    const peso = Number(req.body.peso) > 0 ? Number(req.body.peso) : 1;
+    const r = await pool.query(
+      `INSERT INTO avaliacoes (turma_id, nome, peso, data) VALUES ($1,$2,$3,$4) RETURNING id`,
+      [req.params.id, nome, peso, req.body.data || null]);
+    res.status(201).json({ id: r.rows[0].id });
+  } catch (e) { console.error('Erro POST avaliacao:', e); res.status(500).json({ erro: 'Erro ao criar a avaliação.' }); }
+});
+
+app.delete('/professor/avaliacoes/:id', autenticar, somenteProfessor, async (req, res) => {
+  try {
+    const tId = await turmaDaAvaliacao(req.params.id);
+    if (!tId) return res.status(404).json({ erro: 'Avaliação não encontrada.' });
+    if (!await podeTurma(req, tId)) return res.status(403).json({ erro: 'Avaliação de turma não vinculada ao seu cadastro.' });
+    await pool.query(`DELETE FROM avaliacoes WHERE id = $1`, [req.params.id]);
+    res.json({ ok: true });
+  } catch (e) { console.error('Erro DELETE avaliacao:', e); res.status(500).json({ erro: 'Erro ao remover a avaliação.' }); }
+});
+
+app.get('/professor/avaliacoes/:id/notas', autenticar, somenteProfessor, async (req, res) => {
+  try {
+    const tId = await turmaDaAvaliacao(req.params.id);
+    if (!tId) return res.status(404).json({ erro: 'Avaliação não encontrada.' });
+    if (!await podeTurma(req, tId)) return res.status(403).json({ erro: 'Avaliação de turma não vinculada ao seu cadastro.' });
+    const r = await pool.query(
+      `SELECT m.id AS matricula_id, a.nome, n.nota
+       FROM matriculas m
+       JOIN alunos a ON a.id = m.aluno_id
+       LEFT JOIN notas n ON n.matricula_id = m.id AND n.avaliacao_id = $2
+       WHERE m.turma_id = $1 AND m.status = 'ativa'
+       ORDER BY a.nome`, [tId, req.params.id]);
+    res.json(r.rows);
+  } catch (e) { console.error('Erro GET notas:', e); res.status(500).json({ erro: 'Erro ao carregar as notas.' }); }
+});
+
+app.post('/professor/avaliacoes/:id/notas', autenticar, somenteProfessor, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const tId = await turmaDaAvaliacao(req.params.id);
+    if (!tId) { client.release(); return res.status(404).json({ erro: 'Avaliação não encontrada.' }); }
+    if (!await podeTurma(req, tId)) { client.release(); return res.status(403).json({ erro: 'Avaliação de turma não vinculada ao seu cadastro.' }); }
+    const lista = Array.isArray(req.body.notas) ? req.body.notas : [];
+    await client.query('BEGIN');
+    for (const item of lista) {
+      const mId = Number(item.matricula_id);
+      if (item.nota === '' || item.nota === null || item.nota === undefined) {
+        await client.query(`DELETE FROM notas WHERE avaliacao_id = $1 AND matricula_id = $2`, [req.params.id, mId]);
+        continue;
       }
+      const valor = Number(item.nota);
+      if (!(valor >= 0 && valor <= 10)) { await client.query('ROLLBACK'); client.release(); return res.status(400).json({ erro: 'As notas devem estar entre 0 e 10.' }); }
+      await client.query(
+        `INSERT INTO notas (avaliacao_id, matricula_id, nota, lancada_por)
+         VALUES ($1,$2,$3,$4)
+         ON CONFLICT (avaliacao_id, matricula_id)
+         DO UPDATE SET nota = EXCLUDED.nota, lancada_por = EXCLUDED.lancada_por, lancada_em = NOW()`,
+        [req.params.id, mId, valor, req.usuario.id]);
     }
+    await client.query('COMMIT'); client.release();
+    res.json({ ok: true });
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {}); client.release();
+    console.error('Erro POST notas:', e); res.status(500).json({ erro: 'Erro ao salvar as notas.' });
+  }
+});
 
-    if (avaliacaoJSON.comentarioGeral)
-      avaliacaoJSON.comentarioGeral = avaliacaoJSON.comentarioGeral.replace(/```json[\s\S]*?```/g,'').replace(/```[\s\S]*?```/g,'').trim();
-    if (avaliacaoJSON.assinatura) delete avaliacaoJSON.assinatura;
+// --- Avisos do professor (turma ou aluno) ---
+app.post('/professor/avisos', autenticar, somenteProfessor, async (req, res) => {
+  try {
+    const escopo = req.body.escopo === 'aluno' ? 'aluno' : 'turma';
+    const titulo = (req.body.titulo || '').trim();
+    const mensagem = (req.body.mensagem || '').trim();
+    if (!titulo || !mensagem) return res.status(400).json({ erro: 'Informe o título e a mensagem.' });
+    const turmaId = Number(req.body.turma_id) || null;
+    if (!turmaId) return res.status(400).json({ erro: 'Selecione a turma.' });
+    if (!await podeTurma(req, turmaId)) return res.status(403).json({ erro: 'Turma não vinculada ao seu cadastro.' });
+    const alunoId = escopo === 'aluno' ? (Number(req.body.aluno_id) || null) : null;
+    if (escopo === 'aluno' && !alunoId) return res.status(400).json({ erro: 'Selecione o aluno.' });
+    const r = await pool.query(
+      `INSERT INTO avisos (autor_id, escopo, turma_id, aluno_id, titulo, mensagem)
+       VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
+      [req.usuario.id, escopo, turmaId, alunoId, titulo, mensagem]);
+    res.status(201).json({ id: r.rows[0].id });
+  } catch (e) { console.error('Erro POST aviso professor:', e); res.status(500).json({ erro: 'Erro ao publicar o aviso.' }); }
+});
 
-    let usuarioIdFinal = usuarioId || null;
-    if (!usuarioIdFinal) {
-      try {
-        const uResult = await pool.query('SELECT id FROM usuarios WHERE nome = $1 OR email = $1 LIMIT 1', [usuario || '']);
-        if (uResult.rows.length) usuarioIdFinal = uResult.rows[0].id;
-      } catch {}
+app.get('/professor/avisos', autenticar, somenteProfessor, async (req, res) => {
+  try {
+    const turmaId = Number(req.query.turma_id) || null;
+    if (!turmaId) return res.status(400).json({ erro: 'Selecione a turma.' });
+    if (!await podeTurma(req, turmaId)) return res.status(403).json({ erro: 'Turma não vinculada ao seu cadastro.' });
+    const r = await pool.query(
+      `SELECT av.id, av.escopo, av.titulo, av.mensagem, av.criado_em, a.nome AS aluno_nome
+       FROM avisos av LEFT JOIN alunos a ON a.id = av.aluno_id
+       WHERE av.turma_id = $1 ORDER BY av.criado_em DESC`, [turmaId]);
+    res.json(r.rows);
+  } catch (e) { console.error('Erro GET avisos professor:', e); res.status(500).json({ erro: 'Erro ao listar os avisos.' }); }
+});
+
+app.delete('/professor/avisos/:id', autenticar, somenteProfessor, async (req, res) => {
+  try {
+    const a = await pool.query(`SELECT turma_id FROM avisos WHERE id = $1`, [req.params.id]);
+    if (!a.rows.length) return res.status(404).json({ erro: 'Aviso não encontrado.' });
+    if (a.rows[0].turma_id && !await podeTurma(req, a.rows[0].turma_id)) return res.status(403).json({ erro: 'Aviso de turma não vinculada ao seu cadastro.' });
+    await pool.query(`DELETE FROM avisos WHERE id = $1`, [req.params.id]);
+    res.json({ ok: true });
+  } catch (e) { console.error('Erro DELETE aviso professor:', e); res.status(500).json({ erro: 'Erro ao remover o aviso.' }); }
+});
+
+// --- Ocorrências por aluno ---
+app.get('/professor/ocorrencias', autenticar, somenteProfessor, async (req, res) => {
+  try {
+    const cond = [], params = [];
+    if (req.query.turma_id) {
+      if (!await podeTurma(req, req.query.turma_id)) return res.status(403).json({ erro: 'Turma não vinculada ao seu cadastro.' });
+      params.push(Number(req.query.turma_id)); cond.push(`o.turma_id = $${params.length}`);
+    } else {
+      const prof = escopoProfessor(req);
+      if (prof !== null) { params.push(prof); cond.push(`o.professor_id = $${params.length}`); }
     }
+    if (req.query.aluno_id) { params.push(Number(req.query.aluno_id)); cond.push(`o.aluno_id = $${params.length}`); }
+    const where = cond.length ? 'WHERE ' + cond.join(' AND ') : '';
+    const r = await pool.query(
+      `SELECT o.id, o.data, o.tipo, o.titulo, o.descricao, o.visivel_responsavel,
+              a.nome AS aluno_nome, t.nome AS turma_nome
+       FROM ocorrencias o
+       JOIN alunos a ON a.id = o.aluno_id
+       LEFT JOIN turmas t ON t.id = o.turma_id
+       ${where} ORDER BY o.data DESC, o.id DESC`, params);
+    res.json(r.rows);
+  } catch (e) { console.error('Erro GET ocorrencias:', e); res.status(500).json({ erro: 'Erro ao listar as ocorrências.' }); }
+});
 
-    try {
-      // Garantir usuarioIdFinal preenchido — fallback por nome/email
-      if (!usuarioIdFinal) {
-        try {
-          const uResult = await pool.query(
-            'SELECT id FROM usuarios WHERE nome = $1 OR email = $1 LIMIT 1',
-            [usuario || '']
-          );
-          if (uResult.rows.length) usuarioIdFinal = uResult.rows[0].id;
-        } catch {}
-      }
+app.post('/professor/ocorrencias', autenticar, somenteProfessor, async (req, res) => {
+  try {
+    const alunoId = Number(req.body.aluno_id);
+    const turmaId = Number(req.body.turma_id) || null;
+    const titulo = (req.body.titulo || '').trim();
+    const descricao = (req.body.descricao || '').trim();
+    if (!alunoId) return res.status(400).json({ erro: 'Selecione o aluno.' });
+    if (!titulo || !descricao) return res.status(400).json({ erro: 'Informe o título e a descrição.' });
+    if (turmaId && !await podeTurma(req, turmaId)) return res.status(403).json({ erro: 'Turma não vinculada ao seu cadastro.' });
+    const tipos = ['comportamento','pedagogica','elogio','saude','outro'];
+    const tipo = tipos.includes(req.body.tipo) ? req.body.tipo : 'pedagogica';
+    const r = await pool.query(
+      `INSERT INTO ocorrencias (aluno_id, turma_id, professor_id, data, tipo, titulo, descricao, visivel_responsavel)
+       VALUES ($1,$2,$3,COALESCE($4, CURRENT_DATE),$5,$6,$7,$8) RETURNING id`,
+      [alunoId, turmaId, escopoProfessor(req), req.body.data || null, tipo, titulo, descricao,
+       req.body.visivel_responsavel !== false]);
+    res.status(201).json({ id: r.rows[0].id });
+  } catch (e) { console.error('Erro POST ocorrencia:', e); res.status(500).json({ erro: 'Erro ao registrar a ocorrência.' }); }
+});
 
-      // Se ainda null — estornar crédito e alertar
-      if (!usuarioIdFinal) {
-        await pool.query(
-          `UPDATE usuarios SET avaliacoes_disponiveis = COALESCE(avaliacoes_disponiveis,0) + 1,
-           total_redacoes = GREATEST(COALESCE(total_redacoes,0) - 1, 0), updated_at = NOW()
-           WHERE id = $1`,
-          [usuarioId]
-        ).catch(e => console.error('[/avaliar] Erro ao estornar:', e.message));
-        console.error('[/avaliar] usuarioIdFinal null — crédito estornado para usuarioId:', usuarioId);
+app.delete('/professor/ocorrencias/:id', autenticar, somenteProfessor, async (req, res) => {
+  try {
+    const o = await pool.query(`SELECT turma_id FROM ocorrencias WHERE id = $1`, [req.params.id]);
+    if (!o.rows.length) return res.status(404).json({ erro: 'Ocorrência não encontrada.' });
+    if (o.rows[0].turma_id && !await podeTurma(req, o.rows[0].turma_id)) return res.status(403).json({ erro: 'Ocorrência de turma não vinculada ao seu cadastro.' });
+    await pool.query(`DELETE FROM ocorrencias WHERE id = $1`, [req.params.id]);
+    res.json({ ok: true });
+  } catch (e) { console.error('Erro DELETE ocorrencia:', e); res.status(500).json({ erro: 'Erro ao remover a ocorrência.' }); }
+});
+
+// --- Atividades para casa (link + arquivos) ---
+app.get('/professor/turmas/:id/atividades', autenticar, somenteProfessor, async (req, res) => {
+  try {
+    if (!await podeTurma(req, req.params.id)) return res.status(403).json({ erro: 'Turma não vinculada ao seu cadastro.' });
+    const r = await pool.query(
+      `SELECT at.id, at.titulo, at.descricao, at.link, at.data_entrega, at.criado_em,
+              COALESCE(json_agg(json_build_object('id', ar.id, 'nome', ar.nome, 'mime', ar.mime, 'tamanho', ar.tamanho)
+                       ORDER BY ar.id) FILTER (WHERE ar.id IS NOT NULL), '[]') AS arquivos
+       FROM atividades at
+       LEFT JOIN atividade_arquivos ar ON ar.atividade_id = at.id
+       WHERE at.turma_id = $1
+       GROUP BY at.id ORDER BY at.criado_em DESC`, [req.params.id]);
+    res.json(r.rows);
+  } catch (e) { console.error('Erro GET atividades:', e); res.status(500).json({ erro: 'Erro ao listar as atividades.' }); }
+});
+
+app.post('/professor/turmas/:id/atividades', autenticar, somenteProfessor, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    if (!await podeTurma(req, req.params.id)) { client.release(); return res.status(403).json({ erro: 'Turma não vinculada ao seu cadastro.' }); }
+    const titulo = (req.body.titulo || '').trim();
+    if (!titulo) { client.release(); return res.status(400).json({ erro: 'Informe o título da atividade.' }); }
+    const arquivos = Array.isArray(req.body.arquivos) ? req.body.arquivos : [];
+    for (const f of arquivos) {
+      if (!MIMES_OK[f.mime]) { client.release(); return res.status(400).json({ erro: `Formato não permitido: ${f.nome || f.mime}. Aceitos: foto, PDF e Word.` }); }
+      const bytes = Buffer.byteLength(String(f.base64 || ''), 'base64');
+      if (bytes > LIMITE_ARQUIVO) { client.release(); return res.status(400).json({ erro: `O arquivo ${f.nome} passa de 5 MB.` }); }
+    }
+    await client.query('BEGIN');
+    const r = await client.query(
+      `INSERT INTO atividades (turma_id, professor_id, titulo, descricao, link, data_entrega)
+       VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
+      [req.params.id, escopoProfessor(req), titulo, (req.body.descricao || '').trim() || null,
+       (req.body.link || '').trim() || null, req.body.data_entrega || null]);
+    const atId = r.rows[0].id;
+    for (const f of arquivos) {
+      const buf = Buffer.from(String(f.base64 || ''), 'base64');
+      await client.query(
+        `INSERT INTO atividade_arquivos (atividade_id, nome, mime, tamanho, conteudo) VALUES ($1,$2,$3,$4,$5)`,
+        [atId, (f.nome || 'arquivo').slice(0, 180), f.mime, buf.length, buf]);
+    }
+    await client.query('COMMIT'); client.release();
+    res.status(201).json({ id: atId, arquivos: arquivos.length });
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {}); client.release();
+    console.error('Erro POST atividade:', e); res.status(500).json({ erro: 'Erro ao publicar a atividade.' });
+  }
+});
+
+app.delete('/professor/atividades/:id', autenticar, somenteProfessor, async (req, res) => {
+  try {
+    const a = await pool.query(`SELECT turma_id FROM atividades WHERE id = $1`, [req.params.id]);
+    if (!a.rows.length) return res.status(404).json({ erro: 'Atividade não encontrada.' });
+    if (!await podeTurma(req, a.rows[0].turma_id)) return res.status(403).json({ erro: 'Atividade de turma não vinculada ao seu cadastro.' });
+    await pool.query(`DELETE FROM atividades WHERE id = $1`, [req.params.id]);
+    res.json({ ok: true });
+  } catch (e) { console.error('Erro DELETE atividade:', e); res.status(500).json({ erro: 'Erro ao remover a atividade.' }); }
+});
+
+// Download de anexo (aceita token de professor/gestão ou de responsável, via header ou ?token=)
+app.get('/arquivos/atividade/:id', async (req, res) => {
+  try {
+    const header = req.headers.authorization || '';
+    const token = req.query.token || (header.startsWith('Bearer ') ? header.slice(7) : null);
+    if (!token) return res.status(401).json({ erro: 'Token não fornecido.' });
+    try { jwt.verify(token, JWT_SECRET); } catch { return res.status(401).json({ erro: 'Token inválido ou expirado.' }); }
+    const r = await pool.query(`SELECT nome, mime, conteudo FROM atividade_arquivos WHERE id = $1`, [req.params.id]);
+    if (!r.rows.length) return res.status(404).json({ erro: 'Arquivo não encontrado.' });
+    const f = r.rows[0];
+    res.setHeader('Content-Type', f.mime);
+    res.setHeader('Content-Disposition', `inline; filename*=UTF-8''${encodeURIComponent(f.nome)}`);
+    res.send(f.conteudo);
+  } catch (e) { console.error('Erro download anexo:', e); res.status(500).json({ erro: 'Erro ao baixar o arquivo.' }); }
+});
+
+// ---------- Declaração de Estudos (somente Gestão) ----------
+app.post('/admin/declaracoes/estudos', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const alunoId = Number(req.body.aluno_id);
+    if (!alunoId) return res.status(400).json({ erro: 'Selecione o aluno.' });
+    const modulos = Array.isArray(req.body.modulos)
+      ? req.body.modulos.map(m => String(m || '').trim()).filter(Boolean)
+      : [];
+    if (!modulos.length) return res.status(400).json({ erro: 'Informe ao menos um módulo cursado.' });
+    const a = await pool.query(`SELECT id, nome, cpf FROM alunos WHERE id = $1`, [alunoId]);
+    if (!a.rows.length) return res.status(404).json({ erro: 'Aluno não encontrado.' });
+    const aluno = a.rows[0];
+    // 1 módulo = 1 semestre letivo = 60 horas-aula
+    const HORAS_POR_MODULO = 60;
+    const totalSemestres = modulos.length;
+    const cargaHoraria = totalSemestres * HORAS_POR_MODULO;
+    const curso = (req.body.curso || 'Língua e Cultura Inglesa').trim();
+    let codigo, ok = false;
+    for (let i = 0; i < 6 && !ok; i++) {
+      codigo = 'CEMIC-' + crypto.randomBytes(2).toString('hex').toUpperCase() + '-' + crypto.randomBytes(2).toString('hex').toUpperCase();
+      const ex = await pool.query(`SELECT 1 FROM declaracoes WHERE codigo = $1`, [codigo]);
+      if (!ex.rows.length) ok = true;
+    }
+    const ins = await pool.query(
+      `INSERT INTO declaracoes (codigo, tipo, aluno_id, aluno_nome, aluno_cpf, curso, modulos, total_semestres, carga_horaria, emitida_por)
+       VALUES ($1, 'estudos', $2, $3, $4, $5, $6::jsonb, $7, $8, $9)
+       RETURNING codigo, emitida_em`,
+      [codigo, alunoId, aluno.nome, aluno.cpf, curso, JSON.stringify(modulos), totalSemestres, cargaHoraria, req.usuario.id]);
+    res.status(201).json({
+      codigo: ins.rows[0].codigo, emitida_em: ins.rows[0].emitida_em,
+      aluno_nome: aluno.nome, aluno_cpf: aluno.cpf, curso,
+      modulos, total_semestres: totalSemestres, carga_horaria: cargaHoraria, horas_por_modulo: HORAS_POR_MODULO
+    });
+  } catch (e) { console.error('Erro declaração de estudos:', e); res.status(500).json({ erro: 'Erro ao emitir a declaração.' }); }
+});
+
+// ---------- Portal dos Pais: acadêmico (professor -> responsável) ----------
+async function vinculoOk(respId, alunoId) {
+  const r = await pool.query(`SELECT 1 FROM aluno_responsavel WHERE responsavel_id = $1 AND aluno_id = $2`, [respId, alunoId]);
+  return r.rows.length > 0;
+}
+async function matriculaAtivaDoAluno(alunoId) {
+  const r = await pool.query(
+    `SELECT m.id AS matricula_id, m.turma_id, t.nome AS turma_nome, t.semestre
+     FROM matriculas m JOIN turmas t ON t.id = m.turma_id
+     WHERE m.aluno_id = $1 AND m.status = 'ativa'
+     ORDER BY m.id DESC LIMIT 1`, [alunoId]);
+  return r.rows[0] || null;
+}
+
+app.get('/publico/portal/aluno/:id/faltas', autenticarResponsavel, async (req, res) => {
+  try {
+    const alunoId = Number(req.params.id);
+    if (!await vinculoOk(req.responsavelId, alunoId)) return res.status(403).json({ erro: 'Acesso negado a este aluno.' });
+    const mat = await matriculaAtivaDoAluno(alunoId);
+    if (!mat) return res.json({ turma: null, itens: [], resumo: { aulas: 0, presencas: 0, faltas: 0, percentual: null } });
+    const r = await pool.query(
+      `SELECT au.id, au.data, au.conteudo, f.presente, f.justificativa
+       FROM aulas au
+       LEFT JOIN frequencias f ON f.aula_id = au.id AND f.matricula_id = $2
+       WHERE au.turma_id = $1
+       ORDER BY au.data DESC, au.id DESC`, [mat.turma_id, mat.matricula_id]);
+    const lancadas = r.rows.filter(x => x.presente !== null);
+    const faltas = lancadas.filter(x => x.presente === false).length;
+    const presencas = lancadas.length - faltas;
+    const percentual = lancadas.length ? Math.round((presencas / lancadas.length) * 100) : null;
+    res.json({
+      turma: mat.turma_nome, semestre: mat.semestre,
+      itens: r.rows.filter(x => x.presente !== null),
+      resumo: { aulas: lancadas.length, presencas, faltas, percentual }
+    });
+  } catch (e) { console.error('Erro portal faltas:', e); res.status(500).json({ erro: 'Erro ao carregar a frequência.' }); }
+});
+
+app.get('/publico/portal/aluno/:id/conteudos', autenticarResponsavel, async (req, res) => {
+  try {
+    const alunoId = Number(req.params.id);
+    if (!await vinculoOk(req.responsavelId, alunoId)) return res.status(403).json({ erro: 'Acesso negado a este aluno.' });
+    const mat = await matriculaAtivaDoAluno(alunoId);
+    if (!mat) return res.json({ turma: null, itens: [] });
+    const r = await pool.query(
+      `SELECT au.id, au.data, au.conteudo FROM aulas au
+       WHERE au.turma_id = $1 AND au.conteudo IS NOT NULL AND btrim(au.conteudo) <> ''
+       ORDER BY au.data DESC, au.id DESC`, [mat.turma_id]);
+    res.json({ turma: mat.turma_nome, semestre: mat.semestre, itens: r.rows });
+  } catch (e) { console.error('Erro portal conteudos:', e); res.status(500).json({ erro: 'Erro ao carregar os conteúdos.' }); }
+});
+
+app.get('/publico/portal/aluno/:id/notas', autenticarResponsavel, async (req, res) => {
+  try {
+    const alunoId = Number(req.params.id);
+    if (!await vinculoOk(req.responsavelId, alunoId)) return res.status(403).json({ erro: 'Acesso negado a este aluno.' });
+    const mat = await matriculaAtivaDoAluno(alunoId);
+    if (!mat) return res.json({ turma: null, itens: [], media: null });
+    const r = await pool.query(
+      `SELECT av.id, av.nome, av.peso, av.data, n.nota
+       FROM avaliacoes av
+       LEFT JOIN notas n ON n.avaliacao_id = av.id AND n.matricula_id = $2
+       WHERE av.turma_id = $1
+       ORDER BY av.data NULLS LAST, av.id`, [mat.turma_id, mat.matricula_id]);
+    const comNota = r.rows.filter(x => x.nota !== null);
+    let media = null;
+    if (comNota.length) {
+      const somaPeso = comNota.reduce((s, x) => s + Number(x.peso || 1), 0);
+      const soma = comNota.reduce((s, x) => s + Number(x.nota) * Number(x.peso || 1), 0);
+      media = somaPeso > 0 ? Number((soma / somaPeso).toFixed(2)) : null;
+    }
+    res.json({ turma: mat.turma_nome, semestre: mat.semestre, itens: r.rows, media });
+  } catch (e) { console.error('Erro portal notas:', e); res.status(500).json({ erro: 'Erro ao carregar as notas.' }); }
+});
+
+app.get('/publico/portal/aluno/:id/ocorrencias', autenticarResponsavel, async (req, res) => {
+  try {
+    const alunoId = Number(req.params.id);
+    if (!await vinculoOk(req.responsavelId, alunoId)) return res.status(403).json({ erro: 'Acesso negado a este aluno.' });
+    const r = await pool.query(
+      `SELECT o.id, o.data, o.tipo, o.titulo, o.descricao, p.nome AS professor_nome, t.nome AS turma_nome
+       FROM ocorrencias o
+       LEFT JOIN professores p ON p.id = o.professor_id
+       LEFT JOIN turmas t ON t.id = o.turma_id
+       WHERE o.aluno_id = $1 AND o.visivel_responsavel = TRUE
+       ORDER BY o.data DESC, o.id DESC`, [alunoId]);
+    res.json(r.rows);
+  } catch (e) { console.error('Erro portal ocorrencias:', e); res.status(500).json({ erro: 'Erro ao carregar as ocorrências.' }); }
+});
+
+app.get('/publico/portal/aluno/:id/atividades', autenticarResponsavel, async (req, res) => {
+  try {
+    const alunoId = Number(req.params.id);
+    if (!await vinculoOk(req.responsavelId, alunoId)) return res.status(403).json({ erro: 'Acesso negado a este aluno.' });
+    const mat = await matriculaAtivaDoAluno(alunoId);
+    if (!mat) return res.json({ turma: null, itens: [] });
+    const r = await pool.query(
+      `SELECT at.id, at.titulo, at.descricao, at.link, at.data_entrega, at.criado_em,
+              COALESCE(json_agg(json_build_object('id', ar.id, 'nome', ar.nome, 'mime', ar.mime, 'tamanho', ar.tamanho)
+                       ORDER BY ar.id) FILTER (WHERE ar.id IS NOT NULL), '[]') AS arquivos
+       FROM atividades at
+       LEFT JOIN atividade_arquivos ar ON ar.atividade_id = at.id
+       WHERE at.turma_id = $1
+       GROUP BY at.id ORDER BY at.criado_em DESC`, [mat.turma_id]);
+    res.json({ turma: mat.turma_nome, semestre: mat.semestre, itens: r.rows });
+  } catch (e) { console.error('Erro portal atividades:', e); res.status(500).json({ erro: 'Erro ao carregar as atividades.' }); }
+});
+
+// ---------- Portal: Financeiro do aluno ----------
+const SQL_FIN_ITENS = `
+  SELECT cr.id, cr.descricao, cr.competencia, cr.vencimento,
+         cr.status, cr.data_pagamento, cr.forma_pagamento, t.semestre,
+         cr.valor_final AS valor_cobrado,
+         COALESCE(cr.desconto_pontualidade, 0) AS desconto,
+         COALESCE(cr.juros, 0) AS juros,
+         CASE WHEN cr.status = 'paga'
+              THEN COALESCE(cr.valor_recebido, cr.valor_final - COALESCE(cr.desconto_pontualidade,0) + COALESCE(cr.juros,0))
+         END AS valor_pago,
+         CASE WHEN cr.status = 'paga'
+              THEN COALESCE(cr.valor_recebido, cr.valor_final - COALESCE(cr.desconto_pontualidade,0) + COALESCE(cr.juros,0))
+              ELSE cr.valor_final
+         END AS valor,
+         CASE
+           WHEN cr.status = 'paga' THEN 'pago'
+           WHEN cr.vencimento < CURRENT_DATE THEN 'vencido'
+           ELSE 'em_aberto'
+         END AS situacao,
+         CASE
+           WHEN cr.descricao ILIKE 'Taxa de Matrícula%' THEN 'matricula'
+           WHEN cr.descricao ILIKE 'Taxa da Plataforma%' THEN 'plataforma'
+           ELSE 'mensalidade'
+         END AS tipo
+  FROM contas_receber cr
+  JOIN matriculas m ON m.id = cr.matricula_id
+  JOIN turmas t ON t.id = m.turma_id
+  WHERE cr.aluno_id = $1 AND t.semestre = $2 AND cr.status <> 'cancelada'
+  ORDER BY cr.vencimento, cr.id`;
+
+function resumoFinanceiro(itens) {
+  const n = x => Number(x || 0);
+  // 'valor' = o que foi realmente pago (nos quitados) ou o que está sendo cobrado (nos demais)
+  const total = itens.reduce((s, i) => s + n(i.valor), 0);
+  const pago = itens.filter(i => i.situacao === 'pago').reduce((s, i) => s + n(i.valor), 0);
+  const vencido = itens.filter(i => i.situacao === 'vencido').reduce((s, i) => s + n(i.valor), 0);
+  const aberto = itens.filter(i => i.situacao === 'em_aberto').reduce((s, i) => s + n(i.valor), 0);
+  const pendentes = itens.filter(i => i.situacao !== 'pago').length;
+  return { total, pago, aberto, vencido, pendentes, quitado: itens.length > 0 && pendentes === 0 };
+}
+
+app.get('/publico/portal/aluno/:id/financeiro', autenticarResponsavel, async (req, res) => {
+  try {
+    const alunoId = Number(req.params.id);
+    const vinc = await pool.query(`SELECT 1 FROM aluno_responsavel WHERE responsavel_id = $1 AND aluno_id = $2`, [req.responsavelId, alunoId]);
+    if (!vinc.rows.length) return res.status(403).json({ erro: 'Acesso negado a este aluno.' });
+    const sems = await pool.query(
+      `SELECT DISTINCT t.semestre FROM matriculas m
+       JOIN turmas t ON t.id = m.turma_id
+       WHERE m.aluno_id = $1 AND t.semestre IS NOT NULL
+       ORDER BY t.semestre DESC`, [alunoId]);
+    const semestres = sems.rows.map(r => r.semestre);
+    let semestre = (req.query.semestre || '').trim();
+    if (!semestre) {
+      const vig = await getConfig('semestre_vigente', null);
+      semestre = (vig && semestres.includes(vig)) ? vig : (semestres[0] || null);
+    }
+    if (!semestre) return res.json({ semestre: null, semestres: [], itens: [], resumo: resumoFinanceiro([]) });
+    const r = await pool.query(SQL_FIN_ITENS, [alunoId, semestre]);
+    res.json({ semestre, semestres, itens: r.rows, resumo: resumoFinanceiro(r.rows) });
+  } catch (e) { console.error('Erro portal financeiro:', e); res.status(500).json({ erro: 'Erro ao carregar o financeiro.' }); }
+});
+
+app.post('/publico/portal/aluno/:id/relatorio-financeiro', autenticarResponsavel, async (req, res) => {
+  try {
+    const alunoId = Number(req.params.id);
+    const semestre = String(req.body.semestre || '').trim();
+    if (!semestre) return res.status(400).json({ erro: 'Informe o semestre.' });
+    const vinc = await pool.query(`SELECT 1 FROM aluno_responsavel WHERE responsavel_id = $1 AND aluno_id = $2`, [req.responsavelId, alunoId]);
+    if (!vinc.rows.length) return res.status(403).json({ erro: 'Acesso negado a este aluno.' });
+    const it = await pool.query(SQL_FIN_ITENS, [alunoId, semestre]);
+    const itens = it.rows;
+    if (!itens.length) return res.status(404).json({ erro: 'Não há lançamentos financeiros neste semestre.' });
+    const resumo = resumoFinanceiro(itens);
+    if (!resumo.quitado) {
+      return res.status(409).json({
+        erro: 'O relatório só pode ser emitido quando todos os pagamentos do semestre estiverem quitados.',
+        pendentes: resumo.pendentes
+      });
+    }
+    const dr = await pool.query(
+      `SELECT a.nome, a.cpf, t.turno, n.nome AS nivel_nome
+       FROM alunos a
+       LEFT JOIN matriculas m ON m.aluno_id = a.id
+       LEFT JOIN turmas t ON t.id = m.turma_id AND t.semestre = $2
+       LEFT JOIN niveis n ON n.id = t.nivel_id
+       WHERE a.id = $1
+       ORDER BY (t.semestre = $2) DESC NULLS LAST
+       LIMIT 1`, [alunoId, semestre]);
+    const d = dr.rows[0];
+    if (!d) return res.status(404).json({ erro: 'Aluno não encontrado.' });
+    const curso = 'Língua e Cultura Inglesa';
+    let codigo, ok = false;
+    for (let i = 0; i < 6 && !ok; i++) {
+      codigo = 'CEMIC-' + crypto.randomBytes(2).toString('hex').toUpperCase() + '-' + crypto.randomBytes(2).toString('hex').toUpperCase();
+      const ex = await pool.query(`SELECT 1 FROM declaracoes WHERE codigo = $1`, [codigo]);
+      if (!ex.rows.length) ok = true;
+    }
+    const ins = await pool.query(
+      `INSERT INTO declaracoes (codigo, tipo, aluno_id, aluno_nome, aluno_cpf, curso, modulo, turno, semestre, responsavel_id)
+       VALUES ($1, 'financeiro', $2, $3, $4, $5, $6, $7, $8, $9) RETURNING codigo, emitida_em`,
+      [codigo, alunoId, d.nome, d.cpf, curso, d.nivel_nome || null, d.turno || null, semestre, req.responsavelId]);
+    res.status(201).json({
+      codigo: ins.rows[0].codigo, emitida_em: ins.rows[0].emitida_em,
+      aluno_nome: d.nome, aluno_cpf: d.cpf, curso, modulo: d.nivel_nome || null, turno: d.turno || null,
+      semestre, itens, resumo
+    });
+  } catch (e) { console.error('Erro relatório financeiro:', e); res.status(500).json({ erro: 'Erro ao gerar o relatório financeiro.' }); }
+});
+
+app.get('/publico/verificar/:codigo', async (req, res) => {
+  try {
+    const codigo = String(req.params.codigo || '').trim().toUpperCase();
+    const r = await pool.query(
+      `SELECT codigo, tipo, aluno_nome, aluno_cpf, curso, modulo, turno, semestre, modulos, total_semestres, carga_horaria, emitida_em FROM declaracoes WHERE codigo = $1`, [codigo]);
+    if (!r.rows.length) {
+      // Pode ser um termo de adesão ao serviço voluntário
+      const ta = await pool.query(
+        `SELECT codigo, nome, turnos, vigencia_inicio, vigencia_fim, aceito_em, aceito_por_nome
+         FROM termos_adesao WHERE codigo = $1 AND status = 'aceito'`, [codigo]);
+      if (ta.rows.length) {
+        const w = ta.rows[0];
+        const cpfW = null;
         return res.json({
-          avaliacao: avaliacaoJSON, formato: 'json', banca: bancaFinal,
-          aviso: 'Avaliação realizada mas não salva no histórico. Crédito estornado automaticamente.'
+          valido: true, codigo: w.codigo, tipo: 'termo', voluntario_nome: w.nome, turnos: w.turnos,
+          vigencia_inicio: w.vigencia_inicio, vigencia_fim: w.vigencia_fim,
+          representante: w.aceito_por_nome, emitida_em: w.aceito_em
         });
       }
-
-      const imgHashFinal = req._imgHash || null;
-      await pool.query(
-        `INSERT INTO avaliacoes (usuario_id, usuario, banca, nota_geral, resultado, redacao, imagem_hash, possivel_ia)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
-        [usuarioIdFinal, usuario || 'Anônimo', bancaFinal, avaliacaoJSON.notaGeral || 0,
-         JSON.stringify(avaliacaoJSON),
-         temImagem ? '[redação via foto]' : (redacao || '').substring(0, 2000),
-         imgHashFinal, possivel_ia]
-      );
-      await log(usuarioIdFinal, null, 'avaliar_ok', 'ok', {
-        banca: bancaFinal, nota_geral: avaliacaoJSON.notaGeral || 0,
-        modo: temImagem ? 'foto' : 'texto'
-      });
-    } catch (dbErr) {
-      // INSERT falhou — estornar crédito automaticamente
-      console.error('[/avaliar] Erro ao salvar no banco:', dbErr.message);
-      await pool.query(
-        `UPDATE usuarios SET avaliacoes_disponiveis = COALESCE(avaliacoes_disponiveis,0) + 1,
-         total_redacoes = GREATEST(COALESCE(total_redacoes,0) - 1, 0), updated_at = NOW()
-         WHERE id = $1`,
-        [usuarioIdFinal || usuarioId]
-      ).catch(e => console.error('[/avaliar] Erro ao estornar:', e.message));
-      await log(usuarioIdFinal || usuarioId, null, 'avaliar_estorno', 'ok', {
-        motivo: dbErr.message, banca: bancaFinal
-      });
-      // Retorna a avaliação com aviso — usuário não perde o resultado
-      return res.json({
-        avaliacao: avaliacaoJSON, formato: 'json', banca: bancaFinal,
-        aviso: 'Avaliação realizada mas não salva no histórico. Crédito estornado automaticamente.'
-      });
+      // Pode ser uma carteira estudantil
+      const c = await pool.query(
+        `SELECT codigo, aluno_nome, aluno_cpf, aluno_codigo, curso, modulo, turma_nome, turno, semestre, validade, emitida_em FROM carteiras WHERE codigo = $1`, [codigo]);
+      if (c.rows.length) {
+        const k = c.rows[0];
+        const vencida = k.validade ? (new Date(k.validade) < new Date(new Date().toDateString())) : false;
+        const cpfK = (k.aluno_cpf || '').replace(/\D/g, '');
+        const cpfKMasc = cpfK.length === 11 ? `${cpfK.slice(0, 3)}.***.***-${cpfK.slice(9)}` : null;
+        return res.json({
+          valido: true, codigo: k.codigo, tipo: 'carteira', aluno_nome: k.aluno_nome, aluno_cpf: cpfKMasc, aluno_codigo: k.aluno_codigo,
+          curso: k.curso, modulo: k.modulo, turma_nome: k.turma_nome, turno: k.turno, semestre: k.semestre,
+          validade: k.validade, situacao: vencida ? 'expirada' : 'vigente', emitida_em: k.emitida_em
+        });
+      }
+      // Pode ser a carteira do professor
+      const cpr = await pool.query(
+        `SELECT codigo, professor_nome, professor_cpf, professor_codigo, formacao, funcao, turnos, semestre, validade, emitida_em FROM carteiras_professor WHERE codigo = $1`, [codigo]);
+      if (cpr.rows.length) {
+        const k = cpr.rows[0];
+        const vencida = k.validade ? (new Date(k.validade) < new Date(new Date().toDateString())) : false;
+        const cpfK = (k.professor_cpf || '').replace(/\D/g, '');
+        const cpfKMasc = cpfK.length === 11 ? `${cpfK.slice(0, 3)}.***.***-${cpfK.slice(9)}` : null;
+        return res.json({
+          valido: true, codigo: k.codigo, tipo: 'carteira_professor', professor_nome: k.professor_nome, professor_cpf: cpfKMasc,
+          professor_codigo: k.professor_codigo, formacao: k.formacao, funcao: k.funcao, turnos: k.turnos, semestre: k.semestre,
+          validade: k.validade, situacao: vencida ? 'expirada' : 'vigente', emitida_em: k.emitida_em
+        });
+      }
+      // Pode ser a declaração de vínculo do professor
+      const dpr = await pool.query(
+        `SELECT codigo, professor_nome, professor_cpf, formacao, funcao, data_ingresso, turmas_resumo, turnos, semestre, vigencia_inicio, vigencia_fim, emitida_em FROM declaracoes_professor WHERE codigo = $1`, [codigo]);
+      if (dpr.rows.length) {
+        const k = dpr.rows[0];
+        const cpfK = (k.professor_cpf || '').replace(/\D/g, '');
+        const cpfKMasc = cpfK.length === 11 ? `${cpfK.slice(0, 3)}.***.***-${cpfK.slice(9)}` : null;
+        return res.json({
+          valido: true, codigo: k.codigo, tipo: 'vinculo_professor', professor_nome: k.professor_nome, professor_cpf: cpfKMasc,
+          formacao: k.formacao, funcao: k.funcao, data_ingresso: k.data_ingresso, turnos: k.turnos, semestre: k.semestre,
+          vigencia_inicio: k.vigencia_inicio, vigencia_fim: k.vigencia_fim, emitida_em: k.emitida_em
+        });
+      }
+      return res.status(404).json({ valido: false, erro: 'Documento não encontrado. Verifique o código.' });
     }
-
-    res.json({ avaliacao: avaliacaoJSON, formato: 'json', banca: bancaFinal, possivel_ia });
-
-  } catch (err) {
-    console.error('[/avaliar] Erro interno:', err);
-    res.status(500).json({ erro: 'Erro interno ao processar avaliação. Tente novamente.' });
-  }
+    const d = r.rows[0];
+    const cpf = (d.aluno_cpf || '').replace(/\D/g, '');
+    const cpfMasc = cpf.length === 11 ? `${cpf.slice(0, 3)}.***.***-${cpf.slice(9)}` : null;
+    res.json({ valido: true, codigo: d.codigo, tipo: d.tipo, aluno_nome: d.aluno_nome, aluno_cpf: cpfMasc, curso: d.curso, modulo: d.modulo, turno: d.turno, semestre: d.semestre, modulos: d.modulos, total_semestres: d.total_semestres, carga_horaria: d.carga_horaria, emitida_em: d.emitida_em });
+  } catch (e) { console.error('Erro verificar declaração:', e); res.status(500).json({ valido: false, erro: 'Erro ao verificar o documento.' }); }
 });
 
-// ── AVALIAR COM PAGAMENTO AVULSO — atomic ────────────────────────────
-// Verifica pagamento no MP, credita e debita atomicamente, retorna avaliação
-// Elimina a corrida entre webhook e /avaliar
-app.post('/avaliar-pago', async (req, res) => {
+// ============================================================
+// CARTEIRA ESTUDANTIL — foto do aluno + emissão (Portal dos Pais)
+// ============================================================
+const FOTO_MIMES = ['image/jpeg', 'image/png', 'image/webp'];
+const FOTO_MAX_BYTES = 2 * 1024 * 1024;
+
+// A carteira vale enquanto o semestre letivo estiver em curso.
+function fimDoSemestre(sem) {
+  const m = String(sem || '').match(/^(\d{4})\.([12])$/);
+  if (!m) return null;
+  return m[2] === '1' ? `${m[1]}-06-30` : `${m[1]}-12-31`;
+}
+
+function fotoDoCorpo(body) {
+  const mime = String((body && body.mime) || '').toLowerCase().trim();
+  if (!FOTO_MIMES.includes(mime)) return { erro: 'Envie a foto em JPG, PNG ou WEBP.' };
+  const base64 = String((body && body.base64) || '').replace(/^data:[^,]*,/, '').trim();
+  if (!base64) return { erro: 'Nenhuma imagem foi recebida.' };
+  if (!/^[A-Za-z0-9+/=\s]+$/.test(base64)) return { erro: 'Imagem inválida.' };
+  const buf = Buffer.from(base64, 'base64');
+  if (!buf.length) return { erro: 'Imagem inválida.' };
+  if (buf.length > FOTO_MAX_BYTES) return { erro: 'A foto deve ter no máximo 2 MB.' };
+  return { mime, buf };
+}
+
+// Envio da foto pelo responsável (uma foto por aluno; novo envio substitui a anterior)
+app.post('/publico/portal/aluno/:id/foto', autenticarResponsavel, async (req, res) => {
   try {
-    const { payment_id, usuarioId, redacao, banca, usuario, imagem, mediaType } = req.body;
-    if (!payment_id || !usuarioId) return res.status(400).json({ erro: 'Dados incompletos.' });
+    const alunoId = Number(req.params.id);
+    if (!(await vinculoOk(req.responsavelId, alunoId))) return res.status(403).json({ erro: 'Acesso negado a este aluno.' });
+    const f = fotoDoCorpo(req.body);
+    if (f.erro) return res.status(400).json({ erro: f.erro });
+    await pool.query(
+      `INSERT INTO aluno_fotos (aluno_id, mime, tamanho, conteudo, enviada_por, enviada_em)
+       VALUES ($1, $2, $3, $4, $5, NOW())
+       ON CONFLICT (aluno_id) DO UPDATE
+         SET mime = EXCLUDED.mime, tamanho = EXCLUDED.tamanho, conteudo = EXCLUDED.conteudo,
+             enviada_por = EXCLUDED.enviada_por, enviada_em = NOW()`,
+      [alunoId, f.mime, f.buf.length, f.buf, req.responsavelId]);
+    res.status(201).json({ ok: true, tamanho: f.buf.length });
+  } catch (e) { console.error('Erro enviar foto do aluno:', e); res.status(500).json({ erro: 'Erro ao enviar a foto.' }); }
+});
 
-    const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN;
+app.delete('/publico/portal/aluno/:id/foto', autenticarResponsavel, async (req, res) => {
+  try {
+    const alunoId = Number(req.params.id);
+    if (!(await vinculoOk(req.responsavelId, alunoId))) return res.status(403).json({ erro: 'Acesso negado a este aluno.' });
+    await pool.query(`DELETE FROM aluno_fotos WHERE aluno_id = $1`, [alunoId]);
+    res.json({ ok: true });
+  } catch (e) { console.error('Erro remover foto do aluno:', e); res.status(500).json({ erro: 'Erro ao remover a foto.' }); }
+});
 
-    // 1. Verificar pagamento no MP
-    const mpResp = await fetch(`https://api.mercadopago.com/v1/payments/${payment_id}`, {
-      headers: { 'Authorization': `Bearer ${MP_ACCESS_TOKEN}` }
-    });
-    const pag = await mpResp.json();
+// A Gestão pode remover uma foto inadequada
+app.delete('/admin/alunos/:id/foto', autenticar, somenteGestao, async (req, res) => {
+  try {
+    await pool.query(`DELETE FROM aluno_fotos WHERE aluno_id = $1`, [Number(req.params.id)]);
+    res.json({ ok: true });
+  } catch (e) { console.error('Erro remover foto (gestão):', e); res.status(500).json({ erro: 'Erro ao remover a foto.' }); }
+});
 
-    if (pag.status !== 'approved')
-      return res.status(402).json({ erro: 'Pagamento não aprovado.', status: pag.status });
-
-    // 2. Idempotência — verificar se já foi processado
-    const jaProcessado = await pool.query(
-      `SELECT id FROM pagamentos WHERE payment_id = $1 AND status = 'aprovado'`,
-      [String(payment_id)]
-    );
-
-    // 3. Se não processado, creditar atomicamente
-    if (jaProcessado.rows.length === 0) {
-      const [usuarioIdRef, pacote, qtd] = (pag.external_reference || '').split('|');
-      const avalQtd = parseInt(qtd) || 1;
-      await pool.query(
-        `UPDATE usuarios SET avaliacoes_disponiveis = COALESCE(avaliacoes_disponiveis,0) + $1, updated_at = NOW() WHERE id = $2`,
-        [avalQtd, usuarioId]
-      );
-      await pool.query(
-        `UPDATE pagamentos SET status = 'aprovado', updated_at = NOW()
-         WHERE usuario_id = $1 AND payment_id = $2`,
-        [usuarioId, String(payment_id)]
-      ).catch(() => {});
-      await log(usuarioId, null, 'credito', 'ok', { origem: 'avaliar_pago', payment_id: String(payment_id), qtd: avalQtd });
+// Entrega da foto: só o responsável vinculado ou a gestão; nunca uma URL pública
+app.get('/arquivos/aluno-foto/:id', async (req, res) => {
+  try {
+    const header = req.headers.authorization || '';
+    const token = req.query.token || (header.startsWith('Bearer ') ? header.slice(7) : null);
+    if (!token) return res.status(401).json({ erro: 'Token não fornecido.' });
+    let dados;
+    try { dados = jwt.verify(token, JWT_SECRET); } catch { return res.status(401).json({ erro: 'Token inválido ou expirado.' }); }
+    const alunoId = Number(req.params.id);
+    if (dados.perfil === 'responsavel') {
+      if (!(await vinculoOk(dados.responsavel_id, alunoId))) return res.status(403).json({ erro: 'Acesso negado a este aluno.' });
+    } else if (!['master', 'secretaria'].includes(dados.perfil)) {
+      return res.status(403).json({ erro: 'Acesso negado.' });
     }
+    const r = await pool.query(`SELECT mime, conteudo FROM aluno_fotos WHERE aluno_id = $1`, [alunoId]);
+    if (!r.rows.length) return res.status(404).json({ erro: 'Foto não encontrada.' });
+    res.setHeader('Content-Type', r.rows[0].mime);
+    res.setHeader('Cache-Control', 'private, no-store');
+    res.send(r.rows[0].conteudo);
+  } catch (e) { console.error('Erro baixar foto do aluno:', e); res.status(500).json({ erro: 'Erro ao carregar a foto.' }); }
+});
 
-    // 4. Debitar 1 avaliação atomicamente
-    const debitoResult = await pool.query(
-      `UPDATE usuarios SET avaliacoes_disponiveis = avaliacoes_disponiveis - 1,
-       total_redacoes = COALESCE(total_redacoes,0) + 1, updated_at = NOW()
-       WHERE id = $1 AND avaliacoes_disponiveis > 0
-       RETURNING avaliacoes_disponiveis`,
-      [usuarioId]
-    );
+// Emissão da carteira: uma por aluno e semestre (reemitir devolve a mesma)
+app.post('/publico/portal/aluno/:id/carteira', autenticarResponsavel, async (req, res) => {
+  try {
+    const alunoId = Number(req.params.id);
+    if (!(await vinculoOk(req.responsavelId, alunoId))) return res.status(403).json({ erro: 'Acesso negado a este aluno.' });
+    const dr = await pool.query(
+      `SELECT a.nome, a.cpf AS aluno_cpf, a.codigo AS aluno_codigo, t.nome AS turma_nome, t.turno, t.semestre,
+              n.nome AS nivel_nome, c.nome AS curso_nome
+       FROM alunos a
+       LEFT JOIN matriculas m ON m.aluno_id = a.id AND m.status = 'ativa'
+       LEFT JOIN turmas t ON t.id = m.turma_id
+       LEFT JOIN niveis n ON n.id = t.nivel_id
+       LEFT JOIN cursos c ON c.id = n.curso_id
+       WHERE a.id = $1
+       ORDER BY m.id DESC LIMIT 1`, [alunoId]);
+    const d = dr.rows[0];
+    if (!d) return res.status(404).json({ erro: 'Aluno não encontrado.' });
+    if (!d.semestre) return res.status(400).json({ erro: 'A carteira só pode ser emitida com uma matrícula ativa. Procure a secretaria.' });
 
-    if (debitoResult.rowCount === 0)
-      return res.status(402).json({ erro: 'Saldo insuficiente após pagamento. Tente novamente.' });
+    const semestre = d.semestre;
+    const validade = fimDoSemestre(semestre);
+    const curso = d.curso_nome || 'Inglês';
 
-    await log(usuarioId, null, 'avaliar_inicio', 'ok', { origem: 'avaliar_pago', payment_id: String(payment_id) });
-
-    // 5. Processar avaliação (mesmo código do /avaliar)
-    const bancaNorm = (banca || 'ENEM').toUpperCase().replace(/ /g, '_');
-    const promptSistema = PROMPTS[bancaNorm] || PROMPTS['ENEM'];
-    const bancaFinal = PROMPTS[bancaNorm] ? bancaNorm : 'ENEM';
-    const temImagem = imagem && imagem.length > 100;
-    const MIME_VALIDOS = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'];
-    const mimeRaw = mediaType || 'image/jpeg';
-    const mimeFinal = MIME_VALIDOS.includes(mimeRaw) ? mimeRaw : 'image/jpeg';
-
-    let mensagemConteudo;
-    if (temImagem) {
-      mensagemConteudo = [
-        { type: 'image', source: { type: 'base64', media_type: mimeFinal, data: imagem } },
-        { type: 'text', text: `${promptSistema}
-${SCHEMA_JSON}
-
-Analise a imagem acima. Ela contém uma redação manuscrita. Avalie para a banca ${bancaFinal}.` }
-      ];
+    const existente = await pool.query(`SELECT codigo, emitida_em FROM carteiras WHERE aluno_id = $1 AND semestre = $2`, [alunoId, semestre]);
+    let codigo, emitidaEm;
+    if (existente.rows.length) {
+      codigo = existente.rows[0].codigo;
+      emitidaEm = existente.rows[0].emitida_em;
+      await pool.query(
+        `UPDATE carteiras SET aluno_nome = $1, aluno_cpf = $2, aluno_codigo = $3, curso = $4, modulo = $5, turma_nome = $6, turno = $7, validade = $8
+         WHERE codigo = $9`,
+        [d.nome, d.aluno_cpf, d.aluno_codigo, curso, d.nivel_nome || null, d.turma_nome || null, d.turno || null, validade, codigo]);
     } else {
-      mensagemConteudo = `${promptSistema}
-${SCHEMA_JSON}
-
-Avalie para a banca ${bancaFinal}:
-
-REDAÇÃO:
-${redacao}`;
+      let ok = false;
+      for (let i = 0; i < 6 && !ok; i++) {
+        codigo = 'CEMIC-' + crypto.randomBytes(2).toString('hex').toUpperCase() + '-' + crypto.randomBytes(2).toString('hex').toUpperCase();
+        const ex = await pool.query(`SELECT 1 FROM declaracoes WHERE codigo = $1 UNION ALL SELECT 1 FROM carteiras WHERE codigo = $1`, [codigo]);
+        if (!ex.rows.length) ok = true;
+      }
+      const ins = await pool.query(
+        `INSERT INTO carteiras (codigo, aluno_id, aluno_nome, aluno_cpf, aluno_codigo, curso, modulo, turma_nome, turno, semestre, validade, emitida_por_responsavel)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING emitida_em`,
+        [codigo, alunoId, d.nome, d.aluno_cpf, d.aluno_codigo, curso, d.nivel_nome || null, d.turma_nome || null, d.turno || null, semestre, validade, req.responsavelId]);
+      emitidaEm = ins.rows[0].emitida_em;
     }
 
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-api-key': process.env.ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' },
-      body: JSON.stringify({ model: 'claude-sonnet-4-5', max_tokens: 8000,
-        system: 'Você é o RedaCheck. Responda SEMPRE e SOMENTE com JSON válido, sem nenhum texto adicional.',
-        messages: [{ role: 'user', content: mensagemConteudo }] })
+    const foto = await pool.query(`SELECT 1 FROM aluno_fotos WHERE aluno_id = $1`, [alunoId]);
+    res.status(201).json({
+      codigo, emitida_em: emitidaEm, aluno_nome: d.nome, aluno_cpf: d.aluno_cpf, aluno_codigo: d.aluno_codigo,
+      curso, modulo: d.nivel_nome || null, turma_nome: d.turma_nome || null, turno: d.turno || null,
+      semestre, validade, tem_foto: foto.rows.length > 0
     });
+  } catch (e) { console.error('Erro emitir carteira:', e); res.status(500).json({ erro: 'Erro ao emitir a carteira.' }); }
+});
 
-    const data = await response.json();
-    if (data.error) return res.status(500).json({ erro: 'Erro na API de avaliação.' });
+// Situação da carteira e da foto, para montar a tela sem emitir nada
+app.get('/publico/portal/aluno/:id/carteira', autenticarResponsavel, async (req, res) => {
+  try {
+    const alunoId = Number(req.params.id);
+    if (!(await vinculoOk(req.responsavelId, alunoId))) return res.status(403).json({ erro: 'Acesso negado a este aluno.' });
+    const foto = await pool.query(`SELECT tamanho, enviada_em FROM aluno_fotos WHERE aluno_id = $1`, [alunoId]);
+    const mat = await matriculaAtivaDoAluno(alunoId);
+    const cart = mat ? await pool.query(`SELECT codigo, emitida_em, validade FROM carteiras WHERE aluno_id = $1 AND semestre = $2`, [alunoId, mat.semestre]) : { rows: [] };
+    res.json({
+      tem_foto: foto.rows.length > 0,
+      foto_enviada_em: foto.rows.length ? foto.rows[0].enviada_em : null,
+      semestre: mat ? mat.semestre : null,
+      emitida: cart.rows.length > 0,
+      codigo: cart.rows.length ? cart.rows[0].codigo : null,
+      validade: cart.rows.length ? cart.rows[0].validade : null
+    });
+  } catch (e) { console.error('Erro consultar carteira:', e); res.status(500).json({ erro: 'Erro ao carregar a carteira.' }); }
+});
 
-    const textoResposta = data.content[0].text;
-    let avaliacaoJSON;
-    try {
-      let limpo = textoResposta.replace(/^```json\s*/i,'').replace(/^```\s*/i,'').replace(/\s*```\s*$/i,'').trim();
-      const jsonStart = limpo.indexOf('{'); const jsonEnd = limpo.lastIndexOf('}');
-      if (jsonStart >= 0 && jsonEnd > jsonStart) limpo = limpo.substring(jsonStart, jsonEnd + 1);
-      avaliacaoJSON = JSON.parse(limpo);
-    } catch { return res.status(500).json({ erro: 'Erro ao processar avaliação.' }); }
+// ============================================================
+// CALENDÁRIO ACADÊMICO
+// ============================================================
+const MESES_PT = ['Janeiro', 'Fevereiro', 'Março', 'Abril', 'Maio', 'Junho', 'Julho', 'Agosto', 'Setembro', 'Outubro', 'Novembro', 'Dezembro'];
 
-    if (avaliacaoJSON.comentarioGeral)
-      avaliacaoJSON.comentarioGeral = avaliacaoJSON.comentarioGeral.replace(/```[\s\S]*?```/g,'').trim();
-    if (avaliacaoJSON.assinatura) delete avaliacaoJSON.assinatura;
+// Agrupa os eventos por mês, na ordem do calendário
+function calendarioPorMes(linhas) {
+  const meses = [];
+  for (const ev of linhas) {
+    const d = new Date(ev.data);
+    const chave = `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`;
+    let mes = meses.find(m => m.chave === chave);
+    if (!mes) {
+      mes = { chave, ano: d.getUTCFullYear(), mes: d.getUTCMonth() + 1, nome: MESES_PT[d.getUTCMonth()], eventos: [] };
+      meses.push(mes);
+    }
+    mes.eventos.push({ id: ev.id, data: ev.data, dia: d.getUTCDate(), titulo: ev.titulo, detalhe: ev.detalhe, modalidade: ev.modalidade });
+  }
+  return meses;
+}
 
-    // 6. Salvar avaliação
-    const imgHash = temImagem ? require('crypto').createHash('sha256').update(imagem).digest('hex') : null;
+async function montarCalendario(semestre) {
+  const sem = semestre || await getConfig('semestre_vigente', '2026.2');
+  const r = await pool.query(
+    `SELECT id, data, titulo, detalhe, modalidade FROM calendario WHERE semestre = $1 ORDER BY data, id`, [sem]);
+  const obs = await getConfig('calendario_observacao', '');
+  return { semestre: sem, observacao: obs, meses: calendarioPorMes(r.rows) };
+}
+
+app.get('/calendario', autenticar, async (req, res) => {
+  try { res.json(await montarCalendario(req.query.semestre)); }
+  catch (e) { console.error('Erro GET calendario:', e); res.status(500).json({ erro: 'Erro ao carregar o calendário.' }); }
+});
+
+app.post('/calendario', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const titulo = (req.body.titulo || '').trim();
+    const data = (req.body.data || '').trim();
+    if (!titulo || !data) return res.status(400).json({ erro: 'Informe a data e o título do evento.' });
+    const semestre = (req.body.semestre || '').trim() || await getConfig('semestre_vigente', '2026.2');
+    const modalidade = ['Presencial', 'Online'].includes(req.body.modalidade) ? req.body.modalidade : 'Presencial';
+    const r = await pool.query(
+      `INSERT INTO calendario (semestre, data, titulo, detalhe, modalidade) VALUES ($1,$2,$3,$4,$5)
+       ON CONFLICT (semestre, data, titulo) DO UPDATE SET detalhe = EXCLUDED.detalhe, modalidade = EXCLUDED.modalidade
+       RETURNING id`,
+      [semestre, data, titulo, (req.body.detalhe || '').trim() || null, modalidade]);
+    res.status(201).json({ id: r.rows[0].id });
+  } catch (e) { console.error('Erro POST calendario:', e); res.status(500).json({ erro: 'Erro ao salvar o evento.' }); }
+});
+
+app.put('/calendario/:id', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const titulo = (req.body.titulo || '').trim();
+    const data = (req.body.data || '').trim();
+    if (!titulo || !data) return res.status(400).json({ erro: 'Informe a data e o título do evento.' });
+    const modalidade = ['Presencial', 'Online'].includes(req.body.modalidade) ? req.body.modalidade : 'Presencial';
+    const r = await pool.query(
+      `UPDATE calendario SET data = $1, titulo = $2, detalhe = $3, modalidade = $4 WHERE id = $5`,
+      [data, titulo, (req.body.detalhe || '').trim() || null, modalidade, Number(req.params.id)]);
+    if (!r.rowCount) return res.status(404).json({ erro: 'Evento não encontrado.' });
+    res.json({ ok: true });
+  } catch (e) { console.error('Erro PUT calendario:', e); res.status(500).json({ erro: 'Erro ao alterar o evento.' }); }
+});
+
+app.delete('/calendario/:id', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const r = await pool.query(`DELETE FROM calendario WHERE id = $1`, [Number(req.params.id)]);
+    if (!r.rowCount) return res.status(404).json({ erro: 'Evento não encontrado.' });
+    res.json({ ok: true });
+  } catch (e) { console.error('Erro DELETE calendario:', e); res.status(500).json({ erro: 'Erro ao excluir o evento.' }); }
+});
+
+// Portal dos Pais: leitura do calendário do semestre vigente
+app.get('/publico/portal/calendario', autenticarResponsavel, async (req, res) => {
+  try { res.json(await montarCalendario(req.query.semestre)); }
+  catch (e) { console.error('Erro calendario portal:', e); res.status(500).json({ erro: 'Erro ao carregar o calendário.' }); }
+});
+
+// ============================================================
+// CIRCULARES (comunicados internos)
+// ============================================================
+const DESTINOS_CIRCULAR = ['professores', 'responsaveis', 'todos'];
+
+app.get('/circulares', autenticar, async (req, res) => {
+  try {
+    const gestao = ['master', 'secretaria'].includes(req.usuario.perfil);
+    if (gestao) {
+      const r = await pool.query(
+        `SELECT c.*, (SELECT COUNT(*) FROM circular_leituras l WHERE l.circular_id = c.id) AS leituras
+         FROM circulares c ORDER BY c.criada_em DESC`);
+      return res.json(r.rows);
+    }
+    const r = await pool.query(
+      `SELECT c.id, c.numero, c.titulo, c.corpo, c.destino, c.semestre, c.criada_em,
+              (l.usuario_id IS NOT NULL) AS lida, l.lida_em
+       FROM circulares c
+       LEFT JOIN circular_leituras l ON l.circular_id = c.id AND l.usuario_id = $1
+       WHERE c.publicada = TRUE AND c.destino IN ('professores', 'todos')
+       ORDER BY c.criada_em DESC`, [req.usuario.id]);
+    res.json(r.rows);
+  } catch (e) { console.error('Erro GET circulares:', e); res.status(500).json({ erro: 'Erro ao listar as circulares.' }); }
+});
+
+app.post('/circulares', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const titulo = (req.body.titulo || '').trim();
+    const corpo = (req.body.corpo || '').trim();
+    if (!titulo || !corpo) return res.status(400).json({ erro: 'Informe o título e o texto da circular.' });
+    const destino = DESTINOS_CIRCULAR.includes(req.body.destino) ? req.body.destino : 'professores';
+    const semestre = (req.body.semestre || '').trim() || await getConfig('semestre_vigente', '2026.2');
+    const seq = await pool.query(`SELECT COUNT(*)::int AS n FROM circulares WHERE semestre = $1`, [semestre]);
+    const numero = String(seq.rows[0].n + 1).padStart(3, '0') + '/' + semestre;
+    const r = await pool.query(
+      `INSERT INTO circulares (numero, titulo, corpo, destino, semestre, publicada, criada_por)
+       VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id, numero`,
+      [numero, titulo, corpo, destino, semestre, req.body.publicada !== false, req.usuario.id]);
+    res.status(201).json(r.rows[0]);
+  } catch (e) { console.error('Erro POST circular:', e); res.status(500).json({ erro: 'Erro ao criar a circular.' }); }
+});
+
+app.put('/circulares/:id', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const titulo = (req.body.titulo || '').trim();
+    const corpo = (req.body.corpo || '').trim();
+    if (!titulo || !corpo) return res.status(400).json({ erro: 'Informe o título e o texto da circular.' });
+    const destino = DESTINOS_CIRCULAR.includes(req.body.destino) ? req.body.destino : 'professores';
+    const r = await pool.query(
+      `UPDATE circulares SET titulo = $1, corpo = $2, destino = $3, publicada = $4 WHERE id = $5`,
+      [titulo, corpo, destino, req.body.publicada !== false, Number(req.params.id)]);
+    if (!r.rowCount) return res.status(404).json({ erro: 'Circular não encontrada.' });
+    res.json({ ok: true });
+  } catch (e) { console.error('Erro PUT circular:', e); res.status(500).json({ erro: 'Erro ao alterar a circular.' }); }
+});
+
+app.delete('/circulares/:id', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const r = await pool.query(`DELETE FROM circulares WHERE id = $1`, [Number(req.params.id)]);
+    if (!r.rowCount) return res.status(404).json({ erro: 'Circular não encontrada.' });
+    res.json({ ok: true });
+  } catch (e) { console.error('Erro DELETE circular:', e); res.status(500).json({ erro: 'Erro ao excluir a circular.' }); }
+});
+
+// Confirmação de leitura pelo professor
+app.post('/circulares/:id/lida', autenticar, async (req, res) => {
+  try {
     await pool.query(
-      `INSERT INTO avaliacoes (usuario_id, usuario, banca, nota_geral, resultado, redacao, imagem_hash)
-       VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-      [usuarioId, usuario || 'Anônimo', bancaFinal, avaliacaoJSON.notaGeral || 0,
-       JSON.stringify(avaliacaoJSON), temImagem ? '[redação via foto]' : (redacao||'').substring(0,2000), imgHash]
-    );
-    await log(usuarioId, null, 'avaliar_ok', 'ok', { banca: bancaFinal, nota_geral: avaliacaoJSON.notaGeral || 0, origem: 'avaliar_pago' });
-
-    const saldoFinal = await pool.query('SELECT avaliacoes_disponiveis FROM usuarios WHERE id = $1', [usuarioId]);
-    res.json({ avaliacao: avaliacaoJSON, formato: 'json', banca: bancaFinal, avaliacoes_disponiveis: saldoFinal.rows[0]?.avaliacoes_disponiveis || 0 });
-
-  } catch (err) {
-    console.error('[/avaliar-pago]', err.message);
-    res.status(500).json({ erro: 'Erro ao processar.' });
-  }
-});
-
-// ── FEEDBACKS APROVADOS — exibidos na home ───────────────────────────
-app.get('/feedbacks-aprovados', async (req, res) => {
-  try {
-    const result = await pool.query(
-      `SELECT usuario, nota, comentario, created_at
-       FROM feedbacks
-       WHERE aprovado = TRUE AND comentario != ''
-       ORDER BY created_at DESC LIMIT 100`
-    );
-    res.json({ feedbacks: result.rows });
-  } catch(err) {
-    res.status(500).json({ erro: 'Erro ao buscar feedbacks.' });
-  }
-});
-
-app.get('/historico/:usuario', async (req, res) => {
-  try {
-    const result = await pool.query(
-      `SELECT id, banca, nota_geral, created_at, LEFT(redacao, 150) as redacao_preview
-       FROM avaliacoes WHERE usuario=$1 ORDER BY created_at DESC LIMIT 50`,
-      [req.params.usuario]
-    );
-    res.json({ avaliacoes: result.rows });
-  } catch (err) {
-    res.status(500).json({ erro: 'Erro ao buscar histórico.' });
-  }
-});
-
-// ── HISTÓRICO POR ID (seguro — não cruza dados por nome) ─────────────
-app.get('/historico-id/:id', async (req, res) => {
-  try {
-    const { id } = req.params;
-    const result = await pool.query(
-      `SELECT id, banca, nota_geral, created_at, LEFT(redacao, 150) as redacao_preview
-       FROM avaliacoes
-       WHERE usuario_id = $1
-       ORDER BY created_at DESC LIMIT 50`,
-      [id]
-    );
-    res.json({ avaliacoes: result.rows });
-  } catch (err) {
-    res.status(500).json({ erro: 'Erro ao buscar histórico.' });
-  }
-});
-
-app.get('/avaliacao/:id', async (req, res) => {
-  try {
-    const { usuario_id } = req.query;
-    if (!usuario_id) return res.status(401).json({ erro: 'Identificação obrigatória.' });
-    const result = await pool.query('SELECT * FROM avaliacoes WHERE id=$1 AND usuario_id=$2', [req.params.id, usuario_id]);
-    if (!result.rows.length) return res.status(404).json({ erro: 'Avaliação não encontrada.' });
-    res.json(result.rows[0]);
-  } catch (err) {
-    res.status(500).json({ erro: 'Erro ao buscar avaliação.' });
-  }
-});
-
-// ── RECUPERAR AVALIAÇÃO SIMILAR (usuário confirmou "é a mesma") ───────
-// Retorna resultado da avaliação anterior sem debitar saldo
-app.get('/avaliacao-similar/:id', async (req, res) => {
-  try {
-    const { usuario_id } = req.query;
-    if (!usuario_id) return res.status(401).json({ erro: 'Identificação obrigatória.' });
-    const result = await pool.query(
-      'SELECT id, resultado, nota_geral, banca, created_at FROM avaliacoes WHERE id=$1 AND usuario_id=$2',
-      [req.params.id, usuario_id]
-    );
-    if (!result.rows.length) return res.status(404).json({ erro: 'Avaliação não encontrada.' });
-    const c = result.rows[0];
-    // Atualizar created_at para aparecer no topo do histórico
-    await pool.query(`UPDATE avaliacoes SET created_at = NOW() WHERE id = $1`, [c.id]).catch(() => {});
-    await log(usuario_id, null, 'avaliar_cache', 'ok', { tipo: 'similar_confirmado', avaliacao_id: c.id, banca: c.banca });
-    res.json({
-      avaliacao: typeof c.resultado === 'string' ? JSON.parse(c.resultado) : c.resultado,
-      formato: 'json', banca: c.banca, cache: true, cache_tipo: 'similar_confirmado'
-    });
-  } catch (err) {
-    res.status(500).json({ erro: 'Erro ao recuperar avaliação similar.' });
-  }
-});
-
-app.post('/log/conversa', async (req, res) => {
-  try {
-    const { usuario, mensagens, dataInicio, duracao } = req.body;
-    const result = await pool.query(
-      `INSERT INTO conversas (usuario, mensagens, data_inicio, duracao) VALUES ($1,$2,$3,$4) RETURNING id`,
-      [usuario || 'Anônimo', JSON.stringify(mensagens || []), dataInicio || new Date().toISOString(), duracao || 0]
-    );
-    res.json({ ok: true, id: result.rows[0].id });
-  } catch (err) {
-    res.status(500).json({ erro: 'Erro ao salvar conversa.' });
-  }
-});
-
-app.post('/log/feedback', async (req, res) => {
-  try {
-    const { usuario, nota, comentario } = req.body;
-    const result = await pool.query(
-      `INSERT INTO feedbacks (usuario, nota, comentario) VALUES ($1,$2,$3) RETURNING id`,
-      [usuario || 'Anônimo', nota || 0, comentario || '']
-    );
-    res.json({ ok: true, id: result.rows[0].id });
-  } catch (err) {
-    res.status(500).json({ erro: 'Erro ao salvar feedback.' });
-  }
-});
-
-app.post('/log/sugestao', async (req, res) => {
-  try {
-    const { usuario, texto } = req.body;
-    const result = await pool.query(
-      `INSERT INTO sugestoes (usuario, texto) VALUES ($1,$2) RETURNING id`,
-      [usuario || 'Anônimo', texto || '']
-    );
-    res.json({ ok: true, id: result.rows[0].id });
-  } catch (err) {
-    res.status(500).json({ erro: 'Erro ao salvar sugestão.' });
-  }
-});
-
-app.patch('/log/:tipo/:id', async (req, res) => {
-  const token = req.headers['x-master-token'];
-  if (token !== MASTER_TOKEN) return res.status(401).json({ erro: 'Não autorizado.' });
-  try {
-    const { tipo, id } = req.params;
-    const { status, notaOperador, tags } = req.body;
-    const tabelas = { conversas: 'conversas', feedbacks: 'feedbacks', sugestoes: 'sugestoes' };
-    if (!tabelas[tipo]) return res.status(404).json({ erro: 'Tipo inválido.' });
-    const updates = []; const values = []; let idx = 1;
-    if (status) { updates.push(`status=$${idx++}`); values.push(status); }
-    if (notaOperador !== undefined) { updates.push(`nota_operador=$${idx++}`); values.push(notaOperador); }
-    if (tags) { updates.push(`tags=$${idx++}`); values.push(JSON.stringify(tags)); }
-    if (!updates.length) return res.status(400).json({ erro: 'Nada para atualizar.' });
-    values.push(id);
-    await pool.query(`UPDATE ${tabelas[tipo]} SET ${updates.join(', ')} WHERE id=$${idx}`, values);
+      `INSERT INTO circular_leituras (circular_id, usuario_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`,
+      [Number(req.params.id), req.usuario.id]);
     res.json({ ok: true });
-  } catch (err) {
-    res.status(500).json({ erro: 'Erro ao atualizar.' });
-  }
+  } catch (e) { console.error('Erro marcar circular lida:', e); res.status(500).json({ erro: 'Erro ao confirmar a leitura.' }); }
 });
 
-// ── MASTER ────────────────────────────────────────────────────────────
-const MASTER_TOKEN = process.env.MASTER_TOKEN;
-if (!MASTER_TOKEN) console.error('⚠️  MASTER_TOKEN não configurado!');
-
-app.delete('/master/limpar-usuarios', async (req, res) => {
-  const token = req.headers['x-master-token'];
-  if (token !== MASTER_TOKEN) return res.status(401).json({ erro: 'Acesso não autorizado.' });
+// Quem já leu — controle da Gestão
+app.get('/circulares/:id/leituras', autenticar, somenteGestao, async (req, res) => {
   try {
-    await pool.query('DELETE FROM solicitacoes_professor');
-    await pool.query('DELETE FROM avaliacoes');
-    await pool.query('DELETE FROM usuarios');
-    res.json({ ok: true, mensagem: 'Tabelas limpas.' });
-  } catch (err) {
-    res.status(500).json({ erro: err.message });
-  }
+    const r = await pool.query(
+      `SELECT u.nome, u.perfil, l.lida_em FROM circular_leituras l
+       JOIN usuarios u ON u.id = l.usuario_id WHERE l.circular_id = $1 ORDER BY l.lida_em`,
+      [Number(req.params.id)]);
+    res.json(r.rows);
+  } catch (e) { console.error('Erro GET leituras:', e); res.status(500).json({ erro: 'Erro ao listar as leituras.' }); }
 });
 
-const _masterCodigos = new Map();
+// ============================================================
+// SISTEMA DE AVALIAÇÃO (composição da nota por bimestre)
+// ============================================================
+app.get('/avaliacao/modelo', autenticar, async (req, res) => {
+  try { res.json(await getConfig('sistema_avaliacao', { bimestres: 2, nota_maxima: 10, etapas: { '1': [], '2': [] } })); }
+  catch (e) { console.error('Erro GET modelo avaliacao:', e); res.status(500).json({ erro: 'Erro ao carregar o sistema de avaliação.' }); }
+});
 
-app.post('/master/solicitar-codigo', async (req, res) => {
-  const token = req.headers['x-master-token'];
-  if (token !== MASTER_TOKEN) return res.status(401).json({ erro: 'Token inválido.' });
-  const { email } = req.body;
-  if (!email) return res.status(400).json({ erro: 'E-mail obrigatório.' });
-  const codigo = Math.floor(100000 + Math.random() * 900000).toString();
-  const expira = Date.now() + 10 * 60 * 1000;
-  _masterCodigos.set(email, { codigo, expira });
+app.put('/avaliacao/modelo', autenticar, somenteGestao, async (req, res) => {
   try {
-    const { Resend } = require('resend');
-    const resend = new Resend(process.env.RESEND_API_KEY);
-    await resend.emails.send({
-      from: process.env.RESEND_FROM_EMAIL || 'noreply@redacheck.com.br',
-      to: email,
-      subject: 'RedaCheck Master — Código de acesso',
-      html: `<div style="font-family:sans-serif;max-width:400px;margin:0 auto;padding:24px"><h2 style="color:#1A1A1A">Código de acesso Master</h2><p style="color:#6B6255;margin:12px 0">Seu código de verificação:</p><div style="font-size:36px;font-weight:700;color:#C96A3A;letter-spacing:8px;padding:16px;background:#F5F2EE;border-radius:12px;text-align:center">${codigo}</div><p style="color:#9B9080;font-size:12px;margin-top:12px">Válido por 10 minutos. Não compartilhe.</p></div>`
-    });
-    res.json({ ok: true });
-  } catch(e) {
-    res.status(500).json({ erro: 'Erro ao enviar código.' });
-  }
-});
-
-app.post('/master/verificar-codigo', (req, res) => {
-  const token = req.headers['x-master-token'];
-  if (token !== MASTER_TOKEN) return res.status(401).json({ erro: 'Token inválido.' });
-  const { email, codigo } = req.body;
-  const entry = _masterCodigos.get(email);
-  if (!entry) return res.status(400).json({ erro: 'Nenhum código solicitado.' });
-  if (Date.now() > entry.expira) { _masterCodigos.delete(email); return res.status(400).json({ erro: 'Código expirado.' }); }
-  if (entry.codigo !== String(codigo)) return res.status(400).json({ erro: 'Código incorreto.' });
-  _masterCodigos.delete(email);
-  res.json({ ok: true, sessaoExpira: Date.now() + 4 * 60 * 60 * 1000 });
-});
-
-app.patch('/master/usuario/:id', async (req, res) => {
-  const token = req.headers['x-master-token'];
-  if (token !== MASTER_TOKEN) return res.status(401).json({ erro: 'Não autorizado.' });
-  try {
-    const { id } = req.params;
-    const { nome, email, avaliacoes_disponiveis, plano } = req.body;
-    const updates = [], vals = [];
-    let idx = 1;
-    if (nome !== undefined)                  { updates.push(`nome = $${idx++}`);                   vals.push(nome); }
-    if (email !== undefined)                 { updates.push(`email = $${idx++}`);                  vals.push(email); }
-    if (avaliacoes_disponiveis !== undefined) { updates.push(`avaliacoes_disponiveis = $${idx++}`); vals.push(parseInt(avaliacoes_disponiveis)); }
-    if (plano !== undefined)                 { updates.push(`plano = $${idx++}`);                  vals.push(plano); }
-    if (!updates.length) return res.status(400).json({ erro: 'Nenhum campo para atualizar.' });
-    updates.push('updated_at = NOW()');
-    vals.push(id);
-    await pool.query(`UPDATE usuarios SET ${updates.join(', ')} WHERE id = $${idx}`, vals);
-    if (avaliacoes_disponiveis !== undefined) {
-      await log(id, null, 'credito', 'ok', { origem: 'master_edicao', saldo_definido: parseInt(avaliacoes_disponiveis) });
+    const body = req.body || {};
+    const etapas = {};
+    for (const b of ['1', '2']) {
+      const lista = Array.isArray(body.etapas && body.etapas[b]) ? body.etapas[b] : [];
+      etapas[b] = lista
+        .map(e => ({ nome: String(e.nome || '').trim(), peso: Number(e.peso) > 0 ? Number(e.peso) : 1 }))
+        .filter(e => e.nome);
     }
-    await log(id, null, 'master_editar_usuario', 'ok', { campos: Object.keys(req.body) });
-    res.json({ ok: true });
-  } catch(e) { res.status(500).json({ erro: 'Erro ao editar usuário.' }); }
-});
-
-app.delete('/master/usuario/:id', async (req, res) => {
-  const token = req.headers['x-master-token'];
-  if (token !== MASTER_TOKEN) return res.status(401).json({ erro: 'Não autorizado.' });
-  try {
-    const { id } = req.params;
-    await pool.query('DELETE FROM avaliacoes WHERE usuario_id = $1', [id]);
-    await pool.query('DELETE FROM pagamentos WHERE usuario_id = $1', [id]);
-    await pool.query('DELETE FROM usuarios WHERE id = $1', [id]);
-    res.json({ ok: true });
-  } catch(e) { res.status(500).json({ erro: 'Erro ao remover usuário.' }); }
-});
-
-app.get('/master/dados', async (req, res) => {
-  const token = req.headers['x-master-token'];
-  if (token !== MASTER_TOKEN) return res.status(401).json({ erro: 'Acesso não autorizado.' });
-  try {
-    const [conversas, feedbacks, sugestoes, resumo, professores, ultimasAvaliacoes] = await Promise.all([
-      pool.query('SELECT * FROM conversas ORDER BY created_at DESC LIMIT 100'),
-      pool.query('SELECT * FROM feedbacks ORDER BY created_at DESC LIMIT 100'),
-      pool.query('SELECT * FROM sugestoes ORDER BY created_at DESC LIMIT 100'),
-      pool.query(`
-        SELECT
-          (SELECT COUNT(*) FROM conversas) as total_conversas,
-          (SELECT COUNT(*) FROM feedbacks) as total_feedbacks,
-          (SELECT COALESCE(ROUND(AVG(nota),1),0) FROM feedbacks) as media_estrelas,
-          (SELECT COUNT(*) FROM usuarios) as total_usuarios,
-          (SELECT COUNT(*) FROM usuarios WHERE confirmado=TRUE) as usuarios_confirmados,
-          (SELECT COUNT(*) FROM avaliacoes) as total_avaliacoes,
-          (SELECT COALESCE(ROUND(AVG(nota_geral),0),0) FROM avaliacoes) as media_nota_redacao
-      `),
-      pool.query("SELECT * FROM sugestoes WHERE texto LIKE '[CADASTRO PROFESSOR]%' ORDER BY created_at DESC LIMIT 50"),
-      pool.query('SELECT usuario, banca, nota_geral, created_at FROM avaliacoes ORDER BY created_at DESC LIMIT 20')
-    ]);
-    res.json({
-      resumo: resumo.rows[0], conversas: conversas.rows,
-      feedbacks: feedbacks.rows, sugestoes: sugestoes.rows,
-      professores: professores.rows, ultimasAvaliacoes: ultimasAvaliacoes.rows
-    });
-  } catch (err) {
-    res.status(500).json({ erro: 'Erro ao carregar dados.' });
-  }
-});
-
-// ── MERCADO PAGO ──────────────────────────────────────────────────────
-const PACOTES = {
-  avulso:        { qtd: 1,  valor: 4.90,  descricao: '1 avaliação' },
-  basico:        { qtd: 5,  valor: 19.90, descricao: '5 avaliações' },
-  intermediario: { qtd: 10, valor: 34.90, descricao: '10 avaliações' },
-  avancado:      { qtd: 20, valor: 68.60, descricao: '20 avaliações' }
-};
-const PACOTES_PROFESSOR = {
-  avulso:        { qtd: 1,  valor: 2.45,  descricao: '1 avaliação (professor)' },
-  basico:        { qtd: 5,  valor: 9.95,  descricao: '5 avaliações (professor)' },
-  intermediario: { qtd: 10, valor: 17.45, descricao: '10 avaliações (professor)' },
-  avancado:      { qtd: 20, valor: 34.30, descricao: '20 avaliações (professor)' }
-};
-
-app.post('/pagamento/criar', async (req, res) => {
-  try {
-    const { pacote, usuarioId, email, professor } = req.body;
-    if (!pacote || !usuarioId || !email) return res.status(400).json({ erro: 'Dados incompletos.' });
-    const tabela = professor ? PACOTES_PROFESSOR : PACOTES;
-    const item = tabela[pacote];
-    if (!item) return res.status(400).json({ erro: 'Pacote inválido.' });
-    const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN;
-    if (!MP_ACCESS_TOKEN) return res.status(500).json({ erro: 'Pagamento não configurado.' });
-
-    const preferencia = {
-      items: [{
-        id: pacote,
-        title: `RedaCheck — ${item.descricao}`,
-        description: `${item.qtd} avaliação(ões) de redação`,
-        quantity: 1, currency_id: 'BRL', unit_price: item.valor
-      }],
-      payer: { email },
-      payment_methods: { excluded_payment_types: [], installments: 1 },
-      back_urls: {
-        success: 'https://redacheck.com.br/?pagamento=sucesso',
-        failure: 'https://redacheck.com.br/?pagamento=falhou',
-        pending: 'https://redacheck.com.br/?pagamento=pendente'
-      },
-      auto_return: 'approved',
-      external_reference: `${usuarioId}|${pacote}|${item.qtd}`,
-      notification_url: 'https://redacheck-backend-production-25c3.up.railway.app/pagamento/webhook',
-      statement_descriptor: 'REDACHECK'
+    if (!etapas['1'].length && !etapas['2'].length) return res.status(400).json({ erro: 'Informe ao menos uma etapa.' });
+    const modelo = {
+      bimestres: 2,
+      nota_maxima: Number(body.nota_maxima) > 0 ? Number(body.nota_maxima) : 10,
+      etapas
     };
-
-    const resp = await fetch('https://api.mercadopago.com/checkout/preferences', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${MP_ACCESS_TOKEN}` },
-      body: JSON.stringify(preferencia)
-    });
-    const data = await resp.json();
-    if (data.error) return res.status(500).json({ erro: data.message || 'Erro ao criar pagamento.' });
-
     await pool.query(
-      `INSERT INTO pagamentos (usuario_id, pacote, avaliacoes, valor, status, preferencia_id, created_at)
-       VALUES ($1,$2,$3,$4,'pendente',$5,NOW()) ON CONFLICT DO NOTHING`,
-      [usuarioId, pacote, item.qtd, item.valor, data.id]
-    ).catch(() => {});
+      `INSERT INTO configuracoes (chave, valor, descricao) VALUES ('sistema_avaliacao', $1, 'Composição da nota por bimestre (etapas e pesos) — base para as avaliações das turmas')
+       ON CONFLICT (chave) DO UPDATE SET valor = EXCLUDED.valor`, [JSON.stringify(modelo)]);
+    res.json(modelo);
+  } catch (e) { console.error('Erro PUT modelo avaliacao:', e); res.status(500).json({ erro: 'Erro ao salvar o sistema de avaliação.' }); }
+});
 
-    res.json({ ok: true, preferencia_id: data.id, init_point: data.init_point, sandbox_init_point: data.sandbox_init_point });
-  } catch (err) {
-    console.error('[/pagamento/criar]', err.message);
-    res.status(500).json({ erro: 'Erro ao processar pagamento.' });
+// Cria na turma as avaliações previstas para o bimestre, sem duplicar as já existentes
+app.post('/professor/turmas/:id/avaliacoes/modelo', autenticar, somenteProfessor, async (req, res) => {
+  try {
+    if (!await podeTurma(req, req.params.id)) return res.status(403).json({ erro: 'Turma não vinculada ao seu cadastro.' });
+    const bim = Number(req.body.bimestre);
+    if (![1, 2].includes(bim)) return res.status(400).json({ erro: 'Informe o bimestre (1 ou 2).' });
+    const modelo = await getConfig('sistema_avaliacao', null);
+    const etapas = (modelo && modelo.etapas && modelo.etapas[String(bim)]) || [];
+    if (!etapas.length) return res.status(400).json({ erro: 'O sistema de avaliação ainda não foi configurado pela Gestão.' });
+    let criadas = 0;
+    for (const et of etapas) {
+      const ja = await pool.query(
+        `SELECT 1 FROM avaliacoes WHERE turma_id = $1 AND nome = $2 AND bimestre IS NOT DISTINCT FROM $3`,
+        [req.params.id, et.nome, bim]);
+      if (ja.rows.length) continue;
+      await pool.query(
+        `INSERT INTO avaliacoes (turma_id, nome, peso, bimestre) VALUES ($1,$2,$3,$4)`,
+        [req.params.id, et.nome, Number(et.peso) > 0 ? Number(et.peso) : 1, bim]);
+      criadas++;
+    }
+    res.status(201).json({ criadas, total: etapas.length });
+  } catch (e) { console.error('Erro aplicar modelo:', e); res.status(500).json({ erro: 'Erro ao criar as avaliações do bimestre.' }); }
+});
+
+// ============================================================
+// BACKUP DO BANCO DE DADOS
+// ============================================================
+const somenteMaster = exigirPerfil('master');
+
+// Ordem topológica: tabelas-pai antes das filhas, para o restauro respeitar as chaves estrangeiras
+async function tabelasEmOrdem() {
+  const t = await pool.query(
+    `SELECT table_name FROM information_schema.tables
+     WHERE table_schema = 'public' AND table_type = 'BASE TABLE' ORDER BY table_name`);
+  const nomes = t.rows.map(r => r.table_name);
+  const dep = await pool.query(
+    `SELECT tc.table_name AS filho, ccu.table_name AS pai
+     FROM information_schema.table_constraints tc
+     JOIN information_schema.constraint_column_usage ccu ON ccu.constraint_name = tc.constraint_name
+     WHERE tc.constraint_type = 'FOREIGN KEY' AND tc.table_schema = 'public'`);
+  const pais = {};
+  nomes.forEach(n => { pais[n] = new Set(); });
+  for (const d of dep.rows) {
+    // auto-referência não cria dependência entre tabelas
+    if (d.filho !== d.pai && pais[d.filho] && nomes.includes(d.pai)) pais[d.filho].add(d.pai);
+  }
+  const ordem = [], visto = new Set();
+  const visitar = (n, caminho) => {
+    if (visto.has(n) || caminho.has(n)) return;   // ciclo: resolve na ordem alfabética
+    caminho.add(n);
+    for (const p of pais[n]) visitar(p, caminho);
+    caminho.delete(n);
+    visto.add(n); ordem.push(n);
+  };
+  nomes.forEach(n => visitar(n, new Set()));
+  return ordem;
+}
+
+// Colunas BYTEA por tabela — são os anexos e as fotos, que pesam no arquivo
+async function colunasBinarias() {
+  const r = await pool.query(
+    `SELECT table_name, column_name FROM information_schema.columns
+     WHERE table_schema = 'public' AND data_type = 'bytea'`);
+  const mapa = {};
+  for (const c of r.rows) (mapa[c.table_name] = mapa[c.table_name] || []).push(c.column_name);
+  return mapa;
+}
+
+app.get('/admin/backup/resumo', autenticar, somenteMaster, async (req, res) => {
+  try {
+    const ordem = await tabelasEmOrdem();
+    const bin = await colunasBinarias();
+    const tabelas = [];
+    let totalLinhas = 0, totalBytes = 0;
+    for (const nome of ordem) {
+      const c = await pool.query(`SELECT COUNT(*)::int AS n FROM "${nome}"`);
+      const s = await pool.query(`SELECT pg_total_relation_size($1)::bigint AS b`, [nome]);
+      const bytes = Number(s.rows[0].b);
+      totalLinhas += c.rows[0].n; totalBytes += bytes;
+      tabelas.push({ tabela: nome, linhas: c.rows[0].n, bytes, tem_arquivos: !!bin[nome] });
+    }
+    res.json({ gerado_em: new Date().toISOString(), tabelas, total_linhas: totalLinhas, total_bytes: totalBytes });
+  } catch (e) { console.error('Erro resumo backup:', e); res.status(500).json({ erro: 'Erro ao ler o resumo do banco.' }); }
+});
+
+// Backup completo em JSON. arquivos=1 inclui fotos e anexos (arquivo bem maior)
+app.get('/admin/backup', autenticar, somenteMaster, async (req, res) => {
+  try {
+    const incluirArquivos = String(req.query.arquivos || '') === '1';
+    const ordem = await tabelasEmOrdem();
+    const bin = await colunasBinarias();
+    const dump = {
+      sistema: 'CEMIC — Sistema de Gestão Escolar',
+      versao_backend: '3.35',
+      gerado_em: new Date().toISOString(),
+      gerado_por: req.usuario.id,
+      inclui_arquivos: incluirArquivos,
+      ordem,
+      contagem: {},
+      tabelas: {}
+    };
+    let arquivosOmitidos = 0;
+    for (const nome of ordem) {
+      const r = await pool.query(`SELECT * FROM "${nome}"`);
+      const cols = bin[nome] || [];
+      const linhas = r.rows.map(linha => {
+        for (const col of cols) {
+          if (linha[col] == null) continue;
+          if (incluirArquivos) linha[col] = { __bytea: Buffer.from(linha[col]).toString('base64') };
+          else { linha[col] = null; arquivosOmitidos++; }
+        }
+        return linha;
+      });
+      dump.tabelas[nome] = linhas;
+      dump.contagem[nome] = linhas.length;
+    }
+    dump.arquivos_omitidos = arquivosOmitidos;
+    const nomeArq = `cemic-backup-${new Date().toISOString().slice(0, 10)}${incluirArquivos ? '-com-arquivos' : ''}.json`;
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="${nomeArq}"`);
+    res.setHeader('Cache-Control', 'private, no-store');
+    console.log(`Backup gerado por usuário ${req.usuario.id} — arquivos: ${incluirArquivos}`);
+    res.send(JSON.stringify(dump));
+  } catch (e) { console.error('Erro backup:', e); res.status(500).json({ erro: 'Erro ao gerar o backup.' }); }
+});
+
+// Restauro. Por segurança só roda com confirmação explícita; substituir=true apaga o que existe.
+app.post('/admin/backup/restaurar', express.json({ limit: '250mb' }), autenticar, somenteMaster, async (req, res) => {
+  const cliente = await pool.connect();
+  try {
+    const body = req.body || {};
+    if (body.confirmacao !== 'RESTAURAR') {
+      return res.status(400).json({ erro: 'Envie confirmacao: "RESTAURAR" para executar o restauro.' });
+    }
+    const dump = body.backup;
+    if (!dump || !dump.tabelas || !Array.isArray(dump.ordem)) {
+      return res.status(400).json({ erro: 'Arquivo de backup inválido.' });
+    }
+    const substituir = body.substituir === true;
+    const ordemBanco = await tabelasEmOrdem();
+    const alvo = dump.ordem.filter(t => ordemBanco.includes(t));
+
+    if (!substituir) {
+      for (const t of alvo) {
+        const c = await cliente.query(`SELECT 1 FROM "${t}" LIMIT 1`);
+        if (c.rows.length) {
+          return res.status(409).json({ erro: `A tabela "${t}" já tem dados. Para sobrescrever, envie substituir: true.` });
+        }
+      }
+    }
+
+    await cliente.query('BEGIN');
+    if (substituir) {
+      await cliente.query(`TRUNCATE ${alvo.map(t => `"${t}"`).join(', ')} RESTART IDENTITY CASCADE`);
+    }
+    const restaurado = {};
+    for (const t of alvo) {
+      const linhas = dump.tabelas[t] || [];
+      for (const linha of linhas) {
+        const cols = Object.keys(linha);
+        if (!cols.length) continue;
+        const vals = cols.map(k => {
+          const v = linha[k];
+          return (v && typeof v === 'object' && v.__bytea) ? Buffer.from(v.__bytea, 'base64') : v;
+        });
+        await cliente.query(
+          `INSERT INTO "${t}" (${cols.map(c => `"${c}"`).join(',')})
+           VALUES (${cols.map((_, i) => '$' + (i + 1)).join(',')}) ON CONFLICT DO NOTHING`, vals);
+      }
+      restaurado[t] = linhas.length;
+      // realinha a sequência do id para os próximos cadastros não colidirem
+      await cliente.query(
+        `SELECT setval(pg_get_serial_sequence($1, 'id'), COALESCE((SELECT MAX(id) FROM "${t}"), 1))
+         WHERE pg_get_serial_sequence($1, 'id') IS NOT NULL`, [t]);
+    }
+    await cliente.query('COMMIT');
+    console.log(`Restauro concluído por usuário ${req.usuario.id} — substituir: ${substituir}`);
+    res.json({ ok: true, substituir, tabelas: restaurado });
+  } catch (e) {
+    try { await cliente.query('ROLLBACK'); } catch (x) {}
+    console.error('Erro restaurar backup:', e);
+    res.status(500).json({ erro: 'Erro ao restaurar: ' + e.message + ' — nada foi alterado.' });
+  } finally {
+    cliente.release();
   }
 });
 
-// ══════════════════════════════════════════════════════════════════════
-// WEBHOOK MERCADO PAGO — v9.2
-// FIX: UPDATE pagamentos por payment_id OU preferencia_id
-//      (Pix nativo não usa preferencia_id — bug original)
-// ══════════════════════════════════════════════════════════════════════
-app.post('/pagamento/webhook', async (req, res) => {
+// ============================================================
+// TERMO DE ADESÃO AO SERVIÇO VOLUNTÁRIO (Portal do Professor)
+// ============================================================
+const TERMO_VIGENCIA = { inicio: '2026-08-01', fim: '2026-12-19' };
+const TERMO_VALOR_HORA_PADRAO = 33.33;
+
+// Matutino e vespertino ocorrem somente aos sábados; noturno em dias de semana.
+function diasDoTurnoTermo(turno) {
+  const t = (turno || '').toLowerCase();
+  return (t.startsWith('matut') || t.startsWith('vesper')) ? 'sábados' : '';
+}
+
+async function dadosTermoProfessor(req) {
+  const profId = escopoProfessor(req);
+  if (profId === null || profId === -1) return null;
+  const p = await pool.query(
+    `SELECT id, nome, email, formacao, whatsapp, data_nascimento FROM professores WHERE id = $1`, [profId]);
+  if (!p.rows.length) return null;
+  const u = await pool.query(`SELECT cpf FROM usuarios WHERE id = $1`, [req.usuario.id]);
+  const t = await pool.query(
+    `SELECT nome, turno, horario, semestre FROM turmas
+     WHERE professor_id = $1 AND status <> 'encerrada' ORDER BY turno, nome`, [profId]);
+  const valorCfg = Number(await getConfig('valor_hora_aula', 0));
+  return {
+    professor: { ...p.rows[0], cpf: (u.rows[0] && u.rows[0].cpf) || null },
+    turmas: t.rows,
+    turnos: [...new Set(t.rows.map(x => x.turno).filter(Boolean))],
+    vigencia: TERMO_VIGENCIA,
+    valor_hora: valorCfg > 0 ? valorCfg : TERMO_VALOR_HORA_PADRAO
+  };
+}
+
+// Situação do termo + dados pré-preenchidos para a adesão
+app.get('/professor/termo', autenticar, somenteProfessor, async (req, res) => {
   try {
+    const base = await dadosTermoProfessor(req);
+    if (!base) return res.status(403).json({ erro: 'Disponível apenas para usuários com perfil professor vinculado a um cadastro.' });
+    const t = await pool.query(
+      `SELECT * FROM termos_adesao WHERE professor_id = $1 AND vigencia_inicio = $2`,
+      [base.professor.id, TERMO_VIGENCIA.inicio]);
+    res.json({ ...base, termo: t.rows[0] || null });
+  } catch (e) { console.error('Erro GET termo:', e); res.status(500).json({ erro: 'Erro ao carregar o termo.' }); }
+});
+
+// Adesão do professor: cria o termo pendente de aceite da instituição
+app.post('/professor/termo', autenticar, somenteProfessor, async (req, res) => {
+  try {
+    const base = await dadosTermoProfessor(req);
+    if (!base) return res.status(403).json({ erro: 'Disponível apenas para usuários com perfil professor vinculado a um cadastro.' });
+    if (!base.turmas.length) return res.status(400).json({ erro: 'Você ainda não tem turmas vinculadas neste semestre. Procure a coordenação.' });
+    const ja = await pool.query(
+      `SELECT id, status FROM termos_adesao WHERE professor_id = $1 AND vigencia_inicio = $2`,
+      [base.professor.id, TERMO_VIGENCIA.inicio]);
+    if (ja.rows.length) return res.status(409).json({ erro: 'Você já aderiu ao termo deste período.' });
+    if (req.body.aceite !== true) return res.status(400).json({ erro: 'Confirme a leitura e o aceite do termo.' });
+
+    const turnos = base.turnos.join(' e ') || null;
+    const turmasResumo = base.turmas
+      .map(t => {
+        const dias = diasDoTurnoTermo(t.turno);
+        return `${t.nome}${t.turno ? ' · ' + t.turno : ''}${t.horario ? ' · ' + t.horario : ''}${dias ? ' · ' + dias : ''}`;
+      })
+      .join(' | ');
+    const r = await pool.query(
+      `INSERT INTO termos_adesao
+         (professor_id, usuario_id, nome, cpf, rg, data_nascimento, qualificacao, endereco, telefone, email,
+          turmas_resumo, turnos, vigencia_inicio, vigencia_fim, valor_hora, status)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,'pendente') RETURNING id, assinado_em`,
+      [base.professor.id, req.usuario.id, base.professor.nome, base.professor.cpf,
+       (req.body.rg || '').trim() || null, base.professor.data_nascimento,
+       (req.body.qualificacao || '').trim() || base.professor.formacao || null,
+       (req.body.endereco || '').trim() || null,
+       (req.body.telefone || '').trim() || base.professor.whatsapp || null,
+       base.professor.email || null,
+       turmasResumo, turnos, TERMO_VIGENCIA.inicio, TERMO_VIGENCIA.fim, base.valor_hora]);
+    res.status(201).json({ id: r.rows[0].id, status: 'pendente', assinado_em: r.rows[0].assinado_em });
+  } catch (e) { console.error('Erro POST termo:', e); res.status(500).json({ erro: 'Erro ao registrar a adesão.' }); }
+});
+
+// Gestão: lista de termos (pendentes primeiro)
+app.get('/admin/termos', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const r = await pool.query(
+      `SELECT t.*, p.nome AS professor_cadastro FROM termos_adesao t
+       LEFT JOIN professores p ON p.id = t.professor_id
+       ORDER BY (t.status = 'pendente') DESC, t.assinado_em DESC`);
+    res.json(r.rows);
+  } catch (e) { console.error('Erro GET termos:', e); res.status(500).json({ erro: 'Erro ao listar os termos.' }); }
+});
+
+// Aceite da instituição: só o master, cujo nome completo passa a constar no termo
+app.post('/admin/termos/:id/aceitar', autenticar, exigirPerfil('master'), async (req, res) => {
+  try {
+    const t = await pool.query(`SELECT id, status FROM termos_adesao WHERE id = $1`, [Number(req.params.id)]);
+    if (!t.rows.length) return res.status(404).json({ erro: 'Termo não encontrado.' });
+    if (t.rows[0].status === 'aceito') return res.status(409).json({ erro: 'Este termo já foi aceito.' });
+    let codigo = null;
+    for (let i = 0; i < 6 && !codigo; i++) {
+      const cand = 'CEMIC-' + crypto.randomBytes(2).toString('hex').toUpperCase() + '-' + crypto.randomBytes(2).toString('hex').toUpperCase();
+      const ex = await pool.query(
+        `SELECT 1 FROM declaracoes WHERE codigo = $1
+         UNION ALL SELECT 1 FROM carteiras WHERE codigo = $1
+         UNION ALL SELECT 1 FROM termos_adesao WHERE codigo = $1`, [cand]);
+      if (!ex.rows.length) codigo = cand;
+    }
+    const r = await pool.query(
+      `UPDATE termos_adesao SET status = 'aceito', codigo = $1, aceito_em = NOW(), aceito_por = $2, aceito_por_nome = $3
+       WHERE id = $4 RETURNING codigo, aceito_em, aceito_por_nome`,
+      [codigo, req.usuario.id, req.usuario.nome, Number(req.params.id)]);
+    console.log(`Termo ${req.params.id} aceito por ${req.usuario.nome}`);
+    res.json(r.rows[0]);
+  } catch (e) { console.error('Erro aceitar termo:', e); res.status(500).json({ erro: 'Erro ao aceitar o termo.' }); }
+});
+
+app.delete('/admin/termos/:id', autenticar, exigirPerfil('master'), async (req, res) => {
+  try {
+    const r = await pool.query(`DELETE FROM termos_adesao WHERE id = $1`, [Number(req.params.id)]);
+    if (!r.rowCount) return res.status(404).json({ erro: 'Termo não encontrado.' });
+    res.json({ ok: true });
+  } catch (e) { console.error('Erro DELETE termo:', e); res.status(500).json({ erro: 'Erro ao excluir o termo.' }); }
+});
+
+// ============================================================
+// DOCUMENTOS DO PROFESSOR — foto, carteira e declaração de vínculo
+// ============================================================
+// Reúne o cadastro do professor (referenciado pelo usuário logado), o CPF
+// (do cadastro; na falta, o do usuário), as turmas ativas e o semestre.
+async function dadosProfessorDoc(req) {
+  const profId = escopoProfessor(req);
+  if (profId === null || profId === -1) return null;
+  const p = await pool.query(
+    `SELECT id, nome, codigo, cpf, email, formacao, whatsapp, data_ingresso FROM professores WHERE id = $1`, [profId]);
+  if (!p.rows.length) return null;
+  const u = await pool.query(`SELECT cpf FROM usuarios WHERE id = $1`, [req.usuario.id]);
+  const t = await pool.query(
+    `SELECT nome, turno, horario, semestre FROM turmas
+     WHERE professor_id = $1 AND status <> 'encerrada' ORDER BY turno, nome`, [profId]);
+  const prof = p.rows[0];
+  const cpf = (prof.cpf || (u.rows[0] && u.rows[0].cpf) || null);
+  const turnos = [...new Set(t.rows.map(x => x.turno).filter(Boolean))];
+  const semestre = (t.rows.find(x => x.semestre) || {}).semestre || null;
+  return { professor: { ...prof, cpf }, turmas: t.rows, turnos, semestre };
+}
+
+// Código único verificável, checado contra todas as tabelas de documentos
+async function codigoDocumentoUnico() {
+  for (let i = 0; i < 8; i++) {
+    const cand = 'CEMIC-' + crypto.randomBytes(2).toString('hex').toUpperCase() + '-' + crypto.randomBytes(2).toString('hex').toUpperCase();
+    const ex = await pool.query(
+      `SELECT 1 FROM declaracoes WHERE codigo = $1
+       UNION ALL SELECT 1 FROM carteiras WHERE codigo = $1
+       UNION ALL SELECT 1 FROM termos_adesao WHERE codigo = $1
+       UNION ALL SELECT 1 FROM carteiras_professor WHERE codigo = $1
+       UNION ALL SELECT 1 FROM declaracoes_professor WHERE codigo = $1`, [cand]);
+    if (!ex.rows.length) return cand;
+  }
+  return null;
+}
+
+const PROF_FUNCAO = 'Professor(a) voluntário(a)';
+
+// --- Foto do professor (enviada por ele mesmo; uma por professor) ---
+app.post('/professor/foto', autenticar, somenteProfessor, async (req, res) => {
+  try {
+    const profId = escopoProfessor(req);
+    if (profId === null || profId === -1) return res.status(403).json({ erro: 'Disponível apenas para usuários com perfil professor vinculado a um cadastro.' });
+    const f = fotoDoCorpo(req.body);
+    if (f.erro) return res.status(400).json({ erro: f.erro });
+    await pool.query(
+      `INSERT INTO professor_fotos (professor_id, mime, tamanho, conteudo, enviada_em)
+       VALUES ($1, $2, $3, $4, NOW())
+       ON CONFLICT (professor_id) DO UPDATE
+         SET mime = EXCLUDED.mime, tamanho = EXCLUDED.tamanho, conteudo = EXCLUDED.conteudo, enviada_em = NOW()`,
+      [profId, f.mime, f.buf.length, f.buf]);
+    res.status(201).json({ ok: true, tamanho: f.buf.length });
+  } catch (e) { console.error('Erro enviar foto do professor:', e); res.status(500).json({ erro: 'Erro ao enviar a foto.' }); }
+});
+
+app.delete('/professor/foto', autenticar, somenteProfessor, async (req, res) => {
+  try {
+    const profId = escopoProfessor(req);
+    if (profId === null || profId === -1) return res.status(403).json({ erro: 'Disponível apenas para usuários com perfil professor vinculado a um cadastro.' });
+    await pool.query(`DELETE FROM professor_fotos WHERE professor_id = $1`, [profId]);
+    res.json({ ok: true });
+  } catch (e) { console.error('Erro remover foto do professor:', e); res.status(500).json({ erro: 'Erro ao remover a foto.' }); }
+});
+
+// A Gestão pode remover uma foto inadequada
+app.delete('/admin/professores/:id/foto', autenticar, somenteGestao, async (req, res) => {
+  try {
+    await pool.query(`DELETE FROM professor_fotos WHERE professor_id = $1`, [Number(req.params.id)]);
+    res.json({ ok: true });
+  } catch (e) { console.error('Erro remover foto do professor (gestão):', e); res.status(500).json({ erro: 'Erro ao remover a foto.' }); }
+});
+
+// Entrega autenticada da foto: o próprio professor ou a gestão; nunca URL pública
+app.get('/arquivos/professor-foto/:id', async (req, res) => {
+  try {
+    const header = req.headers.authorization || '';
+    const token = req.query.token || (header.startsWith('Bearer ') ? header.slice(7) : null);
+    if (!token) return res.status(401).json({ erro: 'Token não fornecido.' });
+    let dados;
+    try { dados = jwt.verify(token, JWT_SECRET); } catch { return res.status(401).json({ erro: 'Token inválido ou expirado.' }); }
+    const profId = Number(req.params.id);
+    if (dados.perfil === 'professor') {
+      if (Number(dados.referencia_id) !== profId) return res.status(403).json({ erro: 'Acesso negado.' });
+    } else if (!['master', 'secretaria'].includes(dados.perfil)) {
+      return res.status(403).json({ erro: 'Acesso negado.' });
+    }
+    const r = await pool.query(`SELECT mime, conteudo FROM professor_fotos WHERE professor_id = $1`, [profId]);
+    if (!r.rows.length) return res.status(404).json({ erro: 'Foto não encontrada.' });
+    res.setHeader('Content-Type', r.rows[0].mime);
+    res.setHeader('Cache-Control', 'private, no-store');
+    res.send(r.rows[0].conteudo);
+  } catch (e) { console.error('Erro baixar foto do professor:', e); res.status(500).json({ erro: 'Erro ao carregar a foto.' }); }
+});
+
+// Situação da carteira e da foto (monta a tela sem emitir nada)
+app.get('/professor/carteira', autenticar, somenteProfessor, async (req, res) => {
+  try {
+    const base = await dadosProfessorDoc(req);
+    if (!base) return res.status(403).json({ erro: 'Disponível apenas para usuários com perfil professor vinculado a um cadastro.' });
+    const foto = await pool.query(`SELECT tamanho, enviada_em FROM professor_fotos WHERE professor_id = $1`, [base.professor.id]);
+    const cart = base.semestre
+      ? await pool.query(`SELECT codigo, emitida_em, validade FROM carteiras_professor WHERE professor_id = $1 AND semestre = $2`, [base.professor.id, base.semestre])
+      : { rows: [] };
+    res.json({
+      professor_id: base.professor.id,
+      tem_foto: foto.rows.length > 0,
+      foto_enviada_em: foto.rows.length ? foto.rows[0].enviada_em : null,
+      semestre: base.semestre,
+      emitida: cart.rows.length > 0,
+      codigo: cart.rows.length ? cart.rows[0].codigo : null,
+      validade: cart.rows.length ? cart.rows[0].validade : null
+    });
+  } catch (e) { console.error('Erro consultar carteira do professor:', e); res.status(500).json({ erro: 'Erro ao carregar a carteira.' }); }
+});
+
+// Emissão da carteira: uma por professor e semestre (reemitir devolve a mesma)
+app.post('/professor/carteira', autenticar, somenteProfessor, async (req, res) => {
+  try {
+    const base = await dadosProfessorDoc(req);
+    if (!base) return res.status(403).json({ erro: 'Disponível apenas para usuários com perfil professor vinculado a um cadastro.' });
+    if (!base.semestre) return res.status(400).json({ erro: 'A carteira é emitida quando você tem turma vinculada no semestre. Procure a coordenação.' });
+    const semestre = base.semestre;
+    const validade = fimDoSemestre(semestre);
+    const turnos = base.turnos.join(' e ') || null;
+    const P = base.professor;
+
+    const existente = await pool.query(`SELECT codigo, emitida_em FROM carteiras_professor WHERE professor_id = $1 AND semestre = $2`, [P.id, semestre]);
+    let codigo, emitidaEm;
+    if (existente.rows.length) {
+      codigo = existente.rows[0].codigo;
+      emitidaEm = existente.rows[0].emitida_em;
+      await pool.query(
+        `UPDATE carteiras_professor SET professor_nome = $1, professor_cpf = $2, professor_codigo = $3, formacao = $4, funcao = $5, turnos = $6, validade = $7
+         WHERE codigo = $8`,
+        [P.nome, P.cpf, P.codigo || null, P.formacao || null, PROF_FUNCAO, turnos, validade, codigo]);
+    } else {
+      codigo = await codigoDocumentoUnico();
+      if (!codigo) return res.status(500).json({ erro: 'Não foi possível gerar o código da carteira. Tente novamente.' });
+      const ins = await pool.query(
+        `INSERT INTO carteiras_professor (codigo, professor_id, professor_nome, professor_cpf, professor_codigo, formacao, funcao, turnos, semestre, validade)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING emitida_em`,
+        [codigo, P.id, P.nome, P.cpf, P.codigo || null, P.formacao || null, PROF_FUNCAO, turnos, semestre, validade]);
+      emitidaEm = ins.rows[0].emitida_em;
+    }
+
+    const foto = await pool.query(`SELECT 1 FROM professor_fotos WHERE professor_id = $1`, [P.id]);
+    res.status(201).json({
+      codigo, emitida_em: emitidaEm, professor_id: P.id, professor_nome: P.nome, professor_cpf: P.cpf, professor_codigo: P.codigo || null,
+      formacao: P.formacao || null, funcao: PROF_FUNCAO, turnos, semestre, validade, tem_foto: foto.rows.length > 0
+    });
+  } catch (e) { console.error('Erro emitir carteira do professor:', e); res.status(500).json({ erro: 'Erro ao emitir a carteira.' }); }
+});
+
+// Emissão da declaração de vínculo (uma por professor e vigência; reemitir devolve a mesma)
+app.post('/professor/declaracao-vinculo', autenticar, somenteProfessor, async (req, res) => {
+  try {
+    const base = await dadosProfessorDoc(req);
+    if (!base) return res.status(403).json({ erro: 'Disponível apenas para usuários com perfil professor vinculado a um cadastro.' });
+    const P = base.professor;
+    const turmasResumo = base.turmas
+      .map(t => `${t.nome}${t.turno ? ' · ' + t.turno : ''}${t.horario ? ' · ' + t.horario : ''}`)
+      .join(' | ') || null;
+    const turnos = base.turnos.join(' e ') || null;
+    const semestre = base.semestre;
+
+    const existente = await pool.query(
+      `SELECT codigo, emitida_em FROM declaracoes_professor WHERE professor_id = $1 AND vigencia_inicio = $2`,
+      [P.id, TERMO_VIGENCIA.inicio]);
+    let codigo, emitidaEm;
+    if (existente.rows.length) {
+      codigo = existente.rows[0].codigo;
+      emitidaEm = existente.rows[0].emitida_em;
+      await pool.query(
+        `UPDATE declaracoes_professor SET professor_nome = $1, professor_cpf = $2, formacao = $3, funcao = $4, data_ingresso = $5,
+             turmas_resumo = $6, turnos = $7, semestre = $8, vigencia_fim = $9
+         WHERE codigo = $10`,
+        [P.nome, P.cpf, P.formacao || null, PROF_FUNCAO, P.data_ingresso || null, turmasResumo, turnos, semestre, TERMO_VIGENCIA.fim, codigo]);
+    } else {
+      codigo = await codigoDocumentoUnico();
+      if (!codigo) return res.status(500).json({ erro: 'Não foi possível gerar o código da declaração. Tente novamente.' });
+      const ins = await pool.query(
+        `INSERT INTO declaracoes_professor
+           (codigo, professor_id, professor_nome, professor_cpf, formacao, funcao, data_ingresso, turmas_resumo, turnos, semestre, vigencia_inicio, vigencia_fim)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING emitida_em`,
+        [codigo, P.id, P.nome, P.cpf, P.formacao || null, PROF_FUNCAO, P.data_ingresso || null, turmasResumo, turnos, semestre, TERMO_VIGENCIA.inicio, TERMO_VIGENCIA.fim]);
+      emitidaEm = ins.rows[0].emitida_em;
+    }
+    res.status(201).json({
+      codigo, emitida_em: emitidaEm, professor_nome: P.nome, professor_cpf: P.cpf, formacao: P.formacao || null,
+      funcao: PROF_FUNCAO, data_ingresso: P.data_ingresso || null, turmas_resumo: turmasResumo, turnos, semestre,
+      vigencia_inicio: TERMO_VIGENCIA.inicio, vigencia_fim: TERMO_VIGENCIA.fim
+    });
+  } catch (e) { console.error('Erro emitir declaração de vínculo:', e); res.status(500).json({ erro: 'Erro ao emitir a declaração.' }); }
+});
+
+// ---------- Folha de professores (hora-aula) ----------
+app.post('/admin/professor-horas', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const professorId = Number(req.body.professor_id);
+    const data = req.body.data;
+    const horas = Number(req.body.horas);
+    const valorHora = Number(req.body.valor_hora);
+    const observacao = (req.body.observacao || '').trim() || null;
+    if (!professorId) return res.status(400).json({ erro: 'Selecione o professor.' });
+    if (!data) return res.status(400).json({ erro: 'Informe a data.' });
+    if (!(horas > 0)) return res.status(400).json({ erro: 'Informe a quantidade de horas-aula.' });
+    if (!(valorHora >= 0)) return res.status(400).json({ erro: 'Informe o valor da hora-aula.' });
+    const p = await pool.query(`SELECT 1 FROM professores WHERE id = $1`, [professorId]);
+    if (!p.rows.length) return res.status(404).json({ erro: 'Professor não encontrado.' });
+    const r = await pool.query(
+      `INSERT INTO professor_horas (professor_id, data, horas, valor_hora, observacao)
+       VALUES ($1,$2,$3,$4,$5) RETURNING id`,
+      [professorId, data, horas, valorHora, observacao]);
+    res.status(201).json({ id: r.rows[0].id });
+  } catch (e) { console.error('Erro POST professor-horas:', e); res.status(500).json({ erro: 'Erro ao lançar as horas-aula.' }); }
+});
+
+app.get('/admin/professor-horas', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const cond = [], params = [];
+    if (req.query.professor_id) { params.push(Number(req.query.professor_id)); cond.push(`ph.professor_id = $${params.length}`); }
+    if (req.query.mes) { params.push(req.query.mes); cond.push(`to_char(ph.data, 'YYYY-MM') = $${params.length}`); }
+    if (req.query.de && req.query.ate) {
+      params.push(req.query.de); cond.push(`to_char(ph.data, 'YYYY-MM') >= $${params.length}`);
+      params.push(req.query.ate); cond.push(`to_char(ph.data, 'YYYY-MM') <= $${params.length}`);
+    }
+    const where = cond.length ? 'WHERE ' + cond.join(' AND ') : '';
+    const r = await pool.query(
+      `SELECT ph.id, ph.professor_id, ph.data, ph.horas, ph.valor_hora, ph.observacao,
+              (ph.horas * ph.valor_hora) AS total, p.nome AS professor_nome
+       FROM professor_horas ph
+       JOIN professores p ON p.id = ph.professor_id
+       ${where}
+       ORDER BY p.nome, ph.data`, params);
+    res.json(r.rows);
+  } catch (e) { console.error('Erro GET professor-horas:', e); res.status(500).json({ erro: 'Erro ao listar as horas-aula.' }); }
+});
+
+app.delete('/admin/professor-horas/:id', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const r = await pool.query(`DELETE FROM professor_horas WHERE id = $1 RETURNING id`, [req.params.id]);
+    if (!r.rows.length) return res.status(404).json({ erro: 'Lançamento não encontrado.' });
+    res.json({ ok: true });
+  } catch (e) { console.error('Erro DELETE professor-horas:', e); res.status(500).json({ erro: 'Erro ao remover o lançamento.' }); }
+});
+
+// ---------- Pagamentos aos professores (baixas) ----------
+app.post('/admin/professor-pagamentos', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const professorId = Number(req.body.professor_id);
+    const referencia = (req.body.referencia || '').trim();
+    const dataPagamento = req.body.data_pagamento;
+    const valor = Number(req.body.valor);
+    const forma = (req.body.forma || '').trim() || null;
+    const observacao = (req.body.observacao || '').trim() || null;
+    if (!professorId) return res.status(400).json({ erro: 'Selecione o professor.' });
+    if (!/^\d{4}-\d{2}$/.test(referencia)) return res.status(400).json({ erro: 'Mês de referência inválido.' });
+    if (!dataPagamento) return res.status(400).json({ erro: 'Informe a data do pagamento.' });
+    if (!(valor > 0)) return res.status(400).json({ erro: 'Informe o valor pago.' });
+    const p = await pool.query(`SELECT 1 FROM professores WHERE id = $1`, [professorId]);
+    if (!p.rows.length) return res.status(404).json({ erro: 'Professor não encontrado.' });
+    const r = await pool.query(
+      `INSERT INTO professor_pagamentos (professor_id, referencia, data_pagamento, valor, forma, observacao)
+       VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
+      [professorId, referencia, dataPagamento, valor, forma, observacao]);
+    res.status(201).json({ id: r.rows[0].id });
+  } catch (e) { console.error('Erro POST professor-pagamentos:', e); res.status(500).json({ erro: 'Erro ao registrar o pagamento.' }); }
+});
+
+app.get('/admin/professor-pagamentos', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const cond = [], params = [];
+    if (req.query.professor_id) { params.push(Number(req.query.professor_id)); cond.push(`pg.professor_id = $${params.length}`); }
+    if (req.query.mes) { params.push(req.query.mes); cond.push(`pg.referencia = $${params.length}`); }
+    if (req.query.de && req.query.ate) {
+      params.push(req.query.de); cond.push(`pg.referencia >= $${params.length}`);
+      params.push(req.query.ate); cond.push(`pg.referencia <= $${params.length}`);
+    }
+    const where = cond.length ? 'WHERE ' + cond.join(' AND ') : '';
+    const r = await pool.query(
+      `SELECT pg.id, pg.professor_id, pg.referencia, pg.data_pagamento, pg.valor, pg.forma, pg.observacao,
+              p.nome AS professor_nome
+       FROM professor_pagamentos pg
+       JOIN professores p ON p.id = pg.professor_id
+       ${where}
+       ORDER BY pg.data_pagamento, pg.id`, params);
+    res.json(r.rows);
+  } catch (e) { console.error('Erro GET professor-pagamentos:', e); res.status(500).json({ erro: 'Erro ao listar os pagamentos.' }); }
+});
+
+app.delete('/admin/professor-pagamentos/:id', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const r = await pool.query(`DELETE FROM professor_pagamentos WHERE id = $1 RETURNING id`, [req.params.id]);
+    if (!r.rows.length) return res.status(404).json({ erro: 'Pagamento não encontrado.' });
+    res.json({ ok: true });
+  } catch (e) { console.error('Erro DELETE professor-pagamentos:', e); res.status(500).json({ erro: 'Erro ao remover o pagamento.' }); }
+});
+
+// Saldo consolidado do mês: devido (horas-aula) x pago (baixas)
+app.get('/admin/professor-folha', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const reMes = /^\d{4}-\d{2}$/;
+    let de = req.query.de, ate = req.query.ate;
+    if (req.query.mes) { de = req.query.mes; ate = req.query.mes; }
+    if (!de || !ate || !reMes.test(de) || !reMes.test(ate)) {
+      return res.status(400).json({ erro: 'Informe o mês (mes=AAAA-MM) ou o período (de=AAAA-MM&ate=AAAA-MM).' });
+    }
+    if (de > ate) { const t = de; de = ate; ate = t; }
+    const r = await pool.query(
+      `SELECT p.id AS professor_id, p.nome AS professor_nome,
+              COALESCE(h.horas, 0) AS horas,
+              COALESCE(h.devido, 0) AS devido,
+              COALESCE(g.pago, 0) AS pago,
+              COALESCE(h.devido, 0) - COALESCE(g.pago, 0) AS saldo
+       FROM professores p
+       LEFT JOIN (
+         SELECT professor_id, SUM(horas) AS horas, SUM(horas * valor_hora) AS devido
+         FROM professor_horas WHERE to_char(data, 'YYYY-MM') >= $1 AND to_char(data, 'YYYY-MM') <= $2 GROUP BY professor_id
+       ) h ON h.professor_id = p.id
+       LEFT JOIN (
+         SELECT professor_id, SUM(valor) AS pago
+         FROM professor_pagamentos WHERE referencia >= $1 AND referencia <= $2 GROUP BY professor_id
+       ) g ON g.professor_id = p.id
+       WHERE COALESCE(h.devido, 0) <> 0 OR COALESCE(g.pago, 0) <> 0
+       ORDER BY p.nome`, [de, ate]);
+    res.json(r.rows);
+  } catch (e) { console.error('Erro GET professor-folha:', e); res.status(500).json({ erro: 'Erro ao apurar a folha.' }); }
+});
+
+// ---------- Alteração de turma (transfere matrícula ativa sem cancelar) ----------
+app.put('/admin/matriculas/:id/turma', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const matId = Number(req.params.id);
+    const novaTurmaId = Number(req.body.turma_id);
+    if (!novaTurmaId) return res.status(400).json({ erro: 'Selecione a turma de destino.' });
+    const mr = await pool.query(`SELECT * FROM matriculas WHERE id = $1`, [matId]);
+    const mat = mr.rows[0];
+    if (!mat) return res.status(404).json({ erro: 'Matrícula não encontrada.' });
+    if (mat.status !== 'ativa') return res.status(409).json({ erro: 'Só é possível alterar a turma de uma matrícula ativa.' });
+    if (mat.turma_id === novaTurmaId) return res.status(400).json({ erro: 'A turma de destino é a mesma da turma atual.' });
+    const tr = await pool.query(`SELECT * FROM turmas WHERE id = $1`, [novaTurmaId]);
+    const turma = tr.rows[0];
+    if (!turma) return res.status(404).json({ erro: 'Turma de destino não encontrada.' });
+    if (turma.status === 'encerrada') return res.status(409).json({ erro: 'A turma de destino está encerrada.' });
+    const dup = await pool.query(`SELECT 1 FROM matriculas WHERE aluno_id = $1 AND turma_id = $2 AND status IN ('ativa','trancada')`, [mat.aluno_id, novaTurmaId]);
+    if (dup.rows.length) return res.status(409).json({ erro: 'O aluno já possui matrícula ativa nessa turma.' });
+    const ocup = await pool.query(`SELECT COUNT(*)::int AS n FROM matriculas WHERE turma_id = $1 AND status = 'ativa'`, [novaTurmaId]);
+    if (ocup.rows[0].n >= turma.capacidade) return res.status(409).json({ erro: 'A turma de destino está lotada.' });
+    await pool.query(`UPDATE matriculas SET turma_id = $1 WHERE id = $2`, [novaTurmaId, matId]);
+    res.json({ ok: true, turma_id: novaTurmaId });
+  } catch (e) { console.error('Erro alterar turma:', e); res.status(500).json({ erro: 'Erro ao alterar a turma.' }); }
+});
+
+// ---------- Relatório: pais cadastrados no Portal, por turma ----------
+app.get('/admin/relatorios/pais-por-turma', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const params = [];
+    let filtroSem = '';
+    if (req.query.semestre) { params.push(req.query.semestre); filtroSem = ` AND t.semestre = $${params.length}`; }
+    if (req.query.turma_id) { params.push(Number(req.query.turma_id)); filtroSem += ` AND t.id = $${params.length}`; }
+    const r = await pool.query(
+      `SELECT t.id AS turma_id, t.nome AS turma_nome, t.turno, t.semestre,
+              c.nome AS curso_nome, n.nome AS nivel_nome,
+              a.id AS aluno_id, a.nome AS aluno_nome,
+              r.nome AS responsavel_nome, r.cpf AS responsavel_cpf, r.whatsapp AS responsavel_whatsapp,
+              ar.parentesco, (r.senha_hash IS NOT NULL) AS cadastrado
+       FROM matriculas m
+       JOIN alunos a ON a.id = m.aluno_id
+       JOIN turmas t ON t.id = m.turma_id
+       JOIN niveis n ON n.id = t.nivel_id
+       JOIN cursos c ON c.id = n.curso_id
+       LEFT JOIN aluno_responsavel ar ON ar.aluno_id = a.id
+       LEFT JOIN responsaveis r ON r.id = ar.responsavel_id
+       WHERE m.status = 'ativa'${filtroSem}
+       ORDER BY t.nome, a.nome, r.nome`, params);
+    res.json(r.rows);
+  } catch (e) { console.error('Erro relatório pais por turma:', e); res.status(500).json({ erro: 'Erro ao gerar o relatório.' }); }
+});
+
+app.get('/admin/pre-inscricoes', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const cond = []; const params = [];
+    if (req.query.status) { params.push(req.query.status); cond.push(`status = $${params.length}`); }
+    if (req.query.tipo) { params.push(req.query.tipo); cond.push(`tipo = $${params.length}`); }
+    const where = cond.length ? `WHERE ${cond.join(' AND ')}` : '';
+    const r = await pool.query(`SELECT * FROM pre_inscricoes ${where} ORDER BY criado_em DESC`, params);
+    res.json(r.rows);
+  } catch (e) { console.error('Erro GET pre-inscricoes:', e); res.status(500).json({ erro: 'Erro ao listar pré-inscrições.' }); }
+});
+
+// ============================================================
+// INTEGRAÇÃO PIX — BANCO INTER (Portal dos Pais)
+// ============================================================
+const INTER = {
+  base: process.env.INTER_BASE_URL || 'https://cdpj.partners.bancointer.com.br',
+  clientId: process.env.INTER_CLIENT_ID || '',
+  clientSecret: process.env.INTER_CLIENT_SECRET || '',
+  cert: (process.env.INTER_CERT || '').replace(/\\n/g, '\n'),
+  key: (process.env.INTER_KEY || '').replace(/\\n/g, '\n'),
+  chave: process.env.INTER_PIX_KEY || '',
+  conta: process.env.INTER_CONTA_CORRENTE || ''
+};
+const INTER_SCOPES = 'cob.write cob.read pix.read webhook.write webhook.read';
+function interConfigurado() {
+  return !!(INTER.clientId && INTER.clientSecret && INTER.cert && INTER.key && INTER.chave);
+}
+let interAgent = null;
+function getInterAgent() {
+  if (!interAgent) interAgent = new https.Agent({ cert: INTER.cert, key: INTER.key, keepAlive: true });
+  return interAgent;
+}
+function interHttp(method, pathname, { token, body, form } = {}) {
+  return new Promise((resolve, reject) => {
+    const url = new URL(INTER.base + pathname);
+    const payload = form ? new URLSearchParams(form).toString() : (body ? JSON.stringify(body) : null);
+    const headers = {};
+    if (form) headers['Content-Type'] = 'application/x-www-form-urlencoded';
+    else if (body) headers['Content-Type'] = 'application/json';
+    if (token) headers['Authorization'] = 'Bearer ' + token;
+    if (INTER.conta) headers['x-conta-corrente'] = INTER.conta;
+    if (payload) headers['Content-Length'] = Buffer.byteLength(payload);
+    const r = https.request({ hostname: url.hostname, path: url.pathname + url.search, method, headers, agent: getInterAgent() }, (resp) => {
+      let data = '';
+      resp.on('data', c => data += c);
+      resp.on('end', () => {
+        let parsed; try { parsed = data ? JSON.parse(data) : {}; } catch { parsed = { raw: data }; }
+        if (resp.statusCode >= 200 && resp.statusCode < 300) resolve(parsed);
+        else reject(new Error(`Inter ${resp.statusCode}: ${JSON.stringify(parsed)}`));
+      });
+    });
+    r.on('error', reject);
+    if (payload) r.write(payload);
+    r.end();
+  });
+}
+let interTokenCache = { token: null, exp: 0 };
+async function interToken() {
+  const now = Date.now();
+  if (interTokenCache.token && interTokenCache.exp > now + 30000) return interTokenCache.token;
+  const r = await interHttp('POST', '/oauth/v2/token', { form: {
+    client_id: INTER.clientId, client_secret: INTER.clientSecret,
+    grant_type: 'client_credentials', scope: INTER_SCOPES
+  }});
+  interTokenCache = { token: r.access_token, exp: now + (Number(r.expires_in || 3600) * 1000) };
+  return r.access_token;
+}
+async function interCriarCob(txid, valor, solicitacao) {
+  const token = await interToken();
+  return interHttp('PUT', `/pix/v2/cob/${txid}`, { token, body: {
+    calendario: { expiracao: 3600 },
+    valor: { original: Number(valor).toFixed(2) },
+    chave: INTER.chave,
+    solicitacaoPagador: String(solicitacao || '').slice(0, 140)
+  }});
+}
+async function interConsultarCob(txid) {
+  const token = await interToken();
+  return interHttp('GET', `/pix/v2/cob/${txid}`, { token });
+}
+async function marcarPreInscricaoPaga(preId) {
+  const r = await pool.query(
+    `UPDATE pre_inscricoes SET status='pago', pago_em=NOW() WHERE id=$1 AND status='aguardando_pagamento' RETURNING id`,
+    [preId]);
+  return r.rows.length > 0;
+}
+
+// English Platform: cria/atualiza as solicitações de acesso (pendente) de todos os filhos do responsável.
+async function criarSolicitacoesEP(responsavelId, valor, ref) {
+  const v = (valor != null && !isNaN(valor)) ? valor : null;
+  const r = await pool.query(
+    `INSERT INTO english_platform_acesso (aluno_id, status, solicitado_por, pago_em, pagamento_ref, valor)
+     SELECT ar.aluno_id, 'pendente', $1, NOW(), $2, $3
+       FROM aluno_responsavel ar WHERE ar.responsavel_id = $1
+     ON CONFLICT (aluno_id) DO UPDATE SET
+       status = CASE WHEN english_platform_acesso.status = 'autorizado' THEN 'autorizado' ELSE 'pendente' END,
+       solicitado_por = EXCLUDED.solicitado_por,
+       pago_em = NOW(),
+       pagamento_ref = COALESCE(EXCLUDED.pagamento_ref, english_platform_acesso.pagamento_ref),
+       valor = COALESCE(EXCLUDED.valor, english_platform_acesso.valor),
+       atualizado_em = NOW()`,
+    [responsavelId, ref || null, v]);
+  return r.rowCount;
+}
+// Marca uma cobrança de credenciamento como paga e dispara as solicitações pendentes.
+async function marcarPagamentoEPPago(txid) {
+  const q = await pool.query(`SELECT * FROM english_platform_pagamentos WHERE txid = $1`, [txid]);
+  if (!q.rows.length) return false;
+  const pg = q.rows[0];
+  if (pg.status === 'CONCLUIDA') return true;
+  await pool.query(`UPDATE english_platform_pagamentos SET status='CONCLUIDA', pago_em=NOW() WHERE txid=$1`, [txid]);
+  if (pg.responsavel_id) await criarSolicitacoesEP(pg.responsavel_id, Number(pg.valor), 'PIX ' + txid);
+  return true;
+}
+
+// Gera (ou reaproveita) a cobrança PIX da taxa de uma pré-inscrição
+app.post('/publico/pre-inscricao/:id/pix', limiterPublico, async (req, res) => {
+  try {
+    if (!interConfigurado()) return res.status(503).json({ erro: 'Pagamento via PIX ainda não está configurado.' });
+    const q = await pool.query(`SELECT * FROM pre_inscricoes WHERE id = $1`, [req.params.id]);
+    if (!q.rows.length) return res.status(404).json({ erro: 'Pré-inscrição não encontrada.' });
+    const pre = q.rows[0];
+    if (['pago', 'efetivada'].includes(pre.status)) return res.status(409).json({ erro: 'Esta inscrição já foi paga.' });
+    const valor = Number(pre.valor_taxa);
+    if (!(valor > 0)) return res.status(400).json({ erro: 'Valor da taxa inválido para cobrança.' });
+
+    let txid = pre.mp_payment_id;
+    let copiaCola = pre.pix_copia_cola;
+    if (!txid || !copiaCola) {
+      txid = crypto.randomBytes(16).toString('hex'); // 32 caracteres alfanuméricos
+      const cob = await interCriarCob(txid, valor, `Taxa de matricula CEMIC ${pre.protocolo || ''}`.trim());
+      copiaCola = cob.pixCopiaECola;
+      await pool.query(`UPDATE pre_inscricoes SET mp_payment_id=$1, pix_copia_cola=$2 WHERE id=$3`, [txid, copiaCola, pre.id]);
+    }
+    res.json({ txid, copia_cola: copiaCola, valor, expiracao: 3600 });
+  } catch (e) { console.error('Erro gerar PIX Inter:', e); res.status(500).json({ erro: 'Não foi possível gerar o PIX agora. Tente novamente.' }); }
+});
+
+// Consulta de status (polling) — confirma na API do Inter antes de marcar pago
+app.get('/publico/pre-inscricao/:id/status', limiterPublico, async (req, res) => {
+  try {
+    const q = await pool.query(`SELECT id, protocolo, status, mp_payment_id FROM pre_inscricoes WHERE id = $1`, [req.params.id]);
+    if (!q.rows.length) return res.status(404).json({ erro: 'Pré-inscrição não encontrada.' });
+    const pre = q.rows[0];
+    if (['pago', 'efetivada'].includes(pre.status)) return res.json({ status: 'pago', protocolo: pre.protocolo });
+    if (interConfigurado() && pre.mp_payment_id) {
+      try {
+        const cob = await interConsultarCob(pre.mp_payment_id);
+        if (cob && cob.status === 'CONCLUIDA') { await marcarPreInscricaoPaga(pre.id); return res.json({ status: 'pago', protocolo: pre.protocolo }); }
+      } catch (e) { console.error('Status: erro consultar cob:', e.message); }
+    }
+    res.json({ status: pre.status });
+  } catch (e) { console.error('Erro status pré-inscrição:', e); res.status(500).json({ erro: 'Erro ao consultar o status.' }); }
+});
+
+// Webhook do Inter (sem rate limit; responde 200 rápido e confirma por consulta)
+app.post('/publico/pix/webhook', async (req, res) => {
+  try {
+    const corpo = req.body || {};
+    const lista = Array.isArray(corpo) ? corpo : (Array.isArray(corpo.pix) ? corpo.pix : []);
+    for (const p of lista) {
+      const txid = p && p.txid;
+      if (!txid) continue;
+      // Pré-inscrição
+      const q = await pool.query(`SELECT id, status FROM pre_inscricoes WHERE mp_payment_id = $1`, [txid]);
+      if (q.rows.length && !['pago', 'efetivada'].includes(q.rows[0].status)) {
+        try {
+          const cob = await interConsultarCob(txid);
+          if (cob && cob.status === 'CONCLUIDA') await marcarPreInscricaoPaga(q.rows[0].id);
+        } catch (e) { console.error('Webhook: erro consultar cob:', e.message); }
+      }
+    }
+  } catch (e) { console.error('Erro webhook Inter:', e); }
+  res.status(200).json({ ok: true });
+});
+
+// ===== English Platform — credenciamento via PIX (Mercado Pago) =====
+const MP = { token: process.env.MP_ACCESS_TOKEN || '', base: 'https://api.mercadopago.com' };
+const BACKEND_URL = process.env.BACKEND_URL || 'https://cemic-gestao-backend-production.up.railway.app';
+function mpConfigurado() { return !!MP.token; }
+async function mpCriarPix(valor, descricao, idem, externalRef) {
+  const r = await fetch(MP.base + '/v1/payments', {
+    method: 'POST',
+    headers: {
+      'Authorization': 'Bearer ' + MP.token,
+      'Content-Type': 'application/json',
+      'X-Idempotency-Key': idem
+    },
+    body: JSON.stringify({
+      transaction_amount: Number(valor),
+      description: String(descricao || '').slice(0, 255),
+      payment_method_id: 'pix',
+      payer: { email: (process.env.MP_PAYER_EMAIL || 'credenciamento@cemic.com.br'), first_name: 'Responsável', last_name: 'CEMIC' },
+      external_reference: externalRef || '',
+      // Notifica o webhook por pagamento (funciona mesmo sem configurar no painel, e roteia certo
+      // mesmo compartilhando a conta do Mercado Pago com o RedaCheck).
+      notification_url: BACKEND_URL + '/publico/mp/webhook'
+    })
+  });
+  const data = await r.json();
+  if (!r.ok) { console.error('MP criar erro:', data); throw new Error((data && data.message) || 'Erro ao criar o PIX no Mercado Pago'); }
+  return data;
+}
+async function mpConsultarPagamento(id) {
+  const r = await fetch(MP.base + '/v1/payments/' + id, { headers: { 'Authorization': 'Bearer ' + MP.token } });
+  const data = await r.json();
+  if (!r.ok) { console.error('MP consultar erro:', data); throw new Error('Erro ao consultar o pagamento no Mercado Pago'); }
+  return data;
+}
+
+// Cria (ou reaproveita) a cobrança PIX do credenciamento (R$35 × nº de filhos vinculados ao CPF)
+app.post('/publico/portal/english-platform/pix', autenticarResponsavel, async (req, res) => {
+  try {
+    if (!mpConfigurado()) return res.status(503).json({ erro: 'Pagamento via PIX ainda não está configurado.' });
+    const c = await pool.query(`SELECT COUNT(*)::int AS n FROM aluno_responsavel WHERE responsavel_id = $1`, [req.responsavelId]);
+    const n = c.rows[0].n;
+    if (!n) return res.status(400).json({ erro: 'Nenhum aluno vinculado a este CPF.' });
+    const valor = 35 * n;
+    // Reaproveita uma cobrança ATIVA de mesmo valor, para não gerar PIX duplicado
+    const ex = await pool.query(
+      `SELECT txid, copia_cola, valor FROM english_platform_pagamentos
+        WHERE responsavel_id = $1 AND status = 'ATIVA' ORDER BY criado_em DESC LIMIT 1`, [req.responsavelId]);
+    if (ex.rows.length && ex.rows[0].copia_cola && Number(ex.rows[0].valor) === valor) {
+      return res.json({ txid: ex.rows[0].txid, copia_cola: ex.rows[0].copia_cola, valor, alunos: n });
+    }
+    const idem = crypto.randomBytes(16).toString('hex');
+    const pay = await mpCriarPix(valor, `Credenciamento English Platform CEMIC (${n} aluno${n > 1 ? 's' : ''})`, idem, 'ep|' + req.responsavelId);
+    const pid = String(pay.id);
+    const td = (pay.point_of_interaction && pay.point_of_interaction.transaction_data) || {};
+    const copiaCola = td.qr_code || '';
+    const qrB64 = td.qr_code_base64 || '';
+    await pool.query(
+      `INSERT INTO english_platform_pagamentos (txid, responsavel_id, valor, copia_cola, status)
+       VALUES ($1,$2,$3,$4,'ATIVA')`, [pid, req.responsavelId, valor, copiaCola]);
+    res.json({ txid: pid, copia_cola: copiaCola, qr_base64: qrB64, valor, alunos: n });
+  } catch (e) { console.error('Erro gerar PIX EP (MP):', e); res.status(500).json({ erro: 'Não foi possível gerar o PIX agora. Tente novamente.' }); }
+});
+
+// Status do pagamento (polling). Ao confirmar (approved), cria as solicitações pendentes.
+app.get('/publico/portal/english-platform/pix/:txid/status', autenticarResponsavel, async (req, res) => {
+  try {
+    const txid = req.params.txid;
+    const q = await pool.query(`SELECT status FROM english_platform_pagamentos WHERE txid = $1 AND responsavel_id = $2`, [txid, req.responsavelId]);
+    if (!q.rows.length) return res.status(404).json({ erro: 'Cobrança não encontrada.' });
+    if (q.rows[0].status === 'CONCLUIDA') return res.json({ status: 'CONCLUIDA' });
+    if (mpConfigurado()) {
+      try {
+        const pay = await mpConsultarPagamento(txid);
+        if (pay && pay.status === 'approved') { await marcarPagamentoEPPago(txid); return res.json({ status: 'CONCLUIDA' }); }
+      } catch (e) { console.error('EP status MP:', e.message); }
+    }
+    res.json({ status: 'ATIVA' });
+  } catch (e) { console.error('Erro status PIX EP (MP):', e); res.status(500).json({ erro: 'Erro ao consultar o status.' }); }
+});
+
+// Webhook do Mercado Pago. Confirma consultando o pagamento; valida a assinatura se MP_WEBHOOK_SECRET estiver definida.
+app.post('/publico/mp/webhook', async (req, res) => {
+  try {
+    const q = req.query || {}, b = req.body || {};
+    const id = q['data.id'] || q.id || (b.data && b.data.id) || b['data.id'];
+    // Validação de assinatura (mesmo esquema do RedaCheck): manifest id;request-id;ts -> HMAC-SHA256
     const MP_SECRET = process.env.MP_WEBHOOK_SECRET;
     if (MP_SECRET) {
       const xSig = req.headers['x-signature'] || '';
       const xReqId = req.headers['x-request-id'] || '';
-      const dataId = req.query['data.id'] || req.body?.data?.id || '';
-      const ts = (xSig.match(/ts=([^,]+)/) || [])[1] || '';
-      const sigRec = (xSig.match(/v1=([a-f0-9]+)/) || [])[1] || '';
+      const ts = (String(xSig).match(/ts=([^,]+)/) || [])[1] || '';
+      const sigRec = (String(xSig).match(/v1=([a-f0-9]+)/) || [])[1] || '';
       if (sigRec) {
-        const crypto = require('crypto');
-        const manifest = `id:${dataId};request-id:${xReqId};ts:${ts}`;
+        const manifest = `id:${id};request-id:${xReqId};ts:${ts}`;
         const sigEsp = crypto.createHmac('sha256', MP_SECRET).update(manifest).digest('hex');
-        if (sigRec !== sigEsp) { console.warn('[webhook] Assinatura inválida'); return res.sendStatus(200); }
+        if (sigRec !== sigEsp) { console.warn('[webhook MP] Assinatura inválida'); return res.sendStatus(200); }
       }
     }
-
-    const { type, data } = req.body;
-    if (type !== 'payment') return res.sendStatus(200);
-
-    const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN;
-    const pagResp = await fetch(`https://api.mercadopago.com/v1/payments/${data.id}`, {
-      headers: { 'Authorization': `Bearer ${MP_ACCESS_TOKEN}` }
-    });
-    const pagamento = await pagResp.json();
-
-    if (pagamento.status !== 'approved') return res.sendStatus(200);
-
-    const [usuarioId, pacote, avaliacoes] = (pagamento.external_reference || '').split('|');
-    if (!usuarioId) return res.sendStatus(200);
-    const qtd = parseInt(avaliacoes) || 0;
-
-    // ── Idempotência: verificar se payment_id já foi processado ──────
-    const jaProcessado = await pool.query(
-      `SELECT id FROM pagamentos WHERE payment_id = $1 AND status = 'aprovado'`,
-      [String(data.id)]
-    );
-    if (jaProcessado.rows.length > 0) {
-      console.log('[webhook] Já processado, ignorando:', data.id);
-      return res.sendStatus(200);
-    }
-
-    // ── v9.2 FIX: log antes do crédito para rastreabilidade ──────────
-    console.log(`[webhook] Creditando ${qtd} avaliações → usuario_id=${usuarioId} payment_id=${data.id} pacote=${pacote}`);
-
-    // ── Credita avaliacoes_disponiveis ────────────────────────────────
-    await pool.query(
-      `UPDATE usuarios SET avaliacoes_disponiveis = COALESCE(avaliacoes_disponiveis,0) + $1, updated_at = NOW() WHERE id = $2`,
-      [qtd, usuarioId]
-    );
-
-    console.log(`[webhook] Crédito OK → usuario_id=${usuarioId} +${qtd} avaliações`);
-    await log(usuarioId, null, 'credito', 'ok', { origem: 'webhook_pix', payment_id: String(data.id), pacote, qtd });
-
-    // ── v9.2 FIX: UPDATE por payment_id OU preferencia_id ────────────
-    // Pix nativo não tem preferencia_id — a versão anterior falhava silenciosamente
-    await pool.query(
-      `UPDATE pagamentos
-       SET status = 'aprovado', payment_id = $1, updated_at = NOW()
-       WHERE usuario_id = $3
-         AND status = 'pendente'
-         AND (preferencia_id = $2 OR payment_id = $1)`,
-      [String(data.id), pagamento.preference_id || '', usuarioId]
-    ).catch(e => console.error('[webhook] Erro ao atualizar pagamento:', e.message));
-
-    console.log(`[webhook] Aprovado: usuário ${usuarioId}, +${qtd} avaliações, payment_id=${data.id}`);
-
-    // ── E-mail de confirmação ─────────────────────────────────────────
-    try {
-      const uRes = await pool.query(
-        `SELECT nome, email, COALESCE(avaliacoes_disponiveis, 0) AS saldo_atual
-         FROM usuarios WHERE id = $1`,
-        [usuarioId]
-      );
-      if (uRes.rows.length > 0) {
-        const u = uRes.rows[0];
-        const primeiroNome = u.nome.split(' ')[0];
-        const nomePacote = {
-          avulso: '1 avaliação',
-          basico: 'Pacote Básico — 5 avaliações',
-          intermediario: 'Pacote Intermediário — 10 avaliações',
-          avancado: 'Pacote Avançado — 20 avaliações'
-        }[pacote] || `${qtd} avaliação(ões)`;
-        const valor = pagamento.transaction_amount
-          ? `R$ ${Number(pagamento.transaction_amount).toFixed(2).replace('.', ',')}`
-          : '';
-        const ano = new Date().getFullYear();
-        await enviarEmail(u.email, 'RedaCheck — Pagamento confirmado! ✅', `
-          <div style="font-family:-apple-system,sans-serif;max-width:480px;margin:0 auto;padding:32px 24px;background:#FAF9F7">
-            <div style="text-align:center;margin-bottom:24px">
-              <span style="font-size:22px;font-weight:700;letter-spacing:3px;color:#1A1A1A">REDA<span style="color:#C96A3A">CHECK</span></span>
-              <div style="font-size:10px;color:#9B9080;letter-spacing:1.5px;margin-top:4px">MAIS QUE CORRIGIR — APERFEIÇOAR</div>
-            </div>
-            <h2 style="font-size:20px;color:#1A1A1A;margin-bottom:8px">Pagamento confirmado, ${primeiroNome}! 🎉</h2>
-            <p style="font-size:14px;color:#6B6255;line-height:1.7;margin-bottom:20px">
-              Seu pagamento foi aprovado e suas avaliações já estão disponíveis na plataforma.
-            </p>
-            <div style="background:#1A1A1A;border-radius:16px;padding:24px;margin-bottom:20px">
-              <div style="font-size:11px;color:rgba(255,255,255,0.5);text-transform:uppercase;letter-spacing:1px;margin-bottom:12px">Resumo do pedido</div>
-              <div style="display:flex;justify-content:space-between;margin-bottom:8px">
-                <span style="font-size:13px;color:rgba(255,255,255,0.7)">Pacote</span>
-                <span style="font-size:13px;color:#FAF9F7;font-weight:600">${nomePacote}</span>
-              </div>
-              ${valor ? `<div style="display:flex;justify-content:space-between;margin-bottom:8px">
-                <span style="font-size:13px;color:rgba(255,255,255,0.7)">Valor pago</span>
-                <span style="font-size:13px;color:#FAF9F7;font-weight:600">${valor}</span>
-              </div>` : ''}
-              <div style="border-top:1px solid rgba(255,255,255,0.1);margin-top:12px;padding-top:12px;display:flex;justify-content:space-between">
-                <span style="font-size:13px;color:rgba(255,255,255,0.7)">Saldo atual</span>
-                <span style="font-size:16px;color:#C96A3A;font-weight:700">${u.saldo_atual} avaliação(ões)</span>
-              </div>
-            </div>
-            <a href="https://redacheck.com.br" style="display:block;background:#C96A3A;color:white;text-decoration:none;text-align:center;padding:14px;border-radius:12px;font-size:15px;font-weight:600;margin-bottom:20px">
-              Acessar o RedaCheck →
-            </a>
-            <p style="font-size:12px;color:#9B9080;line-height:1.6;text-align:center">
-              Dúvidas? Entre em contato: contato@redacheck.com.br
-            </p>
-            <div style="border-top:1px solid #E5E0D8;margin-top:24px;padding-top:16px;text-align:center">
-              <span style="font-size:11px;color:#9B9080">© ${ano} RedaCheck — redacheck.com.br</span>
-            </div>
-          </div>
-        `);
-        console.log(`[webhook] E-mail de confirmação enviado para: ${u.email}`);
+    const tipo = q.type || q.topic || b.type || b.topic;
+    const ehPagamento = tipo === 'payment' || (b.action && String(b.action).startsWith('payment'));
+    if (id && ehPagamento && mpConfigurado()) {
+      const ex = await pool.query(`SELECT txid FROM english_platform_pagamentos WHERE txid = $1 AND status <> 'CONCLUIDA'`, [String(id)]);
+      if (ex.rows.length) {
+        const pay = await mpConsultarPagamento(String(id));
+        if (pay && pay.status === 'approved') await marcarPagamentoEPPago(String(id));
       }
-    } catch (emailErr) {
-      console.error('[webhook] Falha ao enviar e-mail de confirmação:', emailErr.message);
     }
-
-    res.sendStatus(200);
-  } catch (err) {
-    console.error('[webhook]', err.message);
-    res.sendStatus(200);
-  }
+  } catch (e) { console.error('Erro webhook MP:', e); }
+  res.status(200).json({ ok: true });
 });
 
-app.post('/pagamento/criar-brick', async (req, res) => {
+// Registro do webhook no Inter (operação única, feita pelo master)
+app.post('/admin/inter/webhook', autenticar, exigirPerfil('master'), async (req, res) => {
   try {
-    const { pacote, usuarioId, email } = req.body;
-    if (!pacote || !usuarioId || !email) return res.status(400).json({ erro: 'Dados incompletos.' });
-    // Segurança: verificar desconto no banco, não confiar no frontend
-    const uCheck = await pool.query('SELECT desconto_professor FROM usuarios WHERE id = $1', [usuarioId]);
-    const professor = uCheck.rows[0]?.desconto_professor === true;
-    const tabela = professor ? PACOTES_PROFESSOR : PACOTES;
-    const item = tabela[pacote];
-    if (!item) return res.status(400).json({ erro: 'Pacote inválido.' });
-    const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN;
-    if (!MP_ACCESS_TOKEN) return res.status(500).json({ erro: 'Pagamento não configurado.' });
+    if (!interConfigurado()) return res.status(503).json({ erro: 'Inter não configurado.' });
+    const url = String(req.body.url || '').trim();
+    if (!/^https:\/\//.test(url)) return res.status(400).json({ erro: 'Informe a URL HTTPS do webhook.' });
+    const token = await interToken();
+    await interHttp('PUT', `/pix/v2/webhook/${encodeURIComponent(INTER.chave)}`, { token, body: { webhookUrl: url } });
+    res.json({ mensagem: 'Webhook registrado no Inter.', url });
+  } catch (e) { console.error('Erro registrar webhook Inter:', e); res.status(500).json({ erro: 'Erro ao registrar webhook: ' + e.message }); }
+});
 
-    const preferencia = {
-      items: [{
-        id: pacote,
-        title: `RedaCheck — ${item.descricao}`,
-        description: `${item.qtd} avaliação(ões) de redação`,
-        quantity: 1, currency_id: 'BRL', unit_price: item.valor
-      }],
-      payer: { email },
-      payment_methods: {
-        excluded_payment_types: [
-          { id: 'ticket' },
-          { id: 'atm' },
-          { id: 'prepaid_card' }
-        ],
-        excluded_payment_methods: [],
-        installments: 1
-      },
-      back_urls: {
-        success: 'https://redacheck.com.br/?pagamento=sucesso',
-        failure: 'https://redacheck.com.br/?pagamento=falhou',
-        pending: 'https://redacheck.com.br/?pagamento=pendente'
-      },
-      auto_return: 'approved',
-      external_reference: `${usuarioId}|${pacote}|${item.qtd}`,
-      notification_url: 'https://redacheck-backend-production-25c3.up.railway.app/pagamento/webhook',
-      statement_descriptor: 'REDACHECK'
-    };
+app.use(express.static(PASTA_PUBLIC));
+app.get('/', (req, res) => {
+  const arquivo = path.join(PASTA_PUBLIC, 'index.html');
+  if (fs.existsSync(arquivo)) return res.sendFile(arquivo);
+  res.status(200).send('CEMIC Gestão — backend no ar. Adicione o index.html na pasta /public do repositório para servir o sistema por aqui.');
+});
 
-    const resp = await fetch('https://api.mercadopago.com/checkout/preferences', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${MP_ACCESS_TOKEN}` },
-      body: JSON.stringify(preferencia)
-    });
-    const data = await resp.json();
-    if (data.error) return res.status(500).json({ erro: data.message || 'Erro ao criar pagamento.' });
-
-    await pool.query(
-      `INSERT INTO pagamentos (usuario_id, pacote, avaliacoes, valor, status, preferencia_id, created_at)
-       VALUES ($1,$2,$3,$4,'pendente',$5,NOW()) ON CONFLICT DO NOTHING`,
-      [usuarioId, pacote, item.qtd, item.valor, data.id]
-    ).catch(() => {});
-
+// ============================================================
+// 12. SAÚDE E INICIALIZAÇÃO
+// ============================================================
+app.get('/health', async (req, res) => {
+  try {
+    await pool.query('SELECT 1');
     res.json({
-      ok: true,
-      preference_id: data.id,
-      public_key: process.env.MP_PUBLIC_KEY || ''
+      status: (erroInicializacao || falhasMigracao.length) ? 'degradado' : 'ok',
+      sistema: 'CEMIC Gestão',
+      versao: '3.49 (English Platform — CORS explícito + preflight)',
+      inicializacao: erroInicializacao || 'ok',
+      migracoes_com_falha: falhasMigracao
     });
-  } catch (err) {
-    console.error('[/pagamento/criar-brick]', err.message);
-    res.status(500).json({ erro: 'Erro ao processar pagamento.' });
+  } catch {
+    res.status(500).json({ status: 'erro', detalhe: 'Banco de dados inacessível.' });
   }
 });
 
-app.post('/pagamento/processar', async (req, res) => {
-  try {
-    const { token, payment_method_id, payer, transaction_amount,
-            installments, issuer_id, usuarioId, pacote, professor,
-            payment_type } = req.body;
-
-    const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN;
-    if (!MP_ACCESS_TOKEN) return res.status(500).json({ erro: 'Pagamento não configurado.' });
-
-    // Segurança: verificar desconto no banco, não confiar no frontend
-    const uCheckProc = await pool.query('SELECT desconto_professor FROM usuarios WHERE id = $1', [usuarioId]);
-    const professorVerificado = uCheckProc.rows[0]?.desconto_professor === true;
-    const tabela = professorVerificado ? PACOTES_PROFESSOR : PACOTES;
-    const item = tabela[pacote];
-    if (!item) return res.status(400).json({ erro: 'Pacote inválido.' });
-
-    const pagBody = {
-      transaction_amount: item.valor,
-      token,
-      payment_method_id,
-      installments: installments || 1,
-      issuer_id,
-      payer,
-      external_reference: `${usuarioId}|${pacote}|${item.qtd}`,
-      notification_url: 'https://redacheck-backend-production-25c3.up.railway.app/pagamento/webhook',
-      statement_descriptor: 'REDACHECK',
-      additional_info: {
-        items: [{
-          id: pacote,
-          title: `RedaCheck — ${item.descricao}`,
-          quantity: 1,
-          unit_price: item.valor
-        }]
-      }
-    };
-
-    const mpResp = await fetch('https://api.mercadopago.com/v1/payments', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${MP_ACCESS_TOKEN}`,
-        'X-Idempotency-Key': `rc-${usuarioId}-${pacote}-${Date.now()}`
-      },
-      body: JSON.stringify(pagBody)
-    });
-    const pagamento = await mpResp.json();
-
-    console.log(`[/processar] status=${pagamento.status} id=${pagamento.id} usuario=${usuarioId}`);
-    await log(usuarioId, payer?.email || null, 'cartao_processado', pagamento.status === 'approved' ? 'ok' : 'pendente', { payment_id: pagamento.id, status: pagamento.status, pacote, valor: item.valor });
-
-    if (pagamento.status === 'approved') {
-      await pool.query(
-        `UPDATE usuarios SET avaliacoes_disponiveis = COALESCE(avaliacoes_disponiveis,0) + $1, updated_at = NOW() WHERE id = $2`,
-        [item.qtd, usuarioId]
-      );
-
-      await pool.query(
-        `INSERT INTO pagamentos (usuario_id, pacote, avaliacoes, valor, status, payment_id, created_at, updated_at)
-         VALUES ($1,$2,$3,$4,'aprovado',$5,NOW(),NOW()) ON CONFLICT DO NOTHING`,
-        [usuarioId, pacote, item.qtd, item.valor, String(pagamento.id)]
-      ).catch(() => {});
-
-      const saldoRes = await pool.query(
-        'SELECT avaliacoes_disponiveis, nome, email FROM usuarios WHERE id = $1',
-        [usuarioId]
-      );
-      const u = saldoRes.rows[0];
-      await log(usuarioId, u?.email || null, 'credito', 'ok', { origem: 'cartao', payment_id: String(pagamento.id), pacote, qtd: item.qtd, saldo_depois: u?.avaliacoes_disponiveis || 0 });
-
-      if (u) {
-        try {
-          const primeiroNome = u.nome.split(' ')[0];
-          const nomePacote = { avulso:'1 avaliação', basico:'Pacote Básico — 5 avaliações',
-            intermediario:'Pacote Intermediário — 10 avaliações', avancado:'Pacote Avançado — 20 avaliações'
-          }[pacote] || `${item.qtd} avaliação(ões)`;
-          const ano = new Date().getFullYear();
-          await enviarEmail(u.email, 'RedaCheck — Pagamento confirmado! ✅', `
-            <div style="font-family:-apple-system,sans-serif;max-width:480px;margin:0 auto;padding:32px 24px;background:#FAF9F7">
-              <div style="text-align:center;margin-bottom:24px">
-                <span style="font-size:22px;font-weight:700;letter-spacing:3px;color:#1A1A1A">REDA<span style="color:#C96A3A">CHECK</span></span>
-                <div style="font-size:10px;color:#9B9080;letter-spacing:1.5px;margin-top:4px">MAIS QUE CORRIGIR — APERFEIÇOAR</div>
-              </div>
-              <h2 style="font-size:20px;color:#1A1A1A;margin-bottom:8px">Pagamento confirmado, ${primeiroNome}! 🎉</h2>
-              <p style="font-size:14px;color:#6B6255;line-height:1.7;margin-bottom:20px">Seu pagamento foi aprovado e suas avaliações já estão disponíveis.</p>
-              <div style="background:#1A1A1A;border-radius:16px;padding:24px;margin-bottom:20px">
-                <div style="font-size:11px;color:rgba(255,255,255,0.5);text-transform:uppercase;letter-spacing:1px;margin-bottom:12px">Resumo do pedido</div>
-                <div style="display:flex;justify-content:space-between;margin-bottom:8px">
-                  <span style="font-size:13px;color:rgba(255,255,255,0.7)">Pacote</span>
-                  <span style="font-size:13px;color:#FAF9F7;font-weight:600">${nomePacote}</span>
-                </div>
-                <div style="display:flex;justify-content:space-between;margin-bottom:8px">
-                  <span style="font-size:13px;color:rgba(255,255,255,0.7)">Valor pago</span>
-                  <span style="font-size:13px;color:#FAF9F7;font-weight:600">R$ ${item.valor.toFixed(2).replace('.',',')}</span>
-                </div>
-                <div style="border-top:1px solid rgba(255,255,255,0.1);margin-top:12px;padding-top:12px;display:flex;justify-content:space-between">
-                  <span style="font-size:13px;color:rgba(255,255,255,0.7)">Saldo atual</span>
-                  <span style="font-size:16px;color:#C96A3A;font-weight:700">${u.avaliacoes_disponiveis} avaliação(ões)</span>
-                </div>
-              </div>
-              <a href="https://redacheck.com.br" style="display:block;background:#C96A3A;color:white;text-decoration:none;text-align:center;padding:14px;border-radius:12px;font-size:15px;font-weight:600;margin-bottom:20px">Acessar o RedaCheck →</a>
-              <div style="border-top:1px solid #E5E0D8;margin-top:24px;padding-top:16px;text-align:center">
-                <span style="font-size:11px;color:#9B9080">© ${ano} RedaCheck — redacheck.com.br</span>
-              </div>
-            </div>
-          `);
-        } catch(emailErr) {
-          console.error('[processar] e-mail:', emailErr.message);
-        }
-      }
-
-      return res.json({
-        status: 'approved',
-        avaliacoes_disponiveis: u?.avaliacoes_disponiveis || 0
-      });
-    }
-
-    res.json({ status: pagamento.status, status_detail: pagamento.status_detail });
-
-  } catch (err) {
-    console.error('[/pagamento/processar]', err.message);
-    res.status(500).json({ erro: 'Erro ao processar pagamento.' });
-  }
-});
-
-// ── PAGAMENTO PIX NATIVO — v9.2 com log de rastreabilidade ───────────
-app.post('/pagamento/pix', async (req, res) => {
-  try {
-    const { pacote, usuarioId, email } = req.body;
-    if (!pacote || !usuarioId || !email) return res.status(400).json({ erro: 'Dados incompletos.' });
-    // Segurança: verificar desconto no banco, não confiar no frontend
-    const uCheck = await pool.query('SELECT desconto_professor FROM usuarios WHERE id = $1', [usuarioId]);
-    const professor = uCheck.rows[0]?.desconto_professor === true;
-    const tabela = professor ? PACOTES_PROFESSOR : PACOTES;
-    const item = tabela[pacote];
-    if (!item) return res.status(400).json({ erro: 'Pacote inválido.' });
-    const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN;
-    if (!MP_ACCESS_TOKEN) return res.status(500).json({ erro: 'Pagamento não configurado.' });
-
-    const pagBody = {
-      transaction_amount: item.valor,
-      description: `RedaCheck — ${item.descricao}`,
-      payment_method_id: 'pix',
-      payer: { email, first_name: 'Usuário', last_name: 'RedaCheck' },
-      external_reference: `${usuarioId}|${pacote}|${item.qtd}`,
-      notification_url: 'https://redacheck-backend-production-25c3.up.railway.app/pagamento/webhook'
-    };
-
-    const mpResp = await fetch('https://api.mercadopago.com/v1/payments', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${MP_ACCESS_TOKEN}`,
-        'X-Idempotency-Key': `pix-${usuarioId}-${pacote}-${Date.now()}`
-      },
-      body: JSON.stringify(pagBody)
-    });
-    const pag = await mpResp.json();
-
-    if (pag.error || !pag.point_of_interaction?.transaction_data) {
-      console.error('[/pix] Erro MP:', JSON.stringify(pag));
-      return res.status(500).json({ erro: pag.message || 'Erro ao gerar Pix.' });
-    }
-
-    const pixData = pag.point_of_interaction.transaction_data;
-
-    // Registrar pagamento pendente com payment_id (Pix não usa preferencia_id)
-    await pool.query(
-      `INSERT INTO pagamentos (usuario_id, pacote, avaliacoes, valor, status, payment_id, created_at, updated_at)
-       VALUES ($1,$2,$3,$4,'pendente',$5,NOW(),NOW()) ON CONFLICT DO NOTHING`,
-      [usuarioId, pacote, item.qtd, item.valor, String(pag.id)]
-    ).catch(e => console.error('[/pix] Erro ao registrar pagamento:', e.message));
-
-    // v9.2: log completo para rastreabilidade
-    console.log(`[/pix] Gerado: payment_id=${pag.id} usuario_id=${usuarioId} pacote=${pacote} valor=${item.valor} external_ref=${usuarioId}|${pacote}|${item.qtd}`);
-    await log(usuarioId, email, 'pix_gerado', 'ok', { payment_id: pag.id, pacote, valor: item.valor, avaliacoes: item.qtd });
-
-    res.json({
-      ok: true,
-      payment_id: pag.id,
-      qr_code: pixData.qr_code,
-      qr_code_base64: pixData.qr_code_base64,
-      valor: item.valor,
-      descricao: item.descricao,
-      expira_em: 30
-    });
-  } catch (err) {
-    console.error('[/pagamento/pix]', err.message);
-    res.status(500).json({ erro: 'Erro ao gerar pagamento Pix.' });
-  }
-});
-
-app.post('/pagamento/reprocessar', async (req, res) => {
-  try {
-    const { payment_id, usuarioId } = req.body;
-    if (!payment_id || !usuarioId) return res.status(400).json({ erro: 'Dados incompletos.' });
-    const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN;
-
-    const mpResp = await fetch(`https://api.mercadopago.com/v1/payments/${payment_id}`, {
-      headers: { 'Authorization': `Bearer ${MP_ACCESS_TOKEN}` }
-    });
-    const pag = await mpResp.json();
-
-    if (pag.status !== 'approved')
-      return res.json({ ok: false, status: pag.status, mensagem: 'Pagamento ainda não aprovado.' });
-
-    const jaProcessado = await pool.query(
-      `SELECT id FROM pagamentos WHERE payment_id = $1 AND status = 'aprovado'`,
-      [String(payment_id)]
-    );
-    if (jaProcessado.rows.length > 0)
-      return res.json({ ok: true, jaProcessado: true, mensagem: 'Pagamento já havia sido creditado.' });
-
-    const pagPendente = await pool.query(
-      `SELECT avaliacoes FROM pagamentos WHERE payment_id = $1 OR (usuario_id = $2 AND status = 'pendente') ORDER BY created_at DESC LIMIT 1`,
-      [String(payment_id), usuarioId]
-    );
-
-    const qtd = pagPendente.rows[0]?.avaliacoes || 1;
-
-    await pool.query(
-      `UPDATE usuarios SET avaliacoes_disponiveis = COALESCE(avaliacoes_disponiveis,0) + $1, updated_at = NOW() WHERE id = $2`,
-      [qtd, usuarioId]
-    );
-
-    await pool.query(
-      `UPDATE pagamentos SET status='aprovado', payment_id=$1, updated_at=NOW()
-       WHERE usuario_id=$2 AND status='pendente' ORDER BY created_at DESC LIMIT 1`,
-      [String(payment_id), usuarioId]
-    ).catch(() => {});
-
-    const saldo = await pool.query('SELECT avaliacoes_disponiveis FROM usuarios WHERE id = $1', [usuarioId]);
-
-    console.log(`[reprocessar] Creditado: usuario=${usuarioId}, +${qtd}, payment=${payment_id}`);
-    await log(usuarioId, null, 'credito', 'ok', { origem: 'reprocessar', payment_id: String(payment_id), qtd, saldo_depois: saldo.rows[0]?.avaliacoes_disponiveis || 0 });
-    res.json({
-      ok: true,
-      mensagem: `${qtd} avaliação(ões) creditada(s) com sucesso.`,
-      avaliacoes_disponiveis: saldo.rows[0]?.avaliacoes_disponiveis || 0
-    });
-
-  } catch (err) {
-    console.error('[/pagamento/reprocessar]', err.message);
-    res.status(500).json({ erro: 'Erro ao reprocessar.' });
-  }
-});
-
-app.get('/pagamento/status/:payment_id', async (req, res) => {
-  try {
-    const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN;
-    const mpResp = await fetch(`https://api.mercadopago.com/v1/payments/${req.params.payment_id}`, {
-      headers: { 'Authorization': `Bearer ${MP_ACCESS_TOKEN}` }
-    });
-    const pag = await mpResp.json();
-    res.json({ status: pag.status, status_detail: pag.status_detail });
-  } catch (err) {
-    res.status(500).json({ erro: 'Erro ao verificar status.' });
-  }
-});
-
-app.get('/pagamento/verificar/:payment_id', async (req, res) => {
-  try {
-    const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN;
-    const resp = await fetch(`https://api.mercadopago.com/v1/payments/${req.params.payment_id}`, {
-      headers: { 'Authorization': `Bearer ${MP_ACCESS_TOKEN}` }
-    });
-    const data = await resp.json();
-    res.json({ status: data.status, valor: data.transaction_amount });
-  } catch (err) {
-    res.status(500).json({ erro: 'Erro ao verificar pagamento.' });
-  }
-});
-
-app.get('/pacotes', (req, res) => {
-  res.json({ pacotes: PACOTES, pacotes_professor: PACOTES_PROFESSOR });
-});
-
-// ── ROTAS MASTER ADICIONAIS ──────────────────────────────────────────
-
-app.get('/master/usuarios', async (req, res) => {
-  const token = req.headers['x-master-token'];
-  if (token !== MASTER_TOKEN) return res.status(401).json({ erro: 'Acesso não autorizado.' });
-  try {
-    const result = await pool.query(
-      `SELECT id, nome, email, codigo, banca, plano, confirmado, professor,
-              avaliacoes_disponiveis, total_indicacoes, total_redacoes,
-              whatsapp, desconto_professor, created_at,
-              COALESCE(escola, '') as tipo_instituicao,
-              professor, desconto_professor
-       FROM usuarios ORDER BY created_at DESC LIMIT 500`
-    );
-    res.json({ usuarios: result.rows });
-  } catch (err) {
-    res.status(500).json({ erro: err.message });
-  }
-});
-
-app.get('/master/pagamentos', async (req, res) => {
-  const token = req.headers['x-master-token'];
-  if (token !== MASTER_TOKEN) return res.status(401).json({ erro: 'Acesso não autorizado.' });
-  try {
-    const result = await pool.query(
-      `SELECT p.*, u.nome as usuario_nome, u.email as usuario_email,
-              COALESCE(u.escola, '') as tipo_instituicao
-       FROM pagamentos p
-       LEFT JOIN usuarios u ON u.id = p.usuario_id
-       ORDER BY p.created_at DESC LIMIT 1000`
-    );
-    res.json({ pagamentos: result.rows });
-  } catch (err) {
-    res.status(500).json({ erro: err.message });
-  }
-});
-
-app.post('/master/usuario/confirmar', async (req, res) => {
-  const token = req.headers['x-master-token'];
-  if (token !== MASTER_TOKEN) return res.status(401).json({ erro: 'Acesso não autorizado.' });
-  try {
-    const { email, nova_senha } = req.body;
-    if (!email) return res.status(400).json({ erro: 'E-mail obrigatório.' });
-    const result = await pool.query('SELECT id, nome, confirmado FROM usuarios WHERE email = $1', [email.toLowerCase()]);
-    if (!result.rows.length) return res.status(404).json({ erro: 'Usuário não encontrado.' });
-    const u = result.rows[0];
-    if (nova_senha && nova_senha.length >= 6) {
-      const hash = await bcrypt.hash(nova_senha, SALT_ROUNDS);
-      await pool.query(
-        `UPDATE usuarios SET confirmado=TRUE, senha_hash=$1, codigo_confirmacao=NULL, codigo_expira=NULL,
-         avaliacoes_disponiveis=CASE WHEN confirmado=FALSE THEN COALESCE(avaliacoes_disponiveis,0)+1
-         ELSE COALESCE(avaliacoes_disponiveis,0) END, updated_at=NOW() WHERE email=$2`,
-        [hash, email.toLowerCase()]
-      );
-      if (!u.confirmado) await log(u.id, email, 'credito', 'ok', { origem: 'master_confirmacao', qtd: 1 });
-      await log(u.id, email, 'master_confirmar', 'ok', { nova_senha: true });
-      res.json({ ok: true, mensagem: `Conta de ${u.nome} confirmada e senha redefinida com sucesso.` });
-    } else {
-      await pool.query(
-        `UPDATE usuarios SET confirmado=TRUE, codigo_confirmacao=NULL, codigo_expira=NULL,
-         avaliacoes_disponiveis=CASE WHEN confirmado=FALSE THEN COALESCE(avaliacoes_disponiveis,0)+1
-         ELSE COALESCE(avaliacoes_disponiveis,0) END, updated_at=NOW() WHERE email=$1`,
-        [email.toLowerCase()]
-      );
-      if (!u.confirmado) await log(u.id, email, 'credito', 'ok', { origem: 'master_confirmacao', qtd: 1 });
-      await log(u.id, email, 'master_confirmar', 'ok', { nova_senha: false });
-      res.json({ ok: true, mensagem: `Conta de ${u.nome} confirmada com sucesso.` });
-    }
-  } catch (err) {
-    console.error('[master/confirmar]', err.message);
-    res.status(500).json({ erro: err.message });
-  }
-});
-
-app.get('/extrato/:id', async (req, res) => {
-  try {
-    const { id } = req.params;
-    const [pagamentos, avaliacoes] = await Promise.all([
-      pool.query(
-        `SELECT pacote, avaliacoes, valor, status, created_at
-         FROM pagamentos
-         WHERE usuario_id = $1 AND status = 'aprovado'
-         ORDER BY created_at DESC LIMIT 50`,
-        [id]
-      ),
-      pool.query(
-        `SELECT banca, nota_geral, created_at
-         FROM avaliacoes
-         WHERE usuario_id = $1
-         ORDER BY created_at DESC LIMIT 100`,
-        [id]
-      )
-    ]);
-    res.json({
-      pagamentos: pagamentos.rows,
-      avaliacoes: avaliacoes.rows
-    });
-  } catch(err) {
-    res.status(500).json({ erro: 'Erro ao buscar extrato.' });
-  }
-});
-
-app.get('/saldo/:id', async (req, res) => {
-  try {
-    const result = await pool.query(
-      'SELECT avaliacoes_disponiveis, total_indicacoes, saldo, total_redacoes FROM usuarios WHERE id = $1',
-      [req.params.id]
-    );
-    if (!result.rows.length) return res.status(404).json({ erro: 'Usuário não encontrado.' });
-    res.json(result.rows[0]);
-  } catch (err) {
-    res.status(500).json({ erro: 'Erro ao buscar saldo.' });
-  }
-});
-
-
-// ── TRILHA DE EVOLUÇÃO DO USUÁRIO ────────────────────────────────────
-// Retorna série histórica de notas por competência para plotagem
-app.get('/evolucao/:usuarioId', async (req, res) => {
-  try {
-    const { usuarioId } = req.params;
-    const { banca } = req.query; // opcional — filtra por banca
-
-    // Concurso agrupa CONCURSO_PUBLICO + CEBRASPE + UNB
-    const bancasGrupoConcurso = ['CONCURSO_PUBLICO', 'CEBRASPE', 'UNB'];
-    const isConcursoGrupo = banca === 'CONCURSO';
-
-    const query = isConcursoGrupo
-      ? `SELECT id, banca, nota_geral, resultado, created_at
-         FROM avaliacoes
-         WHERE usuario_id = $1 AND banca = ANY($2)
-         ORDER BY created_at ASC
-         LIMIT 100`
-      : banca
-      ? `SELECT id, banca, nota_geral, resultado, created_at
-         FROM avaliacoes
-         WHERE usuario_id = $1 AND banca = $2
-         ORDER BY created_at ASC
-         LIMIT 100`
-      : `SELECT id, banca, nota_geral, resultado, created_at
-         FROM avaliacoes
-         WHERE usuario_id = $1
-         ORDER BY created_at ASC
-         LIMIT 100`;
-
-    const params = isConcursoGrupo ? [usuarioId, bancasGrupoConcurso]
-      : banca ? [usuarioId, banca.toUpperCase()] : [usuarioId];
-    const result = await pool.query(query, params);
-
-    if (!result.rows.length) {
-      return res.json({
-        total: 0, serie: [], competencias: {}, resumo: null
-      });
-    }
-
-    // ── Montar série histórica ──────────────────────────────────────
-    const serie = result.rows.map((row, idx) => {
-      const res_json = typeof row.resultado === 'string'
-        ? JSON.parse(row.resultado) : row.resultado || {};
-      const competencias = {};
-      if (Array.isArray(res_json.competencias)) {
-        res_json.competencias.forEach(c => {
-          competencias[c.codigo] = c.nota;
-        });
-      }
-      return {
-        numero: idx + 1,
-        id: row.id,
-        banca: row.banca,
-        nota_geral: row.nota_geral || 0,
-        competencias,
-        data: row.created_at
-      };
-    });
-
-    // ── Calcular médias por competência ─────────────────────────────
-    const totais = {};
-    const contagens = {};
-    serie.forEach(s => {
-      Object.entries(s.competencias).forEach(([cod, nota]) => {
-        totais[cod] = (totais[cod] || 0) + nota;
-        contagens[cod] = (contagens[cod] || 0) + 1;
-      });
-    });
-    const medias = {};
-    Object.keys(totais).forEach(cod => {
-      medias[cod] = Math.round(totais[cod] / contagens[cod]);
-    });
-
-    // ── Tendência por competência (a partir de 2 avaliações) ─────────
-    const tendencias = {};
-    if (serie.length >= 2) {
-      if (serie.length >= 4) {
-        // Com 4+ avaliações: comparar primeira metade vs segunda metade
-        const metade = Math.floor(serie.length / 2);
-        const primeira = serie.slice(0, metade);
-        const segunda = serie.slice(metade);
-        const mediaBloco = (bloco, cod) => {
-          const vals = bloco.map(s => s.competencias[cod] || 0).filter(v => v > 0);
-          return vals.length ? vals.reduce((a, b) => a + b, 0) / vals.length : 0;
-        };
-        Object.keys(medias).forEach(cod => {
-          const m1 = mediaBloco(primeira, cod);
-          const m2 = mediaBloco(segunda, cod);
-          const diff = m2 - m1;
-          tendencias[cod] = diff > 5 ? 'subindo' : diff < -5 ? 'caindo' : 'estavel';
-        });
-      } else {
-        // Com 2-3 avaliações: comparar primeira vs última
-        const primeiraAv = serie[0];
-        const ultimaAv = serie[serie.length - 1];
-        Object.keys(medias).forEach(cod => {
-          const n1 = primeiraAv.competencias[cod] || 0;
-          const n2 = ultimaAv.competencias[cod] || 0;
-          const diff = n2 - n1;
-          tendencias[cod] = diff > 5 ? 'subindo' : diff < -5 ? 'caindo' : 'estavel';
-        });
-      }
-    }
-
-    // ── Identificar competência mais fraca e mais forte ─────────────
-    const codsOrdenados = Object.entries(medias).sort((a, b) => a[1] - b[1]);
-    const maisFragil = codsOrdenados[0]?.[0] || null;
-    const maisForteCod = codsOrdenados[codsOrdenados.length - 1]?.[0] || null;
-
-    // ── Nota geral: primeira, última, melhor, tendência geral ────────
-    const notas = serie.map(s => s.nota_geral);
-    const notaInicial = notas[0];
-    const notaAtual = notas[notas.length - 1];
-    const notaMaxima = Math.max(...notas);
-    const notaMedia = Math.round(notas.reduce((a, b) => a + b, 0) / notas.length);
-    const evolucaoGeral = notaAtual - notaInicial;
-
-    // ── Bancas avaliadas ─────────────────────────────────────────────
-    const bancasUsadas = [...new Set(serie.map(s => s.banca))];
-
-    res.json({
-      total: serie.length,
-      serie,
-      competencias: {
-        medias,
-        tendencias,
-        mais_fragil: maisFragil,
-        mais_forte: maisForteCod
-      },
-      resumo: {
-        nota_inicial: notaInicial,
-        nota_atual: notaAtual,
-        nota_maxima: notaMaxima,
-        nota_media: notaMedia,
-        evolucao_geral: evolucaoGeral,
-        bancas_usadas: bancasUsadas
-      }
-    });
-
-  } catch (err) {
-    console.error('[/evolucao]', err.message);
-    res.status(500).json({ erro: 'Erro ao buscar evolução.' });
-  }
-});
-
-// ── SOLICITAÇÃO DE PROFESSOR ─────────────────────────────────────────
-app.post('/professor/solicitar', async (req, res) => {
-  try {
-    const {
-      usuarioId, usuarioNome, usuarioEmail,
-      tipoDocumento, arquivoNome, arquivoBase64, arquivoMime,
-      nivel, disciplina, instituicao
-    } = req.body;
-
-    if (!usuarioId || !usuarioNome || !usuarioEmail || !arquivoBase64)
-      return res.status(400).json({ erro: 'Dados incompletos.' });
-
-    const existe = await pool.query(
-      `SELECT id FROM solicitacoes_professor WHERE usuario_id = $1 AND status = 'pendente'`,
-      [usuarioId]
-    );
-    if (existe.rows.length > 0)
-      return res.status(409).json({ erro: 'Você já possui uma solicitação em análise.' });
-
-    await pool.query(
-      `INSERT INTO solicitacoes_professor
-         (usuario_id, usuario_nome, usuario_email, tipo_documento,
-          arquivo_nome, arquivo_base64, arquivo_mime, nivel, disciplina, instituicao)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
-      [usuarioId, usuarioNome, usuarioEmail,
-       tipoDocumento || 'CND', arquivoNome || 'documento',
-       arquivoBase64, arquivoMime || 'application/pdf',
-       nivel || null, disciplina || null, instituicao || null]
-    );
-
-    await pool.query(
-      `UPDATE usuarios SET professor = 'pendente', updated_at = NOW() WHERE id = $1`,
-      [usuarioId]
-    ).catch(() => {});
-
-    console.log(`[/professor/solicitar] Solicitação registrada: ${usuarioEmail}`);
-    res.json({ ok: true, mensagem: 'Solicitação enviada! Analisaremos em até 48h úteis.' });
-
-  } catch (err) {
-    console.error('[/professor/solicitar]', err.message);
-    res.status(500).json({ erro: 'Erro ao registrar solicitação.' });
-  }
-});
-
-app.patch('/master/professor/:id/aprovar', async (req, res) => {
-  const token = req.headers['x-master-token'];
-  if (token !== MASTER_TOKEN) return res.status(401).json({ erro: 'Acesso não autorizado.' });
-  try {
-    const { nota } = req.body;
-    const solId = req.params.id;
-
-    const sol = await pool.query('SELECT * FROM solicitacoes_professor WHERE id = $1', [solId]);
-    if (!sol.rows.length) return res.status(404).json({ erro: 'Solicitação não encontrada.' });
-    const s = sol.rows[0];
-
-    await pool.query(
-      `UPDATE solicitacoes_professor SET status = 'aprovado', nota_operador = $1, updated_at = NOW() WHERE id = $2`,
-      [nota || '', solId]
-    );
-
-    // Gerar código de confirmação para o professor aprovado
-    let codigoConf = null;
-    if (s.usuario_id) {
-      codigoConf = Math.floor(100000 + Math.random() * 900000).toString();
-      const codigoExpira = new Date(Date.now() + 48 * 60 * 60 * 1000); // 48h
-      await pool.query(
-        `UPDATE usuarios
-         SET professor = 'aprovado', desconto_professor = TRUE,
-             codigo_confirmacao = $2, codigo_expira = $3,
-             updated_at = NOW()
-         WHERE id = $1`,
-        [s.usuario_id, codigoConf, codigoExpira]
-      );
-      await log(s.usuario_id, s.usuario_email, 'professor_aprovado', 'ok',
-        { solicitacao_id: solId, codigo_gerado: true });
-    }
-
-    // E-mail com código de confirmação — professor precisa confirmar para ativar conta
-    try {
-      const primeiroNome = s.usuario_nome.split(' ')[0];
-      const ano = new Date().getFullYear();
-      await enviarEmail(s.usuario_email, 'RedaCheck — Cadastro de professor aprovado! Confirme sua conta ✅', `
-        <div style="font-family:-apple-system,sans-serif;max-width:480px;margin:0 auto;padding:32px 24px;background:#FAF9F7">
-          <div style="text-align:center;margin-bottom:24px">
-            <span style="font-size:22px;font-weight:700;letter-spacing:3px;color:#1A1A1A">REDA<span style="color:#C96A3A">CHECK</span></span>
-            <div style="font-size:10px;color:#9B9080;letter-spacing:1.5px;margin-top:4px">MAIS QUE CORRIGIR — APERFEIÇOAR</div>
-          </div>
-          <h2 style="font-size:20px;color:#1A1A1A;margin-bottom:8px">Parabéns, ${primeiroNome}! ✅</h2>
-          <p style="font-size:14px;color:#6B6255;line-height:1.7;margin-bottom:20px">
-            Sua documentação foi verificada e seu <strong>Plano Professor</strong> foi <strong style="color:#16A34A">aprovado</strong>!
-            Para ativar sua conta, insira o código abaixo na plataforma. Aproveite todas as funcionalidades!
-          </p>
-          <div style="background:#1A1A1A;border-radius:16px;padding:24px;text-align:center;margin-bottom:20px">
-            <div style="font-size:11px;color:rgba(255,255,255,0.5);text-transform:uppercase;letter-spacing:1px;margin-bottom:10px">Seu código de ativação</div>
-            <div style="font-size:40px;font-weight:700;color:#FAF9F7;letter-spacing:8px">${codigoConf}</div>
-            <div style="font-size:11px;color:rgba(255,255,255,0.4);margin-top:10px">Válido por 48 horas</div>
-          </div>
-          <p style="font-size:12px;color:#9B9080;line-height:1.6">Acesse redacheck.com.br, clique em "Já tenho conta" e insira o código quando solicitado.</p>
-          <div style="border-top:1px solid #E5E0D8;margin-top:24px;padding-top:16px;text-align:center">
-            <span style="font-size:11px;color:#9B9080">© ${ano} RedaCheck — redacheck.com.br</span>
-          </div>
-        </div>
-      `);
-    } catch (emailErr) {
-      console.warn('[aprovar professor] Erro e-mail:', emailErr.message);
-    }
-
-    console.log(`[/master/professor] Aprovado: ${s.usuario_email} | código gerado`);
-    res.json({ ok: true, mensagem: `Professor ${s.usuario_nome} aprovado. E-mail com código enviado.` });
-
-  } catch (err) {
-    console.error('[/master/professor/aprovar]', err.message);
-    res.status(500).json({ erro: 'Erro ao aprovar professor.' });
-  }
-});
-
-app.patch('/master/professor/:id/recusar', async (req, res) => {
-  const token = req.headers['x-master-token'];
-  if (token !== MASTER_TOKEN) return res.status(401).json({ erro: 'Acesso não autorizado.' });
-  try {
-    const { nota } = req.body;
-    const solId = req.params.id;
-
-    const sol = await pool.query('SELECT * FROM solicitacoes_professor WHERE id = $1', [solId]);
-    if (!sol.rows.length) return res.status(404).json({ erro: 'Solicitação não encontrada.' });
-    const s = sol.rows[0];
-
-    await pool.query(
-      `UPDATE solicitacoes_professor SET status = 'recusado', nota_operador = $1, updated_at = NOW() WHERE id = $2`,
-      [nota || '', solId]
-    );
-
-    if (s.usuario_id) {
-      await pool.query(
-        `UPDATE usuarios SET professor = 'recusado', updated_at = NOW() WHERE id = $1`,
-        [s.usuario_id]
-      );
-    }
-
-    try {
-      const primeiroNome = s.usuario_nome.split(' ')[0];
-      const motivo = nota || 'Documento não atende aos requisitos solicitados.';
-      await enviarEmail(s.usuario_email, 'RedaCheck — Sobre sua solicitação de professor', `
-        <div style="font-family:-apple-system,sans-serif;max-width:480px;margin:0 auto;padding:32px 24px;background:#FAF9F7">
-          <div style="text-align:center;margin-bottom:24px">
-            <span style="font-size:22px;font-weight:700;letter-spacing:3px;color:#1A1A1A">REDA<span style="color:#C96A3A">CHECK</span></span>
-          </div>
-          <h2 style="font-size:20px;color:#1A1A1A;margin-bottom:12px">Olá, ${primeiroNome}</h2>
-          <p style="font-size:14px;color:#6B6255;line-height:1.7;margin-bottom:16px">
-            Analisamos sua solicitação de <strong>Plano Professor</strong> e, no momento,
-            não foi possível aprová-la pelo seguinte motivo:
-          </p>
-          <div style="background:#FEF3EC;border-left:4px solid #C96A3A;border-radius:10px;padding:14px 16px;margin-bottom:20px">
-            <div style="font-size:13px;color:#6B6255;line-height:1.6">${motivo}</div>
-          </div>
-          <p style="font-size:14px;color:#6B6255;line-height:1.7;margin-bottom:16px">
-            Você pode reenviar sua solicitação com um dos documentos aceitos:
-            <strong>CND</strong>, <strong>declaração institucional com assinatura digital</strong>
-            ou <strong>contracheque</strong> com vínculo docente ativo.
-          </p>
-          <p style="font-size:12px;color:#9B9080;line-height:1.6">Dúvidas? Entre em contato: contato@redacheck.com.br</p>
-          <div style="border-top:1px solid #E5E0D8;margin-top:24px;padding-top:16px;text-align:center">
-            <span style="font-size:11px;color:#9B9080">© ${new Date().getFullYear()} RedaCheck — redacheck.com.br</span>
-          </div>
-        </div>
-      `);
-    } catch (emailErr) {
-      console.warn('[recusar professor] Erro e-mail:', emailErr.message);
-    }
-
-    console.log(`[/master/professor] Recusado: ${s.usuario_email}`);
-    res.json({ ok: true, mensagem: `Solicitação de ${s.usuario_nome} recusada.` });
-
-  } catch (err) {
-    console.error('[/master/professor/recusar]', err.message);
-    res.status(500).json({ erro: 'Erro ao recusar solicitação.' });
-  }
-});
-
-// ── MASTER: APROVAR FEEDBACK PARA HOME ──────────────────────────────
-app.patch('/master/feedback/:id/aprovar', async (req, res) => {
-  const token = req.headers['x-master-token'];
-  if (token !== MASTER_TOKEN) return res.status(401).json({ erro: 'Não autorizado.' });
-  try {
-    const { aprovado } = req.body;
-    await pool.query(
-      `UPDATE feedbacks SET aprovado = $1 WHERE id = $2`,
-      [aprovado !== false, req.params.id]
-    );
-    res.json({ ok: true });
-  } catch(err) {
-    res.status(500).json({ erro: 'Erro ao atualizar feedback.' });
-  }
-});
-
-// ── MASTER: CREDITAR AVALIAÇÕES MANUALMENTE ─────────────────────────
-app.post('/master/creditar', async (req, res) => {
-  const token = req.headers['x-master-token'];
-  if (token !== MASTER_TOKEN) return res.status(401).json({ erro: 'Acesso não autorizado.' });
-  try {
-    const { usuarioId, qtd, motivo } = req.body;
-    if (!usuarioId || !qtd) return res.status(400).json({ erro: 'usuarioId e qtd são obrigatórios.' });
-    const quantidade = parseInt(qtd);
-    if (isNaN(quantidade) || quantidade < 1 || quantidade > 100)
-      return res.status(400).json({ erro: 'Quantidade inválida. Use entre 1 e 100.' });
-
-    // Buscar usuário antes de creditar (para log com saldo_antes)
-    const uBefore = await pool.query(
-      'SELECT id, nome, email, avaliacoes_disponiveis FROM usuarios WHERE id = $1',
-      [usuarioId]
-    );
-    if (!uBefore.rows.length) return res.status(404).json({ erro: 'Usuário não encontrado.' });
-    const u = uBefore.rows[0];
-    const saldoAntes = u.avaliacoes_disponiveis || 0;
-
-    // Creditar
-    await pool.query(
-      `UPDATE usuarios SET avaliacoes_disponiveis = COALESCE(avaliacoes_disponiveis,0) + $1, updated_at = NOW() WHERE id = $2`,
-      [quantidade, usuarioId]
-    );
-
-    const saldoDepois = saldoAntes + quantidade;
-
-    // Registrar em logs_usuario
-    await log(usuarioId, u.email, 'credito', 'ok', {
-      origem: 'master_credito_manual',
-      qtd: quantidade,
-      motivo: motivo || 'Crédito manual pelo operador',
-      saldo_antes: saldoAntes,
-      saldo_depois: saldoDepois
-    });
-
-    console.log(`[master/creditar] +${quantidade} para usuario_id=${usuarioId} (${u.email}) | motivo: ${motivo || '-'} | saldo: ${saldoAntes} → ${saldoDepois}`);
-
-    res.json({
-      ok: true,
-      mensagem: `${quantidade} avaliação(ões) creditada(s) para ${u.nome}.`,
-      usuario: { id: u.id, nome: u.nome, email: u.email, saldo_antes: saldoAntes, saldo_depois: saldoDepois }
-    });
-  } catch (err) {
-    console.error('[master/creditar]', err.message);
-    res.status(500).json({ erro: 'Erro ao creditar avaliações.' });
-  }
-});
-
-// ── MASTER: LOGS DE USUÁRIO ──────────────────────────────────────────
-app.get('/master/logs/:usuarioId', async (req, res) => {
-  const token = req.headers['x-master-token'];
-  if (token !== MASTER_TOKEN) return res.status(401).json({ erro: 'Acesso não autorizado.' });
-  try {
-    const { usuarioId } = req.params;
-    const { limit = 100 } = req.query;
-    const result = await pool.query(
-      `SELECT id, usuario_id, email, acao, status, detalhes, ip, created_at
-       FROM logs_usuario
-       WHERE usuario_id = $1
-       ORDER BY created_at DESC
-       LIMIT $2`,
-      [usuarioId, parseInt(limit)]
-    );
-    res.json({ logs: result.rows, total: result.rows.length });
-  } catch (err) {
-    res.status(500).json({ erro: err.message });
-  }
-});
-
-// Buscar logs por e-mail (quando não se sabe o id)
-app.get('/master/logs/email/:email', async (req, res) => {
-  const token = req.headers['x-master-token'];
-  if (token !== MASTER_TOKEN) return res.status(401).json({ erro: 'Acesso não autorizado.' });
-  try {
-    const result = await pool.query(
-      `SELECT l.id, l.usuario_id, l.email, l.acao, l.status, l.detalhes, l.ip, l.created_at
-       FROM logs_usuario l
-       WHERE l.email = $1 OR l.usuario_id = (SELECT id FROM usuarios WHERE email = $1 LIMIT 1)
-       ORDER BY l.created_at DESC
-       LIMIT 200`,
-      [req.params.email.toLowerCase()]
-    );
-    res.json({ logs: result.rows, total: result.rows.length });
-  } catch (err) {
-    res.status(500).json({ erro: err.message });
-  }
-});
-
-app.get('/master/solicitacoes-professor', async (req, res) => {
-  const token = req.headers['x-master-token'];
-  if (token !== MASTER_TOKEN) return res.status(401).json({ erro: 'Acesso não autorizado.' });
-  try {
-    const result = await pool.query(
-      `SELECT id, usuario_id, usuario_nome, usuario_email, tipo_documento,
-              arquivo_nome, arquivo_mime, nivel, disciplina, instituicao,
-              status, nota_operador, created_at
-       FROM solicitacoes_professor
-       ORDER BY created_at DESC LIMIT 200`
-    );
-    res.json({ solicitacoes: result.rows });
-  } catch (err) {
-    res.status(500).json({ erro: err.message });
-  }
-});
-
-app.get('/master/solicitacoes-professor/:id/arquivo', async (req, res) => {
-  const token = req.headers['x-master-token'];
-  if (token !== MASTER_TOKEN) return res.status(401).json({ erro: 'Acesso não autorizado.' });
-  try {
-    const result = await pool.query(
-      'SELECT arquivo_base64, arquivo_mime, arquivo_nome FROM solicitacoes_professor WHERE id = $1',
-      [req.params.id]
-    );
-    if (!result.rows.length) return res.status(404).json({ erro: 'Não encontrado.' });
-    res.json(result.rows[0]);
-  } catch (err) {
-    res.status(500).json({ erro: err.message });
-  }
-});
-
-// ── CHAT REDA ─────────────────────────────────────────────────────────
-const REDA_SISTEMA = `Você é a Reda, assistente virtual do RedaCheck. É amigável, pedagógica, direta e especialista em redações dissertativas-argumentativas e no ensino de Língua Portuguesa.
-
-SOBRE O REDACHECK:
-- Plataforma brasileira de avaliação inteligente de redações com IA
-- Fundamentada nas gramáticas de Cegalla, Celso Cunha & Cintra, Marcuschi e Irandé Antunes
-- Avalia para ENEM, ITA, Unicamp, Fuvest/USP e Concursos Públicos
-- Preço: R$ 4,90/avaliação. Pacotes: 5 por R$19,90 (19%), 10 por R$34,90 (29%), 20 por R$68,60 (30%)
-- 1 redação bônus gratuita no cadastro
-- Programa de indicação: a cada 10 indicados confirmados = 1 bônus (máx. 3 bônus)
-- Professores com CND, declaração institucional ou contracheque: 50% de desconto
-- Site: redacheck.com.br
-
-CRITÉRIOS ENEM — 5 COMPETÊNCIAS:
-C1 (0–200) — Domínio da modalidade escrita formal da Língua Portuguesa
-C2 (0–200) — Compreensão da proposta e repertório sociocultural produtivo
-C3 (0–200) — Seleção e organização de argumentos em defesa de um ponto de vista
-C4 (0–200) — Mecanismos linguísticos de coesão textual
-C5 (0–200) — Proposta de intervenção com respeito aos direitos humanos
-→ C5 exige 5 elementos obrigatórios: agente + ação + modo/meio + finalidade + efeito esperado
-→ Proposta vaga ou incompleta = nota penalizada; desrespeito aos DH = nota 0 na C5
-
-PAULO FREIRE E O REDACHECK:
-- Paulo Freire é a referência filosófico-pedagógica central da plataforma.
-- Obra principal no contexto do RedaCheck: "A Importância do Ato de Ler" (1989).
-- Conceito central: "A leitura do mundo precede a leitura da palavra" — escrever bem é pensar o mundo com clareza.
-- Quando o usuário perguntar sobre Freire, sobre leitura ou sobre a filosofia da plataforma, cite este conceito com naturalidade.
-- O feedback do RedaCheck é dialógico, não punitivo — inspirado diretamente em Freire.
-
-REGRAS DE COMPORTAMENTO:
-- Responda SEMPRE em português brasileiro culto e acessível
-- Respostas de até 4 parágrafos curtos e objetivos
-- Nunca invente critérios, preços ou regras`;
-
-app.post('/chat', async (req, res) => {
-  try {
-    const { mensagens, usuario } = req.body;
-    if (!mensagens || !Array.isArray(mensagens) || mensagens.length === 0)
-      return res.status(400).json({ erro: 'Mensagens obrigatórias.' });
-
-    const historico = mensagens.slice(-20);
-
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': process.env.ANTHROPIC_API_KEY,
-        'anthropic-version': '2023-06-01'
-      },
-      body: JSON.stringify({
-        model: 'claude-sonnet-4-5',
-        max_tokens: 600,
-        system: REDA_SISTEMA,
-        messages: historico
-      })
-    });
-
-    const data = await response.json();
-
-    if (data.error) {
-      console.error('[/chat] Erro API:', data.error.message);
-      return res.status(500).json({ erro: 'Erro na API de chat.' });
-    }
-
-    const resposta = data.content?.[0]?.text || 'Desculpe, não consegui processar sua mensagem.';
-    console.log(`[/chat] usuario=${usuario||'?'} msgs=${historico.length}`);
-
-    res.json({ resposta });
-  } catch (err) {
-    console.error('[/chat]', err.message);
-    res.status(500).json({ erro: 'Erro interno no chat.' });
-  }
-});
-
-const _dicaCache = new Map();
-function _getCacheDica(key) {
-  const entry = _dicaCache.get(key);
-  if (!entry) return null;
-  if (Date.now() - entry.ts > 10 * 60 * 1000) { _dicaCache.delete(key); return null; }
-  return entry.data;
-}
-function _setCacheDica(key, data) {
-  _dicaCache.set(key, { data, ts: Date.now() });
-  if (_dicaCache.size > 100) {
-    const firstKey = _dicaCache.keys().next().value;
-    _dicaCache.delete(firstKey);
-  }
-}
-
-const CATEGORIAS_DICA = [
-  'norma-padrão e gramática',
-  'argumentação e estrutura dissertativa',
-  'repertório sociocultural produtivo',
-  'proposta de intervenção C5 ENEM',
-  'conectivos e coesão textual',
-  'especificidades da banca'
-];
-
-app.get('/dica', async (req, res) => {
-  try {
-    const banca = (req.query.banca || 'ENEM').toUpperCase();
-    const categoria = req.query.categoria ||
-      CATEGORIAS_DICA[Math.floor(Math.random() * CATEGORIAS_DICA.length)];
-
-    const cacheKey = `${banca}:${categoria}`;
-    const cached = _getCacheDica(cacheKey);
-    if (cached) {
-      console.log(`[/dica] cache hit: ${cacheKey}`);
-      return res.json({ dica: cached, categorias: CATEGORIAS_DICA, fromCache: true });
-    }
-
-    const prompt = `Você é a Reda, assistente pedagógica do RedaCheck. Gere UMA dica prática e objetiva sobre "${categoria}" para redações da banca ${banca}.
-
-FORMATO OBRIGATÓRIO — responda apenas com JSON válido:
-{
-  "titulo": "<título curto da dica, máx 8 palavras>",
-  "categoria": "${categoria}",
-  "dica": "<dica em 2-3 frases práticas, diretas, com exemplo quando possível>",
-  "atencao": "<1 erro comum relacionado ao tema que o estudante deve evitar>",
-  "referencia": "<obra e autor da base RedaCheck que fundamenta esta dica>"
-}`;
-
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': process.env.ANTHROPIC_API_KEY,
-        'anthropic-version': '2023-06-01'
-      },
-      body: JSON.stringify({
-        model: 'claude-sonnet-4-5',
-        max_tokens: 400,
-        system: 'Responda APENAS com JSON válido, sem markdown, sem texto adicional.',
-        messages: [{ role: 'user', content: prompt }]
-      })
-    });
-
-    const data = await response.json();
-    if (data.error) return res.status(500).json({ erro: 'Erro na API.' });
-
-    let dica;
-    try {
-      let texto = data.content[0].text.trim();
-      const s = texto.indexOf('{'); const e = texto.lastIndexOf('}');
-      if (s >= 0 && e > s) texto = texto.substring(s, e + 1);
-      dica = JSON.parse(texto);
-    } catch {
-      return res.status(500).json({ erro: 'Erro ao processar dica.' });
-    }
-
-    _setCacheDica(cacheKey, dica);
-    console.log(`[/dica] banca=${banca} categoria=${categoria}`);
-    res.json({ dica, categorias: CATEGORIAS_DICA, fromCache: false });
-
-  } catch (err) {
-    console.error('[/dica]', err.message);
-    res.status(500).json({ erro: 'Erro interno.' });
-  }
-});
-
-app.get('/historico-chat/:codigo', async (req, res) => {
-  try {
-    const result = await pool.query(
-      `SELECT c.mensagens, c.data_inicio, c.duracao
-       FROM conversas c
-       JOIN usuarios u ON u.nome = c.usuario
-       WHERE u.codigo = $1
-       ORDER BY c.created_at DESC
-       LIMIT 1`,
-      [req.params.codigo]
-    );
-    if (!result.rows.length) return res.json({ mensagens: [] });
-    res.json({ mensagens: result.rows[0].mensagens || [] });
-  } catch (err) {
-    console.error('[/historico-chat]', err.message);
-    res.status(500).json({ erro: 'Erro ao buscar histórico.' });
-  }
-});
-
-app.get('/bancas', (req, res) => {
-  res.json({
-    bancas: [
-      { id: 'ENEM', nome: 'ENEM', descricao: 'Exame Nacional do Ensino Médio', maxPontos: 1000 },
-      { id: 'ITA', nome: 'ITA', descricao: 'Instituto Tecnológico de Aeronáutica', maxPontos: 1000 },
-      { id: 'UNICAMP', nome: 'Unicamp', descricao: 'Universidade Estadual de Campinas', maxPontos: 12 },
-      { id: 'FUVEST', nome: 'Fuvest / USP', descricao: 'Fundação Universitária para o Vestibular', maxPontos: 100 },
-      { id: 'CONCURSO_PUBLICO', nome: 'Concurso Público', descricao: 'CESPE, FGV, FCC e outras bancas', maxPontos: 100 },
-      { id: 'UNB', nome: 'UnB', descricao: 'Vestibular da Universidade de Brasília — NR = NC – 2×(NE÷TL)', maxPontos: 1000 },
-      { id: 'CEBRASPE', nome: 'CEBRASPE', descricao: 'Concurso Público CEBRASPE/UnB — NPD = NC – 6×(NE÷TL)', maxPontos: 1000 }
-    ]
-  });
-});
-
-// ── INICIALIZAR ───────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
-inicializarBanco().then(() => {
-  app.listen(PORT, () => console.log(`RedaCheck API v9.10 | porta ${PORT} | cache duplicatas + logs + trilha evolução`));
-});
+let erroInicializacao = null;
+initDB()
+  .catch(e => {
+    erroInicializacao = e.message;
+    console.error('Falha ao inicializar o banco:', e);
+  })
+  .finally(() => app.listen(PORT, () => {
+    console.log(`CEMIC Gestão — backend v3.43 rodando na porta ${PORT}`);
+    if (erroInicializacao) console.error('ATENÇÃO: o sistema subiu com falha de inicialização —', erroInicializacao);
+    if (falhasMigracao.length) console.error('ATENÇÃO: migrações com falha —', falhasMigracao.join(' | '));
+  }));
