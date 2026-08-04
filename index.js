@@ -531,6 +531,22 @@ async function initDB() {
     lida_em TIMESTAMP DEFAULT NOW(),
     PRIMARY KEY (circular_id, usuario_id)
   )`);
+  // English Platform: liberação de acesso por aluno.
+  // Fluxo: PIX pago na plataforma -> solicitação (status 'pendente') -> master autoriza aqui -> acesso liberado.
+  await migrar('english_platform_acesso', `CREATE TABLE IF NOT EXISTS english_platform_acesso (
+    id SERIAL PRIMARY KEY,
+    aluno_id INTEGER NOT NULL UNIQUE REFERENCES alunos(id) ON DELETE CASCADE,
+    status TEXT NOT NULL DEFAULT 'pendente' CHECK (status IN ('pendente','autorizado','revogado')),
+    solicitado_por INTEGER REFERENCES responsaveis(id) ON DELETE SET NULL,
+    pago_em TIMESTAMP,
+    pagamento_ref TEXT,
+    valor NUMERIC(10,2),
+    autorizado_por INTEGER REFERENCES usuarios(id) ON DELETE SET NULL,
+    autorizado_em TIMESTAMP,
+    criado_em TIMESTAMP DEFAULT NOW(),
+    atualizado_em TIMESTAMP DEFAULT NOW()
+  )`);
+  await migrar('idx_ep_status', `CREATE INDEX IF NOT EXISTS idx_ep_status ON english_platform_acesso (status)`);
   try { await seedCalendario(); } catch (e) { falhasMigracao.push('seed calendario: ' + e.message); console.error('Falha ao semear o calendário:', e.message); }
   try { await seedConfiguracoes(); } catch (e) { falhasMigracao.push('seed configuracoes: ' + e.message); console.error('Falha ao semear as configurações:', e.message); }
   await seedCursosNiveis();
@@ -753,9 +769,10 @@ function autenticarResponsavel(req, res, next) {
 }
 async function alunosDoResponsavel(respId) {
   const r = await pool.query(
-    `SELECT a.id, a.nome, a.cpf, a.data_nascimento,
+    `SELECT a.id, a.nome, a.cpf, a.codigo, a.data_nascimento,
             t.nome AS turma_nome, t.turno, n.nome AS nivel_nome, c.nome AS curso_nome,
-            p.nome AS professor_nome
+            p.nome AS professor_nome,
+            COALESCE(ep.status, 'nenhum') AS english_platform_status
      FROM aluno_responsavel ar
      JOIN alunos a ON a.id = ar.aluno_id
      LEFT JOIN matriculas m ON m.aluno_id = a.id AND m.status = 'ativa'
@@ -763,6 +780,7 @@ async function alunosDoResponsavel(respId) {
      LEFT JOIN niveis n ON n.id = t.nivel_id
      LEFT JOIN cursos c ON c.id = n.curso_id
      LEFT JOIN professores p ON p.id = t.professor_id
+     LEFT JOIN english_platform_acesso ep ON ep.aluno_id = a.id
      WHERE ar.responsavel_id = $1
      ORDER BY a.nome`, [respId]);
   return r.rows;
@@ -2244,6 +2262,134 @@ app.post('/publico/portal/login', limiterLogin, async (req, res) => {
 app.get('/publico/portal/alunos', autenticarResponsavel, async (req, res) => {
   try { res.json(await alunosDoResponsavel(req.responsavelId)); }
   catch (e) { console.error('Erro portal alunos:', e); res.status(500).json({ erro: 'Erro ao carregar os alunos.' }); }
+});
+
+// ================= English Platform — liberação de acesso =================
+// Fluxo: PIX pago na plataforma -> este endpoint registra a solicitação (status 'pendente')
+// -> o master vê na tela "English Platform" do Gestão e autoriza -> acesso liberado.
+// Em produção, quem confirma o pagamento é o webhook do Mercado Pago (fonte da verdade);
+// aqui o responsável autenticado registra o pedido após o PIX, restrito aos seus próprios filhos.
+async function statusEnglishPlatform(respId) {
+  const r = await pool.query(
+    `SELECT a.id AS aluno_id, a.nome, COALESCE(ep.status,'nenhum') AS status,
+            ep.pago_em, ep.autorizado_em
+       FROM aluno_responsavel ar
+       JOIN alunos a ON a.id = ar.aluno_id
+       LEFT JOIN english_platform_acesso ep ON ep.aluno_id = a.id
+      WHERE ar.responsavel_id = $1
+      ORDER BY a.nome`, [respId]);
+  return r.rows;
+}
+app.get('/publico/portal/english-platform/status', autenticarResponsavel, async (req, res) => {
+  try { res.json(await statusEnglishPlatform(req.responsavelId)); }
+  catch (e) { console.error('Erro EP status:', e); res.status(500).json({ erro: 'Erro ao consultar o acesso.' }); }
+});
+app.post('/publico/portal/english-platform/solicitar', autenticarResponsavel, async (req, res) => {
+  try {
+    const ref = req.body && req.body.pagamento_ref ? String(req.body.pagamento_ref).slice(0, 120) : null;
+    const valor = req.body && req.body.valor != null ? Number(req.body.valor) : null;
+    // Filhos vinculados a este responsável (a solicitação abrange todos, pois o PIX é por família)
+    const filhos = await pool.query(
+      `SELECT aluno_id FROM aluno_responsavel WHERE responsavel_id = $1`, [req.responsavelId]);
+    let pedidos = filhos.rows.map(f => f.aluno_id);
+    if (Array.isArray(req.body && req.body.aluno_ids) && req.body.aluno_ids.length) {
+      const permitidos = new Set(pedidos);
+      pedidos = req.body.aluno_ids.map(Number).filter(id => permitidos.has(id));
+    }
+    if (!pedidos.length) return res.status(400).json({ erro: 'Nenhum aluno vinculado para solicitar acesso.' });
+    for (const alunoId of pedidos) {
+      // Já autorizado permanece autorizado; caso contrário (novo ou revogado) vira 'pendente'
+      await pool.query(
+        `INSERT INTO english_platform_acesso (aluno_id, status, solicitado_por, pago_em, pagamento_ref, valor)
+         VALUES ($1,'pendente',$2, NOW(), $3, $4)
+         ON CONFLICT (aluno_id) DO UPDATE SET
+           status = CASE WHEN english_platform_acesso.status = 'autorizado' THEN 'autorizado' ELSE 'pendente' END,
+           solicitado_por = EXCLUDED.solicitado_por,
+           pago_em = NOW(),
+           pagamento_ref = COALESCE(EXCLUDED.pagamento_ref, english_platform_acesso.pagamento_ref),
+           valor = COALESCE(EXCLUDED.valor, english_platform_acesso.valor),
+           atualizado_em = NOW()`,
+        [alunoId, req.responsavelId, ref, (valor != null && !isNaN(valor)) ? valor : null]);
+    }
+    res.status(201).json({ ok: true, solicitados: pedidos.length, alunos: await statusEnglishPlatform(req.responsavelId) });
+  } catch (e) { console.error('Erro EP solicitar:', e); res.status(500).json({ erro: 'Erro ao registrar a solicitação de acesso.' }); }
+});
+
+// ---------- English Platform · painel do master ----------
+app.get('/admin/english-platform/solicitacoes', autenticar, exigirPerfil('master'), async (req, res) => {
+  try {
+    const filtro = ['pendente', 'autorizado', 'revogado'].includes(req.query.status) ? req.query.status : null;
+    const params = [];
+    let where = '';
+    if (filtro) { params.push(filtro); where = 'WHERE ep.status = $1'; }
+    const r = await pool.query(
+      `SELECT ep.aluno_id, ep.status, ep.pago_em, ep.pagamento_ref, ep.valor,
+              ep.autorizado_em, a.nome AS aluno_nome, a.codigo AS aluno_codigo,
+              t.nome AS turma_nome, t.turno,
+              r.nome AS solicitante_nome, r.cpf AS solicitante_cpf,
+              u.nome AS autorizado_por_nome
+         FROM english_platform_acesso ep
+         JOIN alunos a ON a.id = ep.aluno_id
+         LEFT JOIN matriculas m ON m.aluno_id = a.id AND m.status = 'ativa'
+         LEFT JOIN turmas t ON t.id = m.turma_id
+         LEFT JOIN responsaveis r ON r.id = ep.solicitado_por
+         LEFT JOIN usuarios u ON u.id = ep.autorizado_por
+         ${where}
+        ORDER BY CASE ep.status WHEN 'pendente' THEN 0 WHEN 'autorizado' THEN 1 ELSE 2 END,
+                 ep.pago_em DESC NULLS LAST, a.nome`, params);
+    const contagem = await pool.query(
+      `SELECT status, COUNT(*)::int AS n FROM english_platform_acesso GROUP BY status`);
+    const cont = { pendente: 0, autorizado: 0, revogado: 0 };
+    contagem.rows.forEach(x => { cont[x.status] = x.n; });
+    res.json({ solicitacoes: r.rows, contagem: cont });
+  } catch (e) { console.error('Erro EP solicitacoes:', e); res.status(500).json({ erro: 'Erro ao listar as solicitações.' }); }
+});
+app.post('/admin/english-platform/:alunoId/autorizar', autenticar, exigirPerfil('master'), async (req, res) => {
+  try {
+    const alunoId = Number(req.params.alunoId);
+    if (!alunoId) return res.status(400).json({ erro: 'Aluno inválido.' });
+    const existe = await pool.query(`SELECT id FROM alunos WHERE id = $1`, [alunoId]);
+    if (!existe.rows.length) return res.status(404).json({ erro: 'Aluno não encontrado.' });
+    // Autoriza o pedido pago ou, se não houver, cria já autorizado (liberação manual pelo master)
+    await pool.query(
+      `INSERT INTO english_platform_acesso (aluno_id, status, autorizado_por, autorizado_em)
+       VALUES ($1,'autorizado',$2, NOW())
+       ON CONFLICT (aluno_id) DO UPDATE SET
+         status = 'autorizado', autorizado_por = $2, autorizado_em = NOW(), atualizado_em = NOW()`,
+      [alunoId, req.usuario.id]);
+    res.json({ ok: true, aluno_id: alunoId, status: 'autorizado' });
+  } catch (e) { console.error('Erro EP autorizar:', e); res.status(500).json({ erro: 'Erro ao autorizar o acesso.' }); }
+});
+app.post('/admin/english-platform/autorizar-lote', autenticar, exigirPerfil('master'), async (req, res) => {
+  try {
+    const ids = Array.isArray(req.body && req.body.aluno_ids) ? req.body.aluno_ids.map(Number).filter(Boolean) : [];
+    if (!ids.length) return res.status(400).json({ erro: 'Selecione ao menos um aluno.' });
+    let n = 0;
+    for (const alunoId of ids) {
+      const e = await pool.query(`SELECT id FROM alunos WHERE id = $1`, [alunoId]);
+      if (!e.rows.length) continue;
+      await pool.query(
+        `INSERT INTO english_platform_acesso (aluno_id, status, autorizado_por, autorizado_em)
+         VALUES ($1,'autorizado',$2, NOW())
+         ON CONFLICT (aluno_id) DO UPDATE SET
+           status = 'autorizado', autorizado_por = $2, autorizado_em = NOW(), atualizado_em = NOW()`,
+        [alunoId, req.usuario.id]);
+      n++;
+    }
+    res.json({ ok: true, autorizados: n });
+  } catch (e) { console.error('Erro EP autorizar-lote:', e); res.status(500).json({ erro: 'Erro ao autorizar em lote.' }); }
+});
+app.post('/admin/english-platform/:alunoId/revogar', autenticar, exigirPerfil('master'), async (req, res) => {
+  try {
+    const alunoId = Number(req.params.alunoId);
+    if (!alunoId) return res.status(400).json({ erro: 'Aluno inválido.' });
+    const r = await pool.query(
+      `UPDATE english_platform_acesso
+          SET status = 'revogado', autorizado_por = NULL, autorizado_em = NULL, atualizado_em = NOW()
+        WHERE aluno_id = $1 RETURNING aluno_id`, [alunoId]);
+    if (!r.rows.length) return res.status(404).json({ erro: 'Este aluno não tem solicitação de acesso.' });
+    res.json({ ok: true, aluno_id: alunoId, status: 'revogado' });
+  } catch (e) { console.error('Erro EP revogar:', e); res.status(500).json({ erro: 'Erro ao revogar o acesso.' }); }
 });
 
 // ---------- Avisos (coordenação publica; pais leem no portal) ----------
@@ -4291,7 +4437,7 @@ app.get('/health', async (req, res) => {
     res.json({
       status: (erroInicializacao || falhasMigracao.length) ? 'degradado' : 'ok',
       sistema: 'CEMIC Gestão',
-      versao: '3.43 (Folha de chamada por professor + Carteira/Declaração do Professor)',
+      versao: '3.44 (English Platform — liberação de acesso pelo master)',
       inicializacao: erroInicializacao || 'ok',
       migracoes_com_falha: falhasMigracao
     });
