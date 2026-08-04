@@ -547,6 +547,21 @@ async function initDB() {
     atualizado_em TIMESTAMP DEFAULT NOW()
   )`);
   await migrar('idx_ep_status', `CREATE INDEX IF NOT EXISTS idx_ep_status ON english_platform_acesso (status)`);
+  // English Platform: cobranças PIX do credenciamento (R$35 × nº de filhos, um pagamento por família).
+  await migrar('english_platform_pagamentos', `CREATE TABLE IF NOT EXISTS english_platform_pagamentos (
+    txid TEXT PRIMARY KEY,
+    responsavel_id INTEGER REFERENCES responsaveis(id) ON DELETE SET NULL,
+    valor NUMERIC(10,2) NOT NULL,
+    copia_cola TEXT,
+    status TEXT NOT NULL DEFAULT 'ATIVA',
+    criado_em TIMESTAMP DEFAULT NOW(),
+    pago_em TIMESTAMP
+  )`);
+  await migrar('idx_ep_pag_resp', `CREATE INDEX IF NOT EXISTS idx_ep_pag_resp ON english_platform_pagamentos (responsavel_id, status)`);
+  // Índices nas FKs mais usadas em JOIN/filtro (login do Portal, EP, boletos): antes só 5 índices p/ 36 tabelas.
+  await migrar('idx_ar_responsavel', `CREATE INDEX IF NOT EXISTS idx_ar_responsavel ON aluno_responsavel (responsavel_id)`);
+  await migrar('idx_ar_aluno', `CREATE INDEX IF NOT EXISTS idx_ar_aluno ON aluno_responsavel (aluno_id)`);
+  await migrar('idx_matriculas_aluno', `CREATE INDEX IF NOT EXISTS idx_matriculas_aluno ON matriculas (aluno_id, status)`);
   try { await seedCalendario(); } catch (e) { falhasMigracao.push('seed calendario: ' + e.message); console.error('Falha ao semear o calendário:', e.message); }
   try { await seedConfiguracoes(); } catch (e) { falhasMigracao.push('seed configuracoes: ' + e.message); console.error('Falha ao semear as configurações:', e.message); }
   await seedCursosNiveis();
@@ -4385,6 +4400,34 @@ async function marcarPreInscricaoPaga(preId) {
   return r.rows.length > 0;
 }
 
+// English Platform: cria/atualiza as solicitações de acesso (pendente) de todos os filhos do responsável.
+async function criarSolicitacoesEP(responsavelId, valor, ref) {
+  const v = (valor != null && !isNaN(valor)) ? valor : null;
+  const r = await pool.query(
+    `INSERT INTO english_platform_acesso (aluno_id, status, solicitado_por, pago_em, pagamento_ref, valor)
+     SELECT ar.aluno_id, 'pendente', $1, NOW(), $2, $3
+       FROM aluno_responsavel ar WHERE ar.responsavel_id = $1
+     ON CONFLICT (aluno_id) DO UPDATE SET
+       status = CASE WHEN english_platform_acesso.status = 'autorizado' THEN 'autorizado' ELSE 'pendente' END,
+       solicitado_por = EXCLUDED.solicitado_por,
+       pago_em = NOW(),
+       pagamento_ref = COALESCE(EXCLUDED.pagamento_ref, english_platform_acesso.pagamento_ref),
+       valor = COALESCE(EXCLUDED.valor, english_platform_acesso.valor),
+       atualizado_em = NOW()`,
+    [responsavelId, ref || null, v]);
+  return r.rowCount;
+}
+// Marca uma cobrança de credenciamento como paga e dispara as solicitações pendentes.
+async function marcarPagamentoEPPago(txid) {
+  const q = await pool.query(`SELECT * FROM english_platform_pagamentos WHERE txid = $1`, [txid]);
+  if (!q.rows.length) return false;
+  const pg = q.rows[0];
+  if (pg.status === 'CONCLUIDA') return true;
+  await pool.query(`UPDATE english_platform_pagamentos SET status='CONCLUIDA', pago_em=NOW() WHERE txid=$1`, [txid]);
+  if (pg.responsavel_id) await criarSolicitacoesEP(pg.responsavel_id, Number(pg.valor), 'PIX ' + txid);
+  return true;
+}
+
 // Gera (ou reaproveita) a cobrança PIX da taxa de uma pré-inscrição
 app.post('/publico/pre-inscricao/:id/pix', limiterPublico, async (req, res) => {
   try {
@@ -4433,14 +4476,108 @@ app.post('/publico/pix/webhook', async (req, res) => {
     for (const p of lista) {
       const txid = p && p.txid;
       if (!txid) continue;
+      // Pré-inscrição
       const q = await pool.query(`SELECT id, status FROM pre_inscricoes WHERE mp_payment_id = $1`, [txid]);
-      if (!q.rows.length || ['pago', 'efetivada'].includes(q.rows[0].status)) continue;
-      try {
-        const cob = await interConsultarCob(txid);
-        if (cob && cob.status === 'CONCLUIDA') await marcarPreInscricaoPaga(q.rows[0].id);
-      } catch (e) { console.error('Webhook: erro consultar cob:', e.message); }
+      if (q.rows.length && !['pago', 'efetivada'].includes(q.rows[0].status)) {
+        try {
+          const cob = await interConsultarCob(txid);
+          if (cob && cob.status === 'CONCLUIDA') await marcarPreInscricaoPaga(q.rows[0].id);
+        } catch (e) { console.error('Webhook: erro consultar cob:', e.message); }
+      }
     }
   } catch (e) { console.error('Erro webhook Inter:', e); }
+  res.status(200).json({ ok: true });
+});
+
+// ===== English Platform — credenciamento via PIX (Mercado Pago) =====
+const MP = { token: process.env.MP_ACCESS_TOKEN || '', base: 'https://api.mercadopago.com' };
+function mpConfigurado() { return !!MP.token; }
+async function mpCriarPix(valor, descricao, idem) {
+  const r = await fetch(MP.base + '/v1/payments', {
+    method: 'POST',
+    headers: {
+      'Authorization': 'Bearer ' + MP.token,
+      'Content-Type': 'application/json',
+      'X-Idempotency-Key': idem
+    },
+    body: JSON.stringify({
+      transaction_amount: Number(valor),
+      description: String(descricao || '').slice(0, 255),
+      payment_method_id: 'pix',
+      payer: { email: (process.env.MP_PAYER_EMAIL || 'credenciamento@cemic.com.br') }
+    })
+  });
+  const data = await r.json();
+  if (!r.ok) { console.error('MP criar erro:', data); throw new Error((data && data.message) || 'Erro ao criar o PIX no Mercado Pago'); }
+  return data;
+}
+async function mpConsultarPagamento(id) {
+  const r = await fetch(MP.base + '/v1/payments/' + id, { headers: { 'Authorization': 'Bearer ' + MP.token } });
+  const data = await r.json();
+  if (!r.ok) { console.error('MP consultar erro:', data); throw new Error('Erro ao consultar o pagamento no Mercado Pago'); }
+  return data;
+}
+
+// Cria (ou reaproveita) a cobrança PIX do credenciamento (R$35 × nº de filhos vinculados ao CPF)
+app.post('/publico/portal/english-platform/pix', autenticarResponsavel, async (req, res) => {
+  try {
+    if (!mpConfigurado()) return res.status(503).json({ erro: 'Pagamento via PIX ainda não está configurado.' });
+    const c = await pool.query(`SELECT COUNT(*)::int AS n FROM aluno_responsavel WHERE responsavel_id = $1`, [req.responsavelId]);
+    const n = c.rows[0].n;
+    if (!n) return res.status(400).json({ erro: 'Nenhum aluno vinculado a este CPF.' });
+    const valor = 35 * n;
+    // Reaproveita uma cobrança ATIVA de mesmo valor, para não gerar PIX duplicado
+    const ex = await pool.query(
+      `SELECT txid, copia_cola, valor FROM english_platform_pagamentos
+        WHERE responsavel_id = $1 AND status = 'ATIVA' ORDER BY criado_em DESC LIMIT 1`, [req.responsavelId]);
+    if (ex.rows.length && ex.rows[0].copia_cola && Number(ex.rows[0].valor) === valor) {
+      return res.json({ txid: ex.rows[0].txid, copia_cola: ex.rows[0].copia_cola, valor, alunos: n });
+    }
+    const idem = crypto.randomBytes(16).toString('hex');
+    const pay = await mpCriarPix(valor, `Credenciamento English Platform CEMIC (${n} aluno${n > 1 ? 's' : ''})`, idem);
+    const pid = String(pay.id);
+    const td = (pay.point_of_interaction && pay.point_of_interaction.transaction_data) || {};
+    const copiaCola = td.qr_code || '';
+    const qrB64 = td.qr_code_base64 || '';
+    await pool.query(
+      `INSERT INTO english_platform_pagamentos (txid, responsavel_id, valor, copia_cola, status)
+       VALUES ($1,$2,$3,$4,'ATIVA')`, [pid, req.responsavelId, valor, copiaCola]);
+    res.json({ txid: pid, copia_cola: copiaCola, qr_base64: qrB64, valor, alunos: n });
+  } catch (e) { console.error('Erro gerar PIX EP (MP):', e); res.status(500).json({ erro: 'Não foi possível gerar o PIX agora. Tente novamente.' }); }
+});
+
+// Status do pagamento (polling). Ao confirmar (approved), cria as solicitações pendentes.
+app.get('/publico/portal/english-platform/pix/:txid/status', autenticarResponsavel, async (req, res) => {
+  try {
+    const txid = req.params.txid;
+    const q = await pool.query(`SELECT status FROM english_platform_pagamentos WHERE txid = $1 AND responsavel_id = $2`, [txid, req.responsavelId]);
+    if (!q.rows.length) return res.status(404).json({ erro: 'Cobrança não encontrada.' });
+    if (q.rows[0].status === 'CONCLUIDA') return res.json({ status: 'CONCLUIDA' });
+    if (mpConfigurado()) {
+      try {
+        const pay = await mpConsultarPagamento(txid);
+        if (pay && pay.status === 'approved') { await marcarPagamentoEPPago(txid); return res.json({ status: 'CONCLUIDA' }); }
+      } catch (e) { console.error('EP status MP:', e.message); }
+    }
+    res.json({ status: 'ATIVA' });
+  } catch (e) { console.error('Erro status PIX EP (MP):', e); res.status(500).json({ erro: 'Erro ao consultar o status.' }); }
+});
+
+// Webhook do Mercado Pago (configurar a URL no painel do MP). Confirma consultando o pagamento.
+app.post('/publico/mp/webhook', async (req, res) => {
+  try {
+    const q = req.query || {}, b = req.body || {};
+    const tipo = q.type || q.topic || b.type || b.topic;
+    const id = q['data.id'] || q.id || (b.data && b.data.id) || b['data.id'];
+    const ehPagamento = tipo === 'payment' || (b.action && String(b.action).startsWith('payment'));
+    if (id && ehPagamento && mpConfigurado()) {
+      const ex = await pool.query(`SELECT txid FROM english_platform_pagamentos WHERE txid = $1 AND status <> 'CONCLUIDA'`, [String(id)]);
+      if (ex.rows.length) {
+        const pay = await mpConsultarPagamento(String(id));
+        if (pay && pay.status === 'approved') await marcarPagamentoEPPago(String(id));
+      }
+    }
+  } catch (e) { console.error('Erro webhook MP:', e); }
   res.status(200).json({ ok: true });
 });
 
@@ -4472,7 +4609,7 @@ app.get('/health', async (req, res) => {
     res.json({
       status: (erroInicializacao || falhasMigracao.length) ? 'degradado' : 'ok',
       sistema: 'CEMIC Gestão',
-      versao: '3.45 (English Platform — IA do assistente/dicionário no servidor)',
+      versao: '3.47 (English Platform — persistência de sessão/progresso, índices e batch)',
       inicializacao: erroInicializacao || 'ok',
       migracoes_com_falha: falhasMigracao
     });
