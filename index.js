@@ -2845,6 +2845,28 @@ app.post('/publico/portal/marcar-lido', autenticarResponsavel, async (req, res) 
   } catch (e) { console.error('Erro marcar-lido:', e); res.status(500).json({ erro: 'Erro ao marcar como lido.' }); }
 });
 
+// Relatório: responsáveis que JÁ PAGARAM a English Platform (pago_em preenchido) (v3.54)
+app.get('/admin/english-platform/relatorio-pagos', autenticar, exigirPerfil('master'), async (req, res) => {
+  try {
+    const itens = await pool.query(
+      `SELECT ep.aluno_id, ep.status, ep.pago_em, ep.pagamento_ref, ep.valor,
+              a.nome AS aluno_nome, a.codigo AS aluno_codigo,
+              t.nome AS turma_nome, t.turno,
+              r.id AS responsavel_id, r.nome AS responsavel_nome, r.cpf AS responsavel_cpf, r.whatsapp AS responsavel_whatsapp
+         FROM english_platform_acesso ep
+         JOIN alunos a ON a.id = ep.aluno_id
+         LEFT JOIN matriculas m ON m.aluno_id = a.id AND m.status = 'ativa'
+         LEFT JOIN turmas t ON t.id = m.turma_id
+         LEFT JOIN responsaveis r ON r.id = ep.solicitado_por
+        WHERE ep.pago_em IS NOT NULL
+        ORDER BY r.nome NULLS LAST, a.nome`);
+    const resumo = await pool.query(
+      `SELECT COUNT(DISTINCT ep.solicitado_por) AS pais, COUNT(*)::int AS alunos, COALESCE(SUM(ep.valor), 0) AS valor_total
+         FROM english_platform_acesso ep WHERE ep.pago_em IS NOT NULL`);
+    res.json({ itens: itens.rows, resumo: resumo.rows[0] });
+  } catch (e) { console.error('Erro relatorio EP pagos:', e); res.status(500).json({ erro: 'Erro ao gerar o relatório.' }); }
+});
+
 app.get('/professor/turmas', autenticar, somenteProfessor, async (req, res) => {
   try {
     const prof = escopoProfessor(req);
@@ -4694,6 +4716,21 @@ async function criarSolicitacoesEP(responsavelId, valor, ref) {
     [responsavelId, ref || null, v]);
   return r.rowCount;
 }
+// Baixa automática da Taxa da Plataforma Acadêmica no financeiro quando o PIX da English
+// Platform é confirmado: quita as contas a receber abertas ('Taxa da Plataforma%') dos
+// filhos do responsável que pagou. (v3.55)
+async function darBaixaTaxaPlataforma(responsavelId, txid) {
+  const r = await pool.query(
+    `UPDATE contas_receber cr
+        SET status = 'paga', data_pagamento = CURRENT_DATE, forma_pagamento = 'PIX',
+            valor_recebido = cr.valor_final
+      WHERE cr.status IN ('pendente','atrasada')
+        AND cr.descricao ILIKE 'Taxa da Plataforma%'
+        AND cr.aluno_id IN (SELECT ar.aluno_id FROM aluno_responsavel ar WHERE ar.responsavel_id = $1)`,
+    [responsavelId]);
+  if (r.rowCount) console.log(`Baixa automática: ${r.rowCount} Taxa(s) da Plataforma quitada(s) no financeiro (PIX ${txid}).`);
+  return r.rowCount;
+}
 // Marca uma cobrança de credenciamento como paga e dispara as solicitações pendentes.
 async function marcarPagamentoEPPago(txid) {
   const q = await pool.query(`SELECT * FROM english_platform_pagamentos WHERE txid = $1`, [txid]);
@@ -4701,7 +4738,11 @@ async function marcarPagamentoEPPago(txid) {
   const pg = q.rows[0];
   if (pg.status === 'CONCLUIDA') return true;
   await pool.query(`UPDATE english_platform_pagamentos SET status='CONCLUIDA', pago_em=NOW() WHERE txid=$1`, [txid]);
-  if (pg.responsavel_id) await criarSolicitacoesEP(pg.responsavel_id, Number(pg.valor), 'PIX ' + txid);
+  if (pg.responsavel_id) {
+    await criarSolicitacoesEP(pg.responsavel_id, Number(pg.valor), 'PIX ' + txid);
+    try { await darBaixaTaxaPlataforma(pg.responsavel_id, txid); }
+    catch (e) { console.error('Falha na baixa automática da Taxa da Plataforma (txid ' + txid + '):', e.message); }
+  }
   return true;
 }
 
@@ -4904,7 +4945,7 @@ app.get('/health', async (req, res) => {
     res.json({
       status: (erroInicializacao || falhasMigracao.length) ? 'degradado' : 'ok',
       sistema: 'CEMIC Gestão',
-      versao: '3.53 (Não lidos — avisos, circulares e ocorrências novos sinalizados no Portal dos Pais)',
+      versao: '3.55 (Baixa automática da Taxa da Plataforma no financeiro ao confirmar o PIX da English Platform)',
       inicializacao: erroInicializacao || 'ok',
       migracoes_com_falha: falhasMigracao
     });
@@ -4921,7 +4962,7 @@ initDB()
     console.error('Falha ao inicializar o banco:', e);
   })
   .finally(() => app.listen(PORT, () => {
-    console.log(`CEMIC Gestão — backend v3.53 rodando na porta ${PORT}`);
+    console.log(`CEMIC Gestão — backend v3.55 rodando na porta ${PORT}`);
     if (erroInicializacao) console.error('ATENÇÃO: o sistema subiu com falha de inicialização —', erroInicializacao);
     if (falhasMigracao.length) console.error('ATENÇÃO: migrações com falha —', falhasMigracao.join(' | '));
   }));
