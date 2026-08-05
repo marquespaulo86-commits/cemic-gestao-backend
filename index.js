@@ -2884,6 +2884,19 @@ app.post('/admin/english-platform/reconciliar-taxas', autenticar, exigirPerfil('
   } catch (e) { console.error('Erro reconciliar taxas EP:', e); res.status(500).json({ erro: 'Erro ao reconciliar as taxas da plataforma.' }); }
 });
 
+// Portal do responsável: contagem de contas VENCIDAS (para alertar o pai ao acessar) (v3.57)
+app.get('/publico/portal/vencidas', autenticarResponsavel, async (req, res) => {
+  try {
+    const r = await pool.query(
+      `SELECT COUNT(*)::int AS qtd, COALESCE(SUM(cr.valor_final), 0) AS total
+         FROM contas_receber cr
+        WHERE (cr.status = 'atrasada' OR (cr.status = 'pendente' AND cr.vencimento < CURRENT_DATE))
+          AND cr.aluno_id IN (SELECT ar.aluno_id FROM aluno_responsavel ar WHERE ar.responsavel_id = $1)`,
+      [req.responsavelId]);
+    res.json({ qtd: r.rows[0].qtd, total: Number(r.rows[0].total) });
+  } catch (e) { console.error('Erro portal vencidas:', e); res.status(500).json({ erro: 'Erro ao verificar pendências.' }); }
+});
+
 app.get('/professor/turmas', autenticar, somenteProfessor, async (req, res) => {
   try {
     const prof = escopoProfessor(req);
@@ -4962,7 +4975,7 @@ app.get('/health', async (req, res) => {
     res.json({
       status: (erroInicializacao || falhasMigracao.length) ? 'degradado' : 'ok',
       sistema: 'CEMIC Gestão',
-      versao: '3.56 (Relatório financeiro detalhado corrigido + modalidades + reconciliação retroativa da Taxa da Plataforma)',
+      versao: '3.57 (Alerta de contas vencidas no Portal dos Pais)',
       inicializacao: erroInicializacao || 'ok',
       migracoes_com_falha: falhasMigracao
     });
@@ -4979,7 +4992,7 @@ initDB()
     console.error('Falha ao inicializar o banco:', e);
   })
   .finally(() => app.listen(PORT, () => {
-    console.log(`CEMIC Gestão — backend v3.56 rodando na porta ${PORT}`);
+    console.log(`CEMIC Gestão — backend v3.57 rodando na porta ${PORT}`);
     if (erroInicializacao) console.error('ATENÇÃO: o sistema subiu com falha de inicialização —', erroInicializacao);
     if (falhasMigracao.length) console.error('ATENÇÃO: migrações com falha —', falhasMigracao.join(' | '));
   }));
