@@ -2014,7 +2014,8 @@ app.get('/admin/relatorios/turmas', autenticar, somenteGestao, async (req, res) 
        LEFT JOIN professores p ON p.id=t.professor_id
        ${where} ORDER BY t.semestre DESC, c.nome, n.ordem, t.nome`, params);
     res.json(r.rows);
-  } catch (e) { console.error('Erro relatório turmas:', e); res.status(500).json({ erro: 'Erro ao gerar relatório de turmas.' });
+  } catch (e) { console.error('Erro relatório turmas:', e); res.status(500).json({ erro: 'Erro ao gerar relatório de turmas.' }); }
+});
 
 app.get('/admin/relatorios/financeiro-detalhado', autenticar, somenteGestao, async (req, res) => {
   try {
@@ -2026,6 +2027,7 @@ app.get('/admin/relatorios/financeiro-detalhado', autenticar, somenteGestao, asy
     const SELECT = `
       SELECT cr.id, cr.descricao, cr.competencia, cr.vencimento, cr.valor_final, cr.desconto_pontualidade,
              cr.data_pagamento, cr.forma_pagamento, cr.status,
+             CASE WHEN cr.descricao ILIKE 'Taxa da Plataforma%' THEN 'Taxa de Plataforma' WHEN cr.descricao ILIKE 'Mensalidade%' THEN 'Mensalidade' WHEN cr.descricao ILIKE 'Taxa de Matrícula%' THEN 'Matrícula' ELSE 'Outros' END AS modalidade,
              COALESCE(a.nome, cr.cliente_nome) AS aluno_nome, pgt.nome AS pagante_nome,
              CASE WHEN cr.descricao LIKE 'Mensalidade%' THEN
                (SELECT COUNT(*) FROM contas_receber x WHERE x.matricula_id = cr.matricula_id
@@ -2061,7 +2063,6 @@ app.get('/admin/relatorios/financeiro-detalhado', autenticar, somenteGestao, asy
       }
     });
   } catch (e) { console.error('Erro relatório detalhado:', e); res.status(500).json({ erro: 'Erro ao gerar relatório detalhado.' }); }
-}); }
 });
 
 // ============================================================
@@ -2865,6 +2866,22 @@ app.get('/admin/english-platform/relatorio-pagos', autenticar, exigirPerfil('mas
          FROM english_platform_acesso ep WHERE ep.pago_em IS NOT NULL`);
     res.json({ itens: itens.rows, resumo: resumo.rows[0] });
   } catch (e) { console.error('Erro relatorio EP pagos:', e); res.status(500).json({ erro: 'Erro ao gerar o relatório.' }); }
+});
+
+// Reconciliação retroativa: baixa a Taxa da Plataforma dos alunos cujo acesso EP já foi pago
+// (pago_em preenchido) mas cuja conta a receber ainda está aberta — pagamentos anteriores à
+// baixa automática (v3.55). Comando único acionado pelo master. (v3.56)
+app.post('/admin/english-platform/reconciliar-taxas', autenticar, exigirPerfil('master'), async (req, res) => {
+  try {
+    const r = await pool.query(
+      `UPDATE contas_receber cr
+          SET status = 'paga', data_pagamento = CURRENT_DATE, forma_pagamento = 'PIX',
+              valor_recebido = cr.valor_final
+        WHERE cr.status IN ('pendente','atrasada')
+          AND cr.descricao ILIKE 'Taxa da Plataforma%'
+          AND cr.aluno_id IN (SELECT ep.aluno_id FROM english_platform_acesso ep WHERE ep.pago_em IS NOT NULL)`);
+    res.json({ ok: true, baixadas: r.rowCount });
+  } catch (e) { console.error('Erro reconciliar taxas EP:', e); res.status(500).json({ erro: 'Erro ao reconciliar as taxas da plataforma.' }); }
 });
 
 app.get('/professor/turmas', autenticar, somenteProfessor, async (req, res) => {
@@ -4945,7 +4962,7 @@ app.get('/health', async (req, res) => {
     res.json({
       status: (erroInicializacao || falhasMigracao.length) ? 'degradado' : 'ok',
       sistema: 'CEMIC Gestão',
-      versao: '3.55 (Baixa automática da Taxa da Plataforma no financeiro ao confirmar o PIX da English Platform)',
+      versao: '3.56 (Relatório financeiro detalhado corrigido + modalidades + reconciliação retroativa da Taxa da Plataforma)',
       inicializacao: erroInicializacao || 'ok',
       migracoes_com_falha: falhasMigracao
     });
@@ -4962,7 +4979,7 @@ initDB()
     console.error('Falha ao inicializar o banco:', e);
   })
   .finally(() => app.listen(PORT, () => {
-    console.log(`CEMIC Gestão — backend v3.55 rodando na porta ${PORT}`);
+    console.log(`CEMIC Gestão — backend v3.56 rodando na porta ${PORT}`);
     if (erroInicializacao) console.error('ATENÇÃO: o sistema subiu com falha de inicialização —', erroInicializacao);
     if (falhasMigracao.length) console.error('ATENÇÃO: migrações com falha —', falhasMigracao.join(' | '));
   }));
