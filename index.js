@@ -1,5 +1,5 @@
 // ============================================================
-// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v3.43 (… + Carteira/Declaração do Professor + Folha de Chamada)
+// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v3.50 (… + English Platform: credenciamento direto de qualquer aluno pelo master)
 // Banco + Autenticação com perfis + Configurações + CRUDs
 // Stack: Node.js/Express + PostgreSQL (Railway)
 // ============================================================
@@ -2403,6 +2403,43 @@ app.get('/admin/english-platform/solicitacoes', autenticar, exigirPerfil('master
     res.json({ solicitacoes: r.rows, contagem: cont });
   } catch (e) { console.error('Erro EP solicitacoes:', e); res.status(500).json({ erro: 'Erro ao listar as solicitações.' }); }
 });
+// English Platform · busca de alunos para credenciamento DIRETO pelo master (v3.50).
+// Diferente de /solicitacoes (que so mostra quem ja tem registro), aqui o master
+// encontra QUALQUER aluno ativo — inclusive quem nunca pagou — e ve o status atual
+// na plataforma, para autorizar direto pela rota /:alunoId/autorizar (que cria o
+// registro ja como 'autorizado' quando nao existe). Um filho pode ter mais de uma
+// matricula ativa; DISTINCT ON (a.id) garante uma linha por aluno (turma mais recente).
+app.get('/admin/english-platform/alunos', autenticar, exigirPerfil('master'), async (req, res) => {
+  try {
+    const busca = req.query.busca ? String(req.query.busca).trim() : '';
+    const params = [];
+    const cond = [`a.status = 'ativo'`];
+    if (busca) {
+      params.push(`%${busca}%`);
+      cond.push(`(a.nome ILIKE $${params.length} OR a.codigo ILIKE $${params.length} OR a.cpf ILIKE $${params.length})`);
+    }
+    const where = `WHERE ${cond.join(' AND ')}`;
+    const r = await pool.query(
+      `SELECT sub.aluno_id, sub.aluno_nome, sub.aluno_codigo, sub.turma_nome, sub.turno,
+              sub.english_platform_status, sub.autorizado_em, sub.pago_em
+         FROM (
+           SELECT DISTINCT ON (a.id)
+                  a.id AS aluno_id, a.nome AS aluno_nome, a.codigo AS aluno_codigo,
+                  t.nome AS turma_nome, t.turno,
+                  COALESCE(ep.status, 'nenhum') AS english_platform_status,
+                  ep.autorizado_em, ep.pago_em
+             FROM alunos a
+             LEFT JOIN matriculas m ON m.aluno_id = a.id AND m.status = 'ativa'
+             LEFT JOIN turmas t ON t.id = m.turma_id
+             LEFT JOIN english_platform_acesso ep ON ep.aluno_id = a.id
+             ${where}
+            ORDER BY a.id, m.id DESC
+         ) sub
+        ORDER BY sub.aluno_nome
+        LIMIT 100`, params);
+    res.json({ alunos: r.rows });
+  } catch (e) { console.error('Erro EP alunos:', e); res.status(500).json({ erro: 'Erro ao listar os alunos para credenciamento.' }); }
+});
 app.post('/admin/english-platform/:alunoId/autorizar', autenticar, exigirPerfil('master'), async (req, res) => {
   try {
     const alunoId = Number(req.params.alunoId);
@@ -4636,7 +4673,7 @@ app.get('/health', async (req, res) => {
     res.json({
       status: (erroInicializacao || falhasMigracao.length) ? 'degradado' : 'ok',
       sistema: 'CEMIC Gestão',
-      versao: '3.49 (English Platform — CORS explícito + preflight)',
+      versao: '3.50 (English Platform — credenciamento direto de qualquer aluno pelo master)',
       inicializacao: erroInicializacao || 'ok',
       migracoes_com_falha: falhasMigracao
     });
@@ -4653,7 +4690,7 @@ initDB()
     console.error('Falha ao inicializar o banco:', e);
   })
   .finally(() => app.listen(PORT, () => {
-    console.log(`CEMIC Gestão — backend v3.43 rodando na porta ${PORT}`);
+    console.log(`CEMIC Gestão — backend v3.50 rodando na porta ${PORT}`);
     if (erroInicializacao) console.error('ATENÇÃO: o sistema subiu com falha de inicialização —', erroInicializacao);
     if (falhasMigracao.length) console.error('ATENÇÃO: migrações com falha —', falhasMigracao.join(' | '));
   }));
