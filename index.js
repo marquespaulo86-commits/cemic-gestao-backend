@@ -419,6 +419,37 @@ async function initDB() {
   )`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_ocorrencias_aluno ON ocorrencias (aluno_id, data)`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_atividades_turma ON atividades (turma_id, criado_em)`);
+  // ---------- Reuniões de Pais (v3.52) ----------
+  await pool.query(`CREATE TABLE IF NOT EXISTS reunioes_pais (
+    id SERIAL PRIMARY KEY,
+    titulo TEXT NOT NULL,
+    data DATE NOT NULL,
+    hora TEXT,
+    semestre TEXT,
+    descricao TEXT,
+    criado_em TIMESTAMP DEFAULT NOW()
+  )`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS reuniao_presencas (
+    id SERIAL PRIMARY KEY,
+    reuniao_id INTEGER NOT NULL REFERENCES reunioes_pais(id) ON DELETE CASCADE,
+    responsavel_id INTEGER NOT NULL REFERENCES responsaveis(id) ON DELETE CASCADE,
+    presente BOOLEAN NOT NULL DEFAULT TRUE,
+    marcado_em TIMESTAMP DEFAULT NOW(),
+    marcado_por INTEGER REFERENCES usuarios(id) ON DELETE SET NULL,
+    UNIQUE(reuniao_id, responsavel_id)
+  )`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_reuniao_presencas ON reuniao_presencas (reuniao_id, responsavel_id)`);
+  // ---------- Controle de leitura / não lidos (v3.53) ----------
+  await pool.query(`CREATE TABLE IF NOT EXISTS leituras (
+    id SERIAL PRIMARY KEY,
+    perfil TEXT NOT NULL CHECK (perfil IN ('responsavel','professor')),
+    usuario_id INTEGER NOT NULL,
+    tipo TEXT NOT NULL CHECK (tipo IN ('aviso','ocorrencia')),
+    item_id INTEGER NOT NULL,
+    lido_em TIMESTAMP DEFAULT NOW(),
+    UNIQUE(perfil, usuario_id, tipo, item_id)
+  )`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_leituras ON leituras (perfil, usuario_id, tipo)`);
   // ---------- Carteira Estudantil (v3.32) ----------
   await migrar('aluno_fotos', `CREATE TABLE IF NOT EXISTS aluno_fotos (
     aluno_id INTEGER PRIMARY KEY REFERENCES alunos(id) ON DELETE CASCADE,
@@ -2663,6 +2694,157 @@ app.get('/admin/acompanhamento-pedagogico/turma/:id', autenticar, somenteGestao,
   } catch (e) { console.error('Erro acompanhamento turma:', e); res.status(500).json({ erro: 'Erro ao carregar a turma.' }); }
 });
 
+// ============================================================
+// Controle de Presença em Reunião de Pais/Responsáveis (v3.52)
+// Gestão cadastra a reunião e marca a presença dos responsáveis; o pai vê no Portal.
+// ============================================================
+async function _semestreVigente() {
+  try { const r = await pool.query(`SELECT valor FROM configuracoes WHERE chave = 'semestre_vigente'`); return r.rows.length ? JSON.parse(r.rows[0].valor) : ''; }
+  catch (e) { return ''; }
+}
+const _totalResponsaveisElegiveis = async () => {
+  const r = await pool.query(`SELECT COUNT(DISTINCT ar.responsavel_id) AS n FROM aluno_responsavel ar JOIN matriculas m ON m.aluno_id = ar.aluno_id AND m.status = 'ativa'`);
+  return Number(r.rows[0].n) || 0;
+};
+
+app.get('/admin/reunioes', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const r = await pool.query(
+      `SELECT r.id, r.titulo, r.data, r.hora, r.semestre, r.descricao,
+              (SELECT COUNT(*) FROM reuniao_presencas rp WHERE rp.reuniao_id = r.id AND rp.presente = TRUE) AS presentes,
+              (SELECT COUNT(*) FROM reuniao_presencas rp WHERE rp.reuniao_id = r.id AND rp.presente = FALSE) AS ausentes
+         FROM reunioes_pais r ORDER BY r.data DESC, r.id DESC`);
+    res.json({ reunioes: r.rows, total_responsaveis: await _totalResponsaveisElegiveis() });
+  } catch (e) { console.error('Erro reunioes:', e); res.status(500).json({ erro: 'Erro ao listar as reuniões.' }); }
+});
+
+app.post('/admin/reunioes', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const titulo = String(req.body.titulo || '').trim();
+    const data = String(req.body.data || '').trim();
+    if (!titulo || !data) return res.status(400).json({ erro: 'Título e data são obrigatórios.' });
+    const semestre = String(req.body.semestre || '').trim() || await _semestreVigente();
+    const r = await pool.query(
+      `INSERT INTO reunioes_pais (titulo, data, hora, semestre, descricao) VALUES ($1,$2,$3,$4,$5) RETURNING *`,
+      [titulo, data, String(req.body.hora || '').trim() || null, semestre || null, String(req.body.descricao || '').trim() || null]);
+    res.json(r.rows[0]);
+  } catch (e) { console.error('Erro criar reuniao:', e); res.status(500).json({ erro: 'Erro ao criar a reunião.' }); }
+});
+
+app.put('/admin/reunioes/:id', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const titulo = String(req.body.titulo || '').trim();
+    const data = String(req.body.data || '').trim();
+    if (!titulo || !data) return res.status(400).json({ erro: 'Título e data são obrigatórios.' });
+    const r = await pool.query(
+      `UPDATE reunioes_pais SET titulo=$1, data=$2, hora=$3, semestre=$4, descricao=$5 WHERE id=$6 RETURNING *`,
+      [titulo, data, String(req.body.hora || '').trim() || null, String(req.body.semestre || '').trim() || null, String(req.body.descricao || '').trim() || null, Number(req.params.id)]);
+    if (!r.rows.length) return res.status(404).json({ erro: 'Reunião não encontrada.' });
+    res.json(r.rows[0]);
+  } catch (e) { console.error('Erro editar reuniao:', e); res.status(500).json({ erro: 'Erro ao editar a reunião.' }); }
+});
+
+app.delete('/admin/reunioes/:id', autenticar, somenteGestao, async (req, res) => {
+  try { await pool.query(`DELETE FROM reunioes_pais WHERE id = $1`, [Number(req.params.id)]); res.json({ ok: true }); }
+  catch (e) { console.error('Erro excluir reuniao:', e); res.status(500).json({ erro: 'Erro ao excluir a reunião.' }); }
+});
+
+// Tela de chamada: todos os responsáveis com aluno ativo + presença nesta reunião
+app.get('/admin/reunioes/:id/presencas', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const rh = await pool.query(`SELECT id, titulo, data, hora, semestre, descricao FROM reunioes_pais WHERE id = $1`, [id]);
+    if (!rh.rows.length) return res.status(404).json({ erro: 'Reunião não encontrada.' });
+    const busca = req.query.busca ? String(req.query.busca).trim() : '';
+    const params = [id];
+    let filtro = '';
+    if (busca) { params.push('%' + busca + '%'); filtro = ` AND (r.nome ILIKE $${params.length} OR r.cpf ILIKE $${params.length})`; }
+    const lista = await pool.query(
+      `SELECT r.id AS responsavel_id, r.nome, r.cpf, r.whatsapp, rp.presente,
+              (SELECT string_agg(DISTINCT a.nome, ', ') FROM aluno_responsavel ar
+                 JOIN alunos a ON a.id = ar.aluno_id
+                 JOIN matriculas m ON m.aluno_id = a.id AND m.status = 'ativa'
+                WHERE ar.responsavel_id = r.id) AS filhos
+         FROM responsaveis r
+         LEFT JOIN reuniao_presencas rp ON rp.reuniao_id = $1 AND rp.responsavel_id = r.id
+        WHERE EXISTS (SELECT 1 FROM aluno_responsavel ar JOIN matriculas m ON m.aluno_id = ar.aluno_id AND m.status = 'ativa' WHERE ar.responsavel_id = r.id)${filtro}
+        ORDER BY r.nome`, params);
+    res.json({ reuniao: rh.rows[0], responsaveis: lista.rows });
+  } catch (e) { console.error('Erro presencas reuniao:', e); res.status(500).json({ erro: 'Erro ao carregar a lista de presença.' }); }
+});
+
+// Marcar/alterar/limpar a presença de um responsável
+app.post('/admin/reunioes/:id/presenca', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const reuniaoId = Number(req.params.id);
+    const respId = Number(req.body.responsavel_id);
+    if (!respId) return res.status(400).json({ erro: 'Responsável inválido.' });
+    if (req.body.presente === null) {
+      await pool.query(`DELETE FROM reuniao_presencas WHERE reuniao_id = $1 AND responsavel_id = $2`, [reuniaoId, respId]);
+      return res.json({ ok: true, presente: null });
+    }
+    const presente = !!req.body.presente;
+    await pool.query(
+      `INSERT INTO reuniao_presencas (reuniao_id, responsavel_id, presente, marcado_por)
+       VALUES ($1,$2,$3,$4)
+       ON CONFLICT (reuniao_id, responsavel_id)
+       DO UPDATE SET presente = EXCLUDED.presente, marcado_em = NOW(), marcado_por = EXCLUDED.marcado_por`,
+      [reuniaoId, respId, presente, req.usuario.id]);
+    res.json({ ok: true, presente });
+  } catch (e) { console.error('Erro marcar presenca:', e); res.status(500).json({ erro: 'Erro ao registrar a presença.' }); }
+});
+
+// Portal do responsável: reuniões + a própria presença
+app.get('/publico/portal/reunioes', autenticarResponsavel, async (req, res) => {
+  try {
+    const r = await pool.query(
+      `SELECT r.id, r.titulo, r.data, r.hora, r.semestre, r.descricao, rp.presente
+         FROM reunioes_pais r
+         LEFT JOIN reuniao_presencas rp ON rp.reuniao_id = r.id AND rp.responsavel_id = $1
+        ORDER BY r.data DESC, r.id DESC`, [req.responsavelId]);
+    res.json(r.rows);
+  } catch (e) { console.error('Erro portal reunioes:', e); res.status(500).json({ erro: 'Erro ao carregar as reuniões.' }); }
+});
+
+// ============================================================
+// Não lidos (v3.53) — avisos/circulares/ocorrências novos sinalizados no Portal
+// ============================================================
+app.get('/publico/portal/nao-lidos', autenticarResponsavel, async (req, res) => {
+  try {
+    const q = await pool.query(
+      `SELECT
+        (SELECT COUNT(*) FROM avisos av
+           WHERE av.escopo = 'geral'
+             AND NOT EXISTS (SELECT 1 FROM leituras l WHERE l.perfil='responsavel' AND l.usuario_id=$1 AND l.tipo='aviso' AND l.item_id=av.id)) AS informativos,
+        (SELECT COUNT(*) FROM avisos av
+           WHERE ((av.escopo='turma' AND av.turma_id IN (SELECT m.turma_id FROM aluno_responsavel ar JOIN matriculas m ON m.aluno_id=ar.aluno_id AND m.status='ativa' WHERE ar.responsavel_id=$1))
+               OR (av.escopo='aluno' AND av.aluno_id IN (SELECT ar.aluno_id FROM aluno_responsavel ar JOIN matriculas m ON m.aluno_id=ar.aluno_id AND m.status='ativa' WHERE ar.responsavel_id=$1)))
+             AND NOT EXISTS (SELECT 1 FROM leituras l WHERE l.perfil='responsavel' AND l.usuario_id=$1 AND l.tipo='aviso' AND l.item_id=av.id)) AS avisos,
+        (SELECT COUNT(*) FROM ocorrencias oc
+           WHERE oc.visivel_responsavel = TRUE
+             AND oc.aluno_id IN (SELECT ar.aluno_id FROM aluno_responsavel ar JOIN matriculas m ON m.aluno_id=ar.aluno_id AND m.status='ativa' WHERE ar.responsavel_id=$1)
+             AND NOT EXISTS (SELECT 1 FROM leituras l WHERE l.perfil='responsavel' AND l.usuario_id=$1 AND l.tipo='ocorrencia' AND l.item_id=oc.id)) AS ocorrencias`,
+      [req.responsavelId]);
+    const row = q.rows[0] || {};
+    res.json({ informativos: Number(row.informativos) || 0, avisos: Number(row.avisos) || 0, ocorrencias: Number(row.ocorrencias) || 0 });
+  } catch (e) { console.error('Erro nao-lidos:', e); res.status(500).json({ erro: 'Erro ao verificar novidades.' }); }
+});
+
+app.post('/publico/portal/marcar-lido', autenticarResponsavel, async (req, res) => {
+  try {
+    const tipo = req.body.tipo;
+    if (!['aviso', 'ocorrencia'].includes(tipo)) return res.status(400).json({ erro: 'Tipo inválido.' });
+    const ids = Array.isArray(req.body.ids) ? req.body.ids.map(Number).filter(Boolean) : [];
+    if (!ids.length) return res.json({ ok: true });
+    await pool.query(
+      `INSERT INTO leituras (perfil, usuario_id, tipo, item_id)
+       SELECT 'responsavel', $1, $2, x FROM unnest($3::int[]) AS x
+       ON CONFLICT (perfil, usuario_id, tipo, item_id) DO NOTHING`,
+      [req.responsavelId, tipo, ids]);
+    res.json({ ok: true });
+  } catch (e) { console.error('Erro marcar-lido:', e); res.status(500).json({ erro: 'Erro ao marcar como lido.' }); }
+});
+
 app.get('/professor/turmas', autenticar, somenteProfessor, async (req, res) => {
   try {
     const prof = escopoProfessor(req);
@@ -4722,7 +4904,7 @@ app.get('/health', async (req, res) => {
     res.json({
       status: (erroInicializacao || falhasMigracao.length) ? 'degradado' : 'ok',
       sistema: 'CEMIC Gestão',
-      versao: '3.51 (Acompanhamento pedagógico — gestão monitora conteúdos e chamada dos professores)',
+      versao: '3.53 (Não lidos — avisos, circulares e ocorrências novos sinalizados no Portal dos Pais)',
       inicializacao: erroInicializacao || 'ok',
       migracoes_com_falha: falhasMigracao
     });
@@ -4739,7 +4921,7 @@ initDB()
     console.error('Falha ao inicializar o banco:', e);
   })
   .finally(() => app.listen(PORT, () => {
-    console.log(`CEMIC Gestão — backend v3.51 rodando na porta ${PORT}`);
+    console.log(`CEMIC Gestão — backend v3.53 rodando na porta ${PORT}`);
     if (erroInicializacao) console.error('ATENÇÃO: o sistema subiu com falha de inicialização —', erroInicializacao);
     if (falhasMigracao.length) console.error('ATENÇÃO: migrações com falha —', falhasMigracao.join(' | '));
   }));
