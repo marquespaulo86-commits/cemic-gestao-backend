@@ -2614,6 +2614,55 @@ const MIMES_OK = {
 const LIMITE_ARQUIVO = 5 * 1024 * 1024;
 
 // --- Turmas do professor ---
+// ============================================================
+// Acompanhamento pedagógico (v3.51) — leitura só para gestão/master monitorar a rotina
+// dos professores (conteúdos lançados e chamada) SEM precisar entrar como professor.
+// ============================================================
+app.get('/admin/acompanhamento-pedagogico', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const params = [];
+    const cond = ["t.status <> 'encerrada'"];
+    if (req.query.semestre) { params.push(String(req.query.semestre)); cond.push(`t.semestre = $${params.length}`); }
+    if (req.query.turno)    { params.push(String(req.query.turno));    cond.push(`t.turno = $${params.length}`); }
+    const where = 'WHERE ' + cond.join(' AND ');
+    const r = await pool.query(
+      `SELECT t.id AS turma_id, t.nome AS turma_nome, t.turno, t.semestre, t.status,
+              COALESCE(p.nome, '— sem professor') AS professor_nome,
+              (SELECT COUNT(*) FROM matriculas m WHERE m.turma_id = t.id AND m.status = 'ativa') AS alunos_ativos,
+              (SELECT COUNT(*) FROM aulas a WHERE a.turma_id = t.id) AS total_aulas,
+              (SELECT MAX(a.data) FROM aulas a WHERE a.turma_id = t.id) AS ultima_aula,
+              (SELECT COUNT(*) FROM aulas a WHERE a.turma_id = t.id AND (a.conteudo IS NULL OR btrim(a.conteudo) = '')) AS aulas_sem_conteudo,
+              (SELECT COUNT(*) FROM aulas a WHERE a.turma_id = t.id AND NOT EXISTS (SELECT 1 FROM frequencias f WHERE f.aula_id = a.id)) AS aulas_sem_chamada,
+              (SELECT MAX(a.data) FROM aulas a WHERE a.turma_id = t.id AND EXISTS (SELECT 1 FROM frequencias f WHERE f.aula_id = a.id)) AS ultima_chamada,
+              (SELECT COUNT(*) FROM avaliacoes av WHERE av.turma_id = t.id) AS total_avaliacoes,
+              (SELECT COUNT(*) FROM atividades atv WHERE atv.turma_id = t.id) AS total_atividades,
+              (SELECT COUNT(*) FROM ocorrencias oc WHERE oc.turma_id = t.id) AS total_ocorrencias
+         FROM turmas t
+         LEFT JOIN professores p ON p.id = t.professor_id
+         ${where}
+        ORDER BY COALESCE(p.nome, 'zzzz'), t.nome`, params);
+    res.json({ turmas: r.rows });
+  } catch (e) { console.error('Erro acompanhamento:', e); res.status(500).json({ erro: 'Erro ao carregar o acompanhamento pedagógico.' }); }
+});
+
+app.get('/admin/acompanhamento-pedagogico/turma/:id', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const th = await pool.query(
+      `SELECT t.id, t.nome, t.turno, t.semestre, t.status, COALESCE(p.nome, '— sem professor') AS professor_nome,
+              (SELECT COUNT(*) FROM matriculas m WHERE m.turma_id = t.id AND m.status = 'ativa') AS alunos_ativos
+         FROM turmas t LEFT JOIN professores p ON p.id = t.professor_id WHERE t.id = $1`, [id]);
+    if (!th.rows.length) return res.status(404).json({ erro: 'Turma não encontrada.' });
+    const aulas = await pool.query(
+      `SELECT a.id, a.data, a.conteudo,
+              EXISTS (SELECT 1 FROM frequencias f WHERE f.aula_id = a.id) AS tem_chamada,
+              (SELECT COUNT(*) FROM frequencias f WHERE f.aula_id = a.id AND f.presente = TRUE) AS presentes,
+              (SELECT COUNT(*) FROM frequencias f WHERE f.aula_id = a.id AND f.presente = FALSE) AS faltas
+         FROM aulas a WHERE a.turma_id = $1 ORDER BY a.data DESC, a.id DESC`, [id]);
+    res.json({ turma: th.rows[0], aulas: aulas.rows });
+  } catch (e) { console.error('Erro acompanhamento turma:', e); res.status(500).json({ erro: 'Erro ao carregar a turma.' }); }
+});
+
 app.get('/professor/turmas', autenticar, somenteProfessor, async (req, res) => {
   try {
     const prof = escopoProfessor(req);
@@ -4673,7 +4722,7 @@ app.get('/health', async (req, res) => {
     res.json({
       status: (erroInicializacao || falhasMigracao.length) ? 'degradado' : 'ok',
       sistema: 'CEMIC Gestão',
-      versao: '3.50 (English Platform — credenciamento direto de qualquer aluno pelo master)',
+      versao: '3.51 (Acompanhamento pedagógico — gestão monitora conteúdos e chamada dos professores)',
       inicializacao: erroInicializacao || 'ok',
       migracoes_com_falha: falhasMigracao
     });
@@ -4690,7 +4739,7 @@ initDB()
     console.error('Falha ao inicializar o banco:', e);
   })
   .finally(() => app.listen(PORT, () => {
-    console.log(`CEMIC Gestão — backend v3.50 rodando na porta ${PORT}`);
+    console.log(`CEMIC Gestão — backend v3.51 rodando na porta ${PORT}`);
     if (erroInicializacao) console.error('ATENÇÃO: o sistema subiu com falha de inicialização —', erroInicializacao);
     if (falhasMigracao.length) console.error('ATENÇÃO: migrações com falha —', falhasMigracao.join(' | '));
   }));
