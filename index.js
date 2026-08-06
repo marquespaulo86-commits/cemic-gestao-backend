@@ -4730,9 +4730,10 @@ async function marcarPreInscricaoPaga(preId) {
 }
 
 // English Platform: cria/atualiza as solicitações de acesso (pendente) de todos os filhos do responsável.
-async function criarSolicitacoesEP(responsavelId, valor, ref) {
+async function criarSolicitacoesEP(responsavelId, valor, ref, executor) {
+  const db = executor || pool; // permite rodar dentro de uma transação (item 1 da auditoria)
   const v = (valor != null && !isNaN(valor)) ? valor : null;
-  const r = await pool.query(
+  const r = await db.query(
     `INSERT INTO english_platform_acesso (aluno_id, status, solicitado_por, pago_em, pagamento_ref, valor)
      SELECT ar.aluno_id, 'pendente', $1, NOW(), $2, $3
        FROM aluno_responsavel ar WHERE ar.responsavel_id = $1
@@ -4763,17 +4764,43 @@ async function darBaixaTaxaPlataforma(responsavelId, txid) {
 }
 // Marca uma cobrança de credenciamento como paga e dispara as solicitações pendentes.
 async function marcarPagamentoEPPago(txid) {
-  const q = await pool.query(`SELECT * FROM english_platform_pagamentos WHERE txid = $1`, [txid]);
-  if (!q.rows.length) return false;
-  const pg = q.rows[0];
-  if (pg.status === 'CONCLUIDA') return true;
-  await pool.query(`UPDATE english_platform_pagamentos SET status='CONCLUIDA', pago_em=NOW() WHERE txid=$1`, [txid]);
-  if (pg.responsavel_id) {
-    await criarSolicitacoesEP(pg.responsavel_id, Number(pg.valor), 'PIX ' + txid);
-    try { await darBaixaTaxaPlataforma(pg.responsavel_id, txid); }
-    catch (e) { console.error('Falha na baixa automática da Taxa da Plataforma (txid ' + txid + '):', e.message); }
+  // Marcação ATÔMICA (item 2 da auditoria): só um chamador — webhook OU polling — vence a corrida.
+  // O UPDATE condicional garante que os efeitos colaterais rodem uma única vez.
+  const cliente = await pool.connect();
+  try {
+    await cliente.query('BEGIN');
+    // Trava a linha e confirma o pagamento apenas se ainda não estava CONCLUIDA.
+    const upd = await cliente.query(
+      `UPDATE english_platform_pagamentos
+          SET status='CONCLUIDA', pago_em=NOW()
+        WHERE txid=$1 AND status <> 'CONCLUIDA'
+        RETURNING responsavel_id, valor`, [txid]);
+    if (!upd.rows.length) {
+      // Ou não existe, ou já estava CONCLUIDA (outro chamador venceu): nada a fazer.
+      await cliente.query('ROLLBACK');
+      const existe = await pool.query(`SELECT 1 FROM english_platform_pagamentos WHERE txid=$1`, [txid]);
+      return existe.rows.length > 0;
+    }
+    const pg = upd.rows[0];
+    // Item 1: criar as solicitações DENTRO da mesma transação. Se falhar, o COMMIT não acontece,
+    // o status volta para ATIVA e o próximo webhook/polling reprocessa — o pai nunca some da fila.
+    if (pg.responsavel_id) {
+      await criarSolicitacoesEP(pg.responsavel_id, Number(pg.valor), 'PIX ' + txid, cliente);
+    }
+    await cliente.query('COMMIT');
+    // A baixa financeira fica FORA da transação (não deve derrubar o credenciamento se falhar).
+    if (pg.responsavel_id) {
+      try { await darBaixaTaxaPlataforma(pg.responsavel_id, txid); }
+      catch (e) { console.error('Falha na baixa automática da Taxa da Plataforma (txid ' + txid + '):', e.message); }
+    }
+    return true;
+  } catch (e) {
+    try { await cliente.query('ROLLBACK'); } catch (_) {}
+    console.error('marcarPagamentoEPPago: rollback (txid ' + txid + '):', e.message);
+    throw e; // deixa o webhook/polling tratar; o pagamento permanece ATIVA e será reprocessado
+  } finally {
+    cliente.release();
   }
-  return true;
 }
 
 // Gera (ou reaproveita) a cobrança PIX da taxa de uma pré-inscrição
@@ -4975,7 +5002,7 @@ app.get('/health', async (req, res) => {
     res.json({
       status: (erroInicializacao || falhasMigracao.length) ? 'degradado' : 'ok',
       sistema: 'CEMIC Gestão',
-      versao: '3.57 (Alerta de contas vencidas no Portal dos Pais)',
+      versao: '3.58 (English Platform — confirmação de pagamento atômica e transacional: pago sempre vira pendente na fila do master)',
       inicializacao: erroInicializacao || 'ok',
       migracoes_com_falha: falhasMigracao
     });
@@ -4992,7 +5019,7 @@ initDB()
     console.error('Falha ao inicializar o banco:', e);
   })
   .finally(() => app.listen(PORT, () => {
-    console.log(`CEMIC Gestão — backend v3.57 rodando na porta ${PORT}`);
+    console.log(`CEMIC Gestão — backend v3.58 rodando na porta ${PORT}`);
     if (erroInicializacao) console.error('ATENÇÃO: o sistema subiu com falha de inicialização —', erroInicializacao);
     if (falhasMigracao.length) console.error('ATENÇÃO: migrações com falha —', falhasMigracao.join(' | '));
   }));
