@@ -386,6 +386,10 @@ async function initDB() {
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_prof_pag_ref ON professor_pagamentos (professor_id, referencia)`);
   // ---------- Portal do Professor ----------
   await pool.query(`ALTER TABLE aulas ADD COLUMN IF NOT EXISTS professor_id INTEGER REFERENCES professores(id) ON DELETE SET NULL`);
+  await pool.query(`ALTER TABLE aulas ADD COLUMN IF NOT EXISTS objetivo TEXT`);
+  await pool.query(`ALTER TABLE aulas ADD COLUMN IF NOT EXISTS metodologia TEXT`);
+  await pool.query(`ALTER TABLE aulas ADD COLUMN IF NOT EXISTS avaliacao TEXT`);
+  await pool.query(`ALTER TABLE aulas ADD COLUMN IF NOT EXISTS habilidades TEXT[]`);
   await pool.query(`CREATE TABLE IF NOT EXISTS ocorrencias (
     id SERIAL PRIMARY KEY,
     aluno_id INTEGER NOT NULL REFERENCES alunos(id) ON DELETE CASCADE,
@@ -2949,7 +2953,7 @@ app.get('/professor/turmas/:id/aulas', autenticar, somenteProfessor, async (req,
   try {
     if (!await podeTurma(req, req.params.id)) return res.status(403).json({ erro: 'Turma não vinculada ao seu cadastro.' });
     const r = await pool.query(
-      `SELECT au.id, au.data, au.conteudo,
+      `SELECT au.id, au.data, au.conteudo, au.objetivo, au.metodologia, au.avaliacao, au.habilidades,
               (SELECT COUNT(*) FROM frequencias f WHERE f.aula_id = au.id) AS chamada_lancada,
               (SELECT COUNT(*) FROM frequencias f WHERE f.aula_id = au.id AND f.presente = FALSE) AS faltas
        FROM aulas au WHERE au.turma_id = $1 ORDER BY au.data DESC, au.id DESC`, [req.params.id]);
@@ -2964,10 +2968,16 @@ app.post('/professor/turmas/:id/aulas', autenticar, somenteProfessor, async (req
     const conteudo = (req.body.conteudo || '').trim();
     if (!data) return res.status(400).json({ erro: 'Informe a data da aula.' });
     if (!conteudo) return res.status(400).json({ erro: 'Descreva o conteúdo trabalhado.' });
+    const objetivo = (req.body.objetivo || '').trim() || null;
+    const metodologia = (req.body.metodologia || '').trim() || null;
+    const avaliacao = (req.body.avaliacao || '').trim() || null;
+    const HAB = ['listening', 'speaking', 'writing', 'reading'];
+    const habilidades = Array.isArray(req.body.habilidades) ? req.body.habilidades.filter(x => HAB.includes(x)) : [];
     const prof = escopoProfessor(req);
     const r = await pool.query(
-      `INSERT INTO aulas (turma_id, data, conteudo, professor_id) VALUES ($1,$2,$3,$4) RETURNING id`,
-      [req.params.id, data, conteudo, prof]);
+      `INSERT INTO aulas (turma_id, data, conteudo, professor_id, objetivo, metodologia, avaliacao, habilidades)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id`,
+      [req.params.id, data, conteudo, prof, objetivo, metodologia, avaliacao, habilidades]);
     res.status(201).json({ id: r.rows[0].id });
   } catch (e) { console.error('Erro POST aula:', e); res.status(500).json({ erro: 'Erro ao registrar a aula.' }); }
 });
@@ -5024,7 +5034,7 @@ app.get('/health', async (req, res) => {
     res.json({
       status: (erroInicializacao || falhasMigracao.length) ? 'degradado' : 'ok',
       sistema: 'CEMIC Gestão',
-      versao: '3.60 (English Platform — IA com system prompt fixado no servidor por modo + teto diário por responsável)',
+      versao: '3.61 (Lançamento de conteúdo do professor — objetivo, metodologia, avaliação e habilidades L/S/W/R)',
       inicializacao: erroInicializacao || 'ok',
       migracoes_com_falha: falhasMigracao
     });
@@ -5041,7 +5051,7 @@ initDB()
     console.error('Falha ao inicializar o banco:', e);
   })
   .finally(() => app.listen(PORT, () => {
-    console.log(`CEMIC Gestão — backend v3.60 rodando na porta ${PORT}`);
+    console.log(`CEMIC Gestão — backend v3.61 rodando na porta ${PORT}`);
     if (erroInicializacao) console.error('ATENÇÃO: o sistema subiu com falha de inicialização —', erroInicializacao);
     if (falhasMigracao.length) console.error('ATENÇÃO: migrações com falha —', falhasMigracao.join(' | '));
   }));
