@@ -390,6 +390,7 @@ async function initDB() {
   await pool.query(`ALTER TABLE aulas ADD COLUMN IF NOT EXISTS metodologia TEXT`);
   await pool.query(`ALTER TABLE aulas ADD COLUMN IF NOT EXISTS avaliacao TEXT`);
   await pool.query(`ALTER TABLE aulas ADD COLUMN IF NOT EXISTS habilidades TEXT[]`);
+  await pool.query(`ALTER TABLE niveis ADD COLUMN IF NOT EXISTS plataforma_modulo TEXT`);
   await pool.query(`CREATE TABLE IF NOT EXISTS ocorrencias (
     id SERIAL PRIMARY KEY,
     aluno_id INTEGER NOT NULL REFERENCES alunos(id) ON DELETE CASCADE,
@@ -839,7 +840,7 @@ function autenticarResponsavel(req, res, next) {
 async function alunosDoResponsavel(respId) {
   const r = await pool.query(
     `SELECT a.id, a.nome, a.cpf, a.codigo, a.data_nascimento,
-            t.nome AS turma_nome, t.turno, n.nome AS nivel_nome, c.nome AS curso_nome,
+            t.nome AS turma_nome, t.turno, n.nome AS nivel_nome, n.plataforma_modulo AS modulo_key, c.nome AS curso_nome,
             p.nome AS professor_nome,
             COALESCE(ep.status, 'nenhum') AS english_platform_status
      FROM aluno_responsavel ar
@@ -1302,8 +1303,8 @@ app.post('/admin/niveis', autenticar, somenteGestao, async (req, res) => {
     const erro = obrigatorios(req.body, ['curso_id', 'nome', 'ordem']);
     if (erro) return res.status(400).json({ erro });
     const r = await pool.query(
-      `INSERT INTO niveis (curso_id, nome, ordem, carga_horaria) VALUES ($1,$2,$3,$4) RETURNING *`,
-      [req.body.curso_id, req.body.nome, req.body.ordem, req.body.carga_horaria || null]
+      `INSERT INTO niveis (curso_id, nome, ordem, carga_horaria, plataforma_modulo) VALUES ($1,$2,$3,$4,$5) RETURNING *`,
+      [req.body.curso_id, req.body.nome, req.body.ordem, req.body.carga_horaria || null, req.body.plataforma_modulo || null]
     );
     res.status(201).json(r.rows[0]);
   } catch (e) {
@@ -1320,8 +1321,8 @@ app.put('/admin/niveis/:id', autenticar, somenteGestao, async (req, res) => {
     if (!atual.rows.length) return res.status(404).json({ erro: 'Nível não encontrado.' });
     const x = atual.rows[0];
     const r = await pool.query(
-      `UPDATE niveis SET nome=$1, ordem=$2, carga_horaria=$3 WHERE id=$4 RETURNING *`,
-      [req.body.nome ?? x.nome, req.body.ordem ?? x.ordem, req.body.carga_horaria ?? x.carga_horaria, req.params.id]
+      `UPDATE niveis SET nome=$1, ordem=$2, carga_horaria=$3, plataforma_modulo=$4 WHERE id=$5 RETURNING *`,
+      [req.body.nome ?? x.nome, req.body.ordem ?? x.ordem, req.body.carga_horaria ?? x.carga_horaria, req.body.plataforma_modulo ?? x.plataforma_modulo, req.params.id]
     );
     res.json(r.rows[0]);
   } catch (e) {
@@ -5034,7 +5035,7 @@ app.get('/health', async (req, res) => {
     res.json({
       status: (erroInicializacao || falhasMigracao.length) ? 'degradado' : 'ok',
       sistema: 'CEMIC Gestão',
-      versao: '3.61 (Lançamento de conteúdo do professor — objetivo, metodologia, avaliação e habilidades L/S/W/R)',
+      versao: '3.62 (Vínculo explícito nível→módulo da English Platform: niveis.plataforma_modulo, devolvido em modulo_key)',
       inicializacao: erroInicializacao || 'ok',
       migracoes_com_falha: falhasMigracao
     });
@@ -5051,7 +5052,7 @@ initDB()
     console.error('Falha ao inicializar o banco:', e);
   })
   .finally(() => app.listen(PORT, () => {
-    console.log(`CEMIC Gestão — backend v3.61 rodando na porta ${PORT}`);
+    console.log(`CEMIC Gestão — backend v3.62 rodando na porta ${PORT}`);
     if (erroInicializacao) console.error('ATENÇÃO: o sistema subiu com falha de inicialização —', erroInicializacao);
     if (falhasMigracao.length) console.error('ATENÇÃO: migrações com falha —', falhasMigracao.join(' | '));
   }));
