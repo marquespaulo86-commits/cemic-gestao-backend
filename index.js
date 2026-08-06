@@ -598,6 +598,7 @@ async function initDB() {
     pago_em TIMESTAMP
   )`);
   await migrar('idx_ep_pag_resp', `CREATE INDEX IF NOT EXISTS idx_ep_pag_resp ON english_platform_pagamentos (responsavel_id, status)`);
+  await migrar('ep_pag_expira', `ALTER TABLE english_platform_pagamentos ADD COLUMN IF NOT EXISTS expira_em TIMESTAMP`);
   // Índices nas FKs mais usadas em JOIN/filtro (login do Portal, EP, boletos): antes só 5 índices p/ 36 tabelas.
   await migrar('idx_ar_responsavel', `CREATE INDEX IF NOT EXISTS idx_ar_responsavel ON aluno_responsavel (responsavel_id)`);
   await migrar('idx_ar_aluno', `CREATE INDEX IF NOT EXISTS idx_ar_aluno ON aluno_responsavel (aluno_id)`);
@@ -2381,14 +2382,30 @@ app.post('/publico/portal/english-platform/solicitar', autenticarResponsavel, as
 });
 
 // English Platform · IA (assistente + dicionário). Proxy server-side para não expor a chave no navegador.
+// Teto diário do assistente por responsável (anti-abuso de custo — item 6 da auditoria). Em memória.
+const _epIaDia = new Map();
+const EP_IA_LIMITE_DIA = Number(process.env.EP_IA_LIMITE_DIA || 120);
+function epIaOkDia(respId) {
+  const hoje = new Date().toISOString().slice(0, 10);
+  const reg = _epIaDia.get(respId);
+  if (!reg || reg.dia !== hoje) { _epIaDia.set(respId, { dia: hoje, n: 1 }); return true; }
+  if (reg.n >= EP_IA_LIMITE_DIA) return false;
+  reg.n++; return true;
+}
 // Só para responsáveis autenticados e com limite de uso. Configure ANTHROPIC_API_KEY no ambiente (Railway).
 app.post('/publico/portal/assistant', autenticarResponsavel, limiterIA, async (req, res) => {
   try {
     const key = process.env.ANTHROPIC_API_KEY;
     if (!key) return res.status(503).json({ erro: 'Assistente indisponível: falta configurar a chave da IA no servidor.' });
-    const system = String((req.body && req.body.system) || '').slice(0, 4000);
-    const user = String((req.body && req.body.user) || '').slice(0, 4000);
+    const user = String((req.body && req.body.user) || '').slice(0, 2000);
     if (!user) return res.status(400).json({ erro: 'Mensagem vazia.' });
+    // Item 6 da auditoria: o system prompt é definido AQUI (servidor), por modo — o cliente não o controla mais.
+    if (!epIaOkDia(req.responsavelId)) return res.status(429).json({ erro: 'Limite diário do assistente atingido. Tente novamente amanhã.' });
+    const modo = String((req.body && req.body.modo) || 'assistente');
+    const nivel = String((req.body && req.body.nivel) || '').slice(0, 40).replace(/[\r\n]+/g, ' ');
+    const SYS_ASSIST = "You are the friendly English tutor of CEMIC's English Platform." + (nivel ? " The student's level is " + nivel + "." : "") + " Help with English learning only: grammar, vocabulary, pronunciation, how to say things. Keep answers short and simple, matching the level. Reply in English and add a brief Portuguese note in parentheses when it helps a Brazilian learner. Be encouraging.";
+    const SYS_DICT = "You are an English-Portuguese learner's dictionary. Return ONLY a JSON object, no markdown, with keys: word, ipa (IPA or empty), pos (part of speech), en (short English definition), pt (Brazilian Portuguese translation), example (one simple English sentence using the word). Keep it concise and level-appropriate.";
+    const system = modo === 'dicionario' ? SYS_DICT : SYS_ASSIST;
     const r = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: { 'content-type': 'application/json', 'x-api-key': key, 'anthropic-version': '2023-06-01' },
@@ -4905,11 +4922,13 @@ app.post('/publico/portal/english-platform/pix', autenticarResponsavel, async (r
     const c = await pool.query(`SELECT COUNT(*)::int AS n FROM aluno_responsavel WHERE responsavel_id = $1`, [req.responsavelId]);
     const n = c.rows[0].n;
     if (!n) return res.status(400).json({ erro: 'Nenhum aluno vinculado a este CPF.' });
-    const valor = 35 * n;
+    const valorUnit = Number(await getConfig('valor_plataforma', 35)) || 35;
+    const valor = valorUnit * n;
     // Reaproveita uma cobrança ATIVA de mesmo valor, para não gerar PIX duplicado
     const ex = await pool.query(
       `SELECT txid, copia_cola, valor FROM english_platform_pagamentos
-        WHERE responsavel_id = $1 AND status = 'ATIVA' ORDER BY criado_em DESC LIMIT 1`, [req.responsavelId]);
+        WHERE responsavel_id = $1 AND status = 'ATIVA' AND expira_em > NOW() + INTERVAL '2 minutes'
+        ORDER BY criado_em DESC LIMIT 1`, [req.responsavelId]);
     if (ex.rows.length && ex.rows[0].copia_cola && Number(ex.rows[0].valor) === valor) {
       return res.json({ txid: ex.rows[0].txid, copia_cola: ex.rows[0].copia_cola, valor, alunos: n });
     }
@@ -4920,8 +4939,8 @@ app.post('/publico/portal/english-platform/pix', autenticarResponsavel, async (r
     const copiaCola = td.qr_code || '';
     const qrB64 = td.qr_code_base64 || '';
     await pool.query(
-      `INSERT INTO english_platform_pagamentos (txid, responsavel_id, valor, copia_cola, status)
-       VALUES ($1,$2,$3,$4,'ATIVA')`, [pid, req.responsavelId, valor, copiaCola]);
+      `INSERT INTO english_platform_pagamentos (txid, responsavel_id, valor, copia_cola, status, expira_em)
+       VALUES ($1,$2,$3,$4,'ATIVA',$5)`, [pid, req.responsavelId, valor, copiaCola, pay.date_of_expiration || null]);
     res.json({ txid: pid, copia_cola: copiaCola, qr_base64: qrB64, valor, alunos: n });
   } catch (e) { console.error('Erro gerar PIX EP (MP):', e); res.status(500).json({ erro: 'Não foi possível gerar o PIX agora. Tente novamente.' }); }
 });
@@ -4955,11 +4974,14 @@ app.post('/publico/mp/webhook', async (req, res) => {
       const xReqId = req.headers['x-request-id'] || '';
       const ts = (String(xSig).match(/ts=([^,]+)/) || [])[1] || '';
       const sigRec = (String(xSig).match(/v1=([a-f0-9]+)/) || [])[1] || '';
-      if (sigRec) {
-        const manifest = `id:${id};request-id:${xReqId};ts:${ts}`;
-        const sigEsp = crypto.createHmac('sha256', MP_SECRET).update(manifest).digest('hex');
-        if (sigRec !== sigEsp) { console.warn('[webhook MP] Assinatura inválida'); return res.sendStatus(200); }
-      }
+      // Item 5 da auditoria: com MP_WEBHOOK_SECRET configurado, exigir assinatura VÁLIDA.
+      // Ausência/erro NÃO passa mais (antes, sem v1= a validação era pulada).
+      const manifest = `id:${id};request-id:${xReqId};ts:${ts}`;
+      const sigEsp = crypto.createHmac('sha256', MP_SECRET).update(manifest).digest('hex');
+      let assinaturaOk = false;
+      try { assinaturaOk = !!sigRec && crypto.timingSafeEqual(Buffer.from(sigRec, 'hex'), Buffer.from(sigEsp, 'hex')); }
+      catch (_) { assinaturaOk = false; }
+      if (!assinaturaOk) { console.warn('[webhook MP] Assinatura ausente ou inválida — ignorado'); return res.sendStatus(200); }
     }
     const tipo = q.type || q.topic || b.type || b.topic;
     const ehPagamento = tipo === 'payment' || (b.action && String(b.action).startsWith('payment'));
@@ -5002,7 +5024,7 @@ app.get('/health', async (req, res) => {
     res.json({
       status: (erroInicializacao || falhasMigracao.length) ? 'degradado' : 'ok',
       sistema: 'CEMIC Gestão',
-      versao: '3.58 (English Platform — confirmação de pagamento atômica e transacional: pago sempre vira pendente na fila do master)',
+      versao: '3.60 (English Platform — IA com system prompt fixado no servidor por modo + teto diário por responsável)',
       inicializacao: erroInicializacao || 'ok',
       migracoes_com_falha: falhasMigracao
     });
@@ -5019,7 +5041,7 @@ initDB()
     console.error('Falha ao inicializar o banco:', e);
   })
   .finally(() => app.listen(PORT, () => {
-    console.log(`CEMIC Gestão — backend v3.58 rodando na porta ${PORT}`);
+    console.log(`CEMIC Gestão — backend v3.60 rodando na porta ${PORT}`);
     if (erroInicializacao) console.error('ATENÇÃO: o sistema subiu com falha de inicialização —', erroInicializacao);
     if (falhasMigracao.length) console.error('ATENÇÃO: migrações com falha —', falhasMigracao.join(' | '));
   }));
