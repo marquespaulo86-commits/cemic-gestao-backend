@@ -1,5 +1,5 @@
 // ============================================================
-// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v3.64 (… + Justificativa de Faltas: Portal dos Pais -> Pedagógico -> chamada)
+// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v3.65 (baixa da Taxa da Plataforma recortada por semestre; … + Justificativa de Faltas: Portal dos Pais -> Pedagógico -> chamada)
 // Banco + Autenticação com perfis + Configurações + CRUDs
 // Stack: Node.js/Express + PostgreSQL (Railway)
 // ============================================================
@@ -3094,13 +3094,16 @@ app.get('/admin/english-platform/relatorio-pagos', autenticar, exigirPerfil('mas
 // baixa automática (v3.55). Comando único acionado pelo master. (v3.56)
 app.post('/admin/english-platform/reconciliar-taxas', autenticar, exigirPerfil('master'), async (req, res) => {
   try {
+    const _jan = janelaSemestre(await getConfig('semestre_vigente', '2026.2'));
     const r = await pool.query(
       `UPDATE contas_receber cr
           SET status = 'paga', data_pagamento = CURRENT_DATE, forma_pagamento = 'PIX',
               valor_recebido = cr.valor_final
         WHERE cr.status IN ('pendente','atrasada')
           AND cr.descricao ILIKE 'Taxa da Plataforma%'
-          AND cr.aluno_id IN (SELECT ep.aluno_id FROM english_platform_acesso ep WHERE ep.pago_em IS NOT NULL)`);
+          AND cr.vencimento BETWEEN $1 AND $2
+          AND cr.aluno_id IN (SELECT ep.aluno_id FROM english_platform_acesso ep WHERE ep.pago_em IS NOT NULL)`,
+      [_jan.ini, _jan.fim]);
     res.json({ ok: true, baixadas: r.rowCount });
   } catch (e) { console.error('Erro reconciliar taxas EP:', e); res.status(500).json({ erro: 'Erro ao reconciliar as taxas da plataforma.' }); }
 });
@@ -5048,18 +5051,30 @@ async function criarSolicitacoesEP(responsavelId, valor, ref, executor) {
     [responsavelId, ref || null, v]);
   return r.rowCount;
 }
+// Janela de datas do semestre vigente (AAAA.S). Fallback pela data atual se o config vier
+// malformado. Usada para NÃO quitar taxas de semestres anteriores (item 7 da auditoria).
+function janelaSemestre(sem) {
+  const m = /^(\d{4})\.([12])$/.exec(String(sem || '').trim());
+  let ano, s;
+  if (m) { ano = Number(m[1]); s = Number(m[2]); }
+  else { const h = new Date(); ano = h.getFullYear(); s = (h.getMonth() + 1) <= 6 ? 1 : 2; }
+  return s === 1 ? { ini: `${ano}-01-01`, fim: `${ano}-06-30` }
+                 : { ini: `${ano}-07-01`, fim: `${ano}-12-31` };
+}
 // Baixa automática da Taxa da Plataforma Acadêmica no financeiro quando o PIX da English
 // Platform é confirmado: quita as contas a receber abertas ('Taxa da Plataforma%') dos
 // filhos do responsável que pagou. (v3.55)
 async function darBaixaTaxaPlataforma(responsavelId, txid) {
+  const _jan = janelaSemestre(await getConfig('semestre_vigente', '2026.2'));
   const r = await pool.query(
     `UPDATE contas_receber cr
         SET status = 'paga', data_pagamento = CURRENT_DATE, forma_pagamento = 'PIX',
             valor_recebido = cr.valor_final
       WHERE cr.status IN ('pendente','atrasada')
         AND cr.descricao ILIKE 'Taxa da Plataforma%'
+        AND cr.vencimento BETWEEN $2 AND $3
         AND cr.aluno_id IN (SELECT ar.aluno_id FROM aluno_responsavel ar WHERE ar.responsavel_id = $1)`,
-    [responsavelId]);
+    [responsavelId, _jan.ini, _jan.fim]);
   if (r.rowCount) console.log(`Baixa automática: ${r.rowCount} Taxa(s) da Plataforma quitada(s) no financeiro (PIX ${txid}).`);
   return r.rowCount;
 }
@@ -5308,7 +5323,7 @@ app.get('/health', async (req, res) => {
     res.json({
       status: (erroInicializacao || falhasMigracao.length) ? 'degradado' : 'ok',
       sistema: 'CEMIC Gestão',
-      versao: '3.64 (Justificativa de Faltas: Portal dos Pais -> Pedagógico -> chamada)',
+      versao: '3.65 (baixa da Taxa da Plataforma recortada por semestre)',
       inicializacao: erroInicializacao || 'ok',
       migracoes_com_falha: falhasMigracao
     });
