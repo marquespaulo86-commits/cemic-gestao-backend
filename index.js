@@ -1,5 +1,5 @@
 // ============================================================
-// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v3.63 (… + Recibo e Termo de rematrícula ONLINE verificáveis por QR)
+// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v3.64 (… + Justificativa de Faltas: Portal dos Pais -> Pedagógico -> chamada)
 // Banco + Autenticação com perfis + Configurações + CRUDs
 // Stack: Node.js/Express + PostgreSQL (Railway)
 // ============================================================
@@ -465,6 +465,30 @@ async function initDB() {
     UNIQUE(reuniao_id, responsavel_id)
   )`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_reuniao_presencas ON reuniao_presencas (reuniao_id, responsavel_id)`);
+  // Justificativa de faltas (Portal dos Pais -> Pedagógico -> chamada)
+  await pool.query(`CREATE TABLE IF NOT EXISTS justificativas_falta (
+    id SERIAL PRIMARY KEY,
+    aluno_id INTEGER NOT NULL REFERENCES alunos(id) ON DELETE CASCADE,
+    responsavel_id INTEGER REFERENCES responsaveis(id) ON DELETE SET NULL,
+    data_falta DATE NOT NULL,
+    descricao TEXT,
+    status TEXT NOT NULL DEFAULT 'pendente',
+    observacao_gestao TEXT,
+    analisada_por INTEGER REFERENCES usuarios(id) ON DELETE SET NULL,
+    analisada_em TIMESTAMP,
+    criada_em TIMESTAMP DEFAULT NOW()
+  )`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS justificativa_arquivos (
+    id SERIAL PRIMARY KEY,
+    justificativa_id INTEGER NOT NULL REFERENCES justificativas_falta(id) ON DELETE CASCADE,
+    nome TEXT NOT NULL,
+    mime TEXT NOT NULL,
+    tamanho INTEGER,
+    conteudo BYTEA NOT NULL
+  )`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_justif_aluno ON justificativas_falta (aluno_id, status)`);
+  await pool.query(`ALTER TABLE frequencias ADD COLUMN IF NOT EXISTS justificada BOOLEAN DEFAULT FALSE`);
+  await pool.query(`ALTER TABLE frequencias ADD COLUMN IF NOT EXISTS justificativa_falta_id INTEGER REFERENCES justificativas_falta(id) ON DELETE SET NULL`);
   // ---------- Controle de leitura / não lidos (v3.53) ----------
   await pool.query(`CREATE TABLE IF NOT EXISTS leituras (
     id SERIAL PRIMARY KEY,
@@ -2657,6 +2681,160 @@ app.post('/publico/portal/aluno/:id/declaracao', autenticarResponsavel, async (r
   } catch (e) { console.error('Erro gerar declaração:', e); res.status(500).json({ erro: 'Erro ao gerar a declaração.' }); }
 });
 
+
+// ============================================================
+// JUSTIFICATIVA DE FALTAS (Portal dos Pais -> Pedagógico -> chamada)
+const JUSTIF_MIMES = { 'image/jpeg': 1, 'image/png': 1, 'image/webp': 1, 'image/gif': 1, 'application/pdf': 1 };
+const JUSTIF_MAX_BYTES = 5 * 1024 * 1024;
+const JUSTIF_MAX_ARQ = 5;
+
+// Portal dos Pais: enviar justificativa de falta
+app.post('/publico/portal/aluno/:id/justificativas', autenticarResponsavel, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const alunoId = Number(req.params.id);
+    if (!(await vinculoOk(req.responsavelId, alunoId))) { client.release(); return res.status(403).json({ erro: 'Acesso negado a este aluno.' }); }
+    const dataFalta = String(req.body.data_falta || '').slice(0, 10);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(dataFalta)) { client.release(); return res.status(400).json({ erro: 'Informe a data da falta.' }); }
+    if (new Date(dataFalta) > new Date(new Date().toDateString())) { client.release(); return res.status(400).json({ erro: 'A data da falta não pode ser futura.' }); }
+    const descricao = String(req.body.descricao || '').trim() || null;
+    const arquivos = Array.isArray(req.body.arquivos) ? req.body.arquivos.slice(0, JUSTIF_MAX_ARQ) : [];
+    if (!descricao && !arquivos.length) { client.release(); return res.status(400).json({ erro: 'Anexe um documento (PDF ou imagem) ou descreva a justificativa.' }); }
+    for (const f of arquivos) {
+      if (!JUSTIF_MIMES[f.mime]) { client.release(); return res.status(400).json({ erro: `Formato não permitido: ${f.nome || f.mime}. Aceitos: imagem (JPG, PNG, WEBP, GIF) e PDF.` }); }
+      const bytes = Buffer.byteLength(String(f.base64 || ''), 'base64');
+      if (bytes > JUSTIF_MAX_BYTES) { client.release(); return res.status(400).json({ erro: `O arquivo ${f.nome || ''} excede o limite de 5 MB.` }); }
+    }
+    await client.query('BEGIN');
+    const jr = await client.query(
+      `INSERT INTO justificativas_falta (aluno_id, responsavel_id, data_falta, descricao, status)
+       VALUES ($1,$2,$3,$4,'pendente') RETURNING id, criada_em`,
+      [alunoId, req.responsavelId, dataFalta, descricao]);
+    const jid = jr.rows[0].id;
+    for (const f of arquivos) {
+      const buf = Buffer.from(String(f.base64 || ''), 'base64');
+      await client.query(
+        `INSERT INTO justificativa_arquivos (justificativa_id, nome, mime, tamanho, conteudo) VALUES ($1,$2,$3,$4,$5)`,
+        [jid, (f.nome || 'documento').slice(0, 180), f.mime, buf.length, buf]);
+    }
+    await client.query('COMMIT'); client.release();
+    res.status(201).json({ id: jid, status: 'pendente', criada_em: jr.rows[0].criada_em });
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {}); client.release();
+    console.error('Erro criar justificativa:', e); res.status(500).json({ erro: 'Erro ao enviar a justificativa.' });
+  }
+});
+
+// Portal dos Pais: listar as justificativas do aluno (com status/resposta)
+app.get('/publico/portal/aluno/:id/justificativas', autenticarResponsavel, async (req, res) => {
+  try {
+    const alunoId = Number(req.params.id);
+    if (!(await vinculoOk(req.responsavelId, alunoId))) return res.status(403).json({ erro: 'Acesso negado a este aluno.' });
+    const r = await pool.query(
+      `SELECT j.id, j.data_falta, j.descricao, j.status, j.observacao_gestao, j.analisada_em, j.criada_em,
+              COALESCE(json_agg(json_build_object('id', a.id, 'nome', a.nome, 'mime', a.mime)) FILTER (WHERE a.id IS NOT NULL), '[]') AS arquivos
+       FROM justificativas_falta j
+       LEFT JOIN justificativa_arquivos a ON a.justificativa_id = j.id
+       WHERE j.aluno_id = $1
+       GROUP BY j.id
+       ORDER BY j.criada_em DESC`, [alunoId]);
+    res.json(r.rows);
+  } catch (e) { console.error('Erro listar justificativas (portal):', e); res.status(500).json({ erro: 'Erro ao carregar as justificativas.' }); }
+});
+
+// Portal dos Pais: baixar o documento anexado (somente o responsável vinculado)
+app.get('/publico/portal/justificativas/:jid/arquivo/:aid', autenticarResponsavel, async (req, res) => {
+  try {
+    const r = await pool.query(
+      `SELECT a.nome, a.mime, a.conteudo, j.aluno_id
+       FROM justificativa_arquivos a JOIN justificativas_falta j ON j.id = a.justificativa_id
+       WHERE a.id = $1 AND a.justificativa_id = $2`, [Number(req.params.aid), Number(req.params.jid)]);
+    if (!r.rows.length) return res.status(404).json({ erro: 'Arquivo não encontrado.' });
+    if (!(await vinculoOk(req.responsavelId, r.rows[0].aluno_id))) return res.status(403).json({ erro: 'Acesso negado.' });
+    const f = r.rows[0];
+    res.setHeader('Content-Type', f.mime);
+    res.setHeader('Content-Disposition', `inline; filename*=UTF-8''${encodeURIComponent(f.nome)}`);
+    res.send(f.conteudo);
+  } catch (e) { console.error('Erro baixar anexo justificativa (portal):', e); res.status(500).json({ erro: 'Erro ao baixar o arquivo.' }); }
+});
+
+// Pedagógico (Gestão): listar justificativas (padrão: pendentes)
+app.get('/admin/justificativas', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const status = String(req.query.status || 'pendente').trim();
+    const cond = []; const params = [];
+    if (status && status !== 'todas') { params.push(status); cond.push(`j.status = $${params.length}`); }
+    const where = cond.length ? `WHERE ${cond.join(' AND ')}` : '';
+    const r = await pool.query(
+      `SELECT j.id, j.data_falta, j.descricao, j.status, j.observacao_gestao, j.analisada_em, j.criada_em,
+              al.id AS aluno_id, al.nome AS aluno_nome, resp.nome AS responsavel_nome,
+              t.nome AS turma_nome, t.turno, n.nome AS nivel_nome,
+              COALESCE(json_agg(json_build_object('id', a.id, 'nome', a.nome, 'mime', a.mime)) FILTER (WHERE a.id IS NOT NULL), '[]') AS arquivos
+       FROM justificativas_falta j
+       JOIN alunos al ON al.id = j.aluno_id
+       LEFT JOIN responsaveis resp ON resp.id = j.responsavel_id
+       LEFT JOIN matriculas m ON m.aluno_id = al.id AND m.status = 'ativa'
+       LEFT JOIN turmas t ON t.id = m.turma_id
+       LEFT JOIN niveis n ON n.id = t.nivel_id
+       LEFT JOIN justificativa_arquivos a ON a.justificativa_id = j.id
+       ${where}
+       GROUP BY j.id, al.id, al.nome, resp.nome, t.nome, t.turno, n.nome
+       ORDER BY (j.status = 'pendente') DESC, j.criada_em DESC`, params);
+    res.json(r.rows);
+  } catch (e) { console.error('Erro listar justificativas (admin):', e); res.status(500).json({ erro: 'Erro ao carregar as justificativas.' }); }
+});
+
+// Pedagógico (Gestão): baixar o documento anexado
+app.get('/admin/justificativas/:jid/arquivo/:aid', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const r = await pool.query(
+      `SELECT nome, mime, conteudo FROM justificativa_arquivos WHERE id = $1 AND justificativa_id = $2`,
+      [Number(req.params.aid), Number(req.params.jid)]);
+    if (!r.rows.length) return res.status(404).json({ erro: 'Arquivo não encontrado.' });
+    const f = r.rows[0];
+    res.setHeader('Content-Type', f.mime);
+    res.setHeader('Content-Disposition', `inline; filename*=UTF-8''${encodeURIComponent(f.nome)}`);
+    res.send(f.conteudo);
+  } catch (e) { console.error('Erro baixar anexo justificativa (admin):', e); res.status(500).json({ erro: 'Erro ao baixar o arquivo.' }); }
+});
+
+// Pedagógico (Gestão): deferir ou indeferir — ao deferir, vincula à falta já lançada
+app.post('/admin/justificativas/:id/analisar', autenticar, somenteGestao, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const jid = Number(req.params.id);
+    const decisao = String(req.body.decisao || '').trim();
+    if (!['deferida', 'indeferida'].includes(decisao)) { client.release(); return res.status(400).json({ erro: 'Decisão inválida.' }); }
+    const observacao = String(req.body.observacao || '').trim() || null;
+    await client.query('BEGIN');
+    const up = await client.query(
+      `UPDATE justificativas_falta
+          SET status = $1, observacao_gestao = $2, analisada_por = $3, analisada_em = NOW()
+        WHERE id = $4 RETURNING id`,
+      [decisao, observacao, req.usuario.id, jid]);
+    if (!up.rows.length) { await client.query('ROLLBACK'); client.release(); return res.status(404).json({ erro: 'Justificativa não encontrada.' }); }
+    let vinculada = 0;
+    if (decisao === 'deferida') {
+      const link = await client.query(
+        `UPDATE frequencias f
+            SET justificada = TRUE, justificativa_falta_id = j.id
+           FROM matriculas m, aulas au, justificativas_falta j
+          WHERE j.id = $1 AND f.matricula_id = m.id AND m.aluno_id = j.aluno_id
+            AND f.aula_id = au.id AND au.data = j.data_falta AND f.presente = FALSE
+        RETURNING f.id`, [jid]);
+      vinculada = link.rows.length;
+    } else {
+      await client.query(
+        `UPDATE frequencias SET justificada = FALSE, justificativa_falta_id = NULL WHERE justificativa_falta_id = $1`, [jid]);
+    }
+    await client.query('COMMIT'); client.release();
+    res.json({ ok: true, status: decisao, faltas_vinculadas: vinculada });
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {}); client.release();
+    console.error('Erro analisar justificativa:', e); res.status(500).json({ erro: 'Erro ao registrar a análise.' });
+  }
+});
+
 // ============================================================
 // PORTAL DO PROFESSOR
 // ============================================================
@@ -3063,6 +3241,15 @@ app.post('/professor/aulas/:id/chamada', autenticar, somenteProfessor, async (re
          DO UPDATE SET presente = EXCLUDED.presente, justificativa = EXCLUDED.justificativa`,
         [req.params.id, Number(p.matricula_id), p.presente !== false, (p.justificativa || '').trim() || null]);
     }
+    // Faltas com justificativa já DEFERIDA nesta data entram automaticamente como "justificada"
+    await client.query(
+      `UPDATE frequencias f
+          SET justificada = TRUE, justificativa_falta_id = j.id
+         FROM matriculas m, aulas au, justificativas_falta j
+        WHERE f.aula_id = $1 AND f.presente = FALSE
+          AND m.id = f.matricula_id AND au.id = f.aula_id
+          AND j.aluno_id = m.aluno_id AND j.data_falta = au.data AND j.status = 'deferida'`,
+      [req.params.id]);
     await client.query('COMMIT');
     client.release();
     res.json({ ok: true, registros: lista.length });
@@ -5121,7 +5308,7 @@ app.get('/health', async (req, res) => {
     res.json({
       status: (erroInicializacao || falhasMigracao.length) ? 'degradado' : 'ok',
       sistema: 'CEMIC Gestão',
-      versao: '3.63 (Recibo e Termo de rematrícula ONLINE verificáveis por QR)',
+      versao: '3.64 (Justificativa de Faltas: Portal dos Pais -> Pedagógico -> chamada)',
       inicializacao: erroInicializacao || 'ok',
       migracoes_com_falha: falhasMigracao
     });
@@ -5138,7 +5325,7 @@ initDB()
     console.error('Falha ao inicializar o banco:', e);
   })
   .finally(() => app.listen(PORT, () => {
-    console.log(`CEMIC Gestão — backend v3.63 rodando na porta ${PORT}`);
+    console.log(`CEMIC Gestão — backend v3.64 rodando na porta ${PORT}`);
     if (erroInicializacao) console.error('ATENÇÃO: o sistema subiu com falha de inicialização —', erroInicializacao);
     if (falhasMigracao.length) console.error('ATENÇÃO: migrações com falha —', falhasMigracao.join(' | '));
   }));
