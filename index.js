@@ -1,5 +1,5 @@
 // ============================================================
-// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v3.50 (… + English Platform: credenciamento direto de qualquer aluno pelo master)
+// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v3.63 (… + Recibo e Termo de rematrícula ONLINE verificáveis por QR)
 // Banco + Autenticação com perfis + Configurações + CRUDs
 // Stack: Node.js/Express + PostgreSQL (Railway)
 // ============================================================
@@ -361,6 +361,27 @@ async function initDB() {
   await pool.query(`ALTER TABLE declaracoes ADD COLUMN IF NOT EXISTS total_semestres INTEGER`);
   await pool.query(`ALTER TABLE declaracoes ADD COLUMN IF NOT EXISTS carga_horaria INTEGER`);
   await pool.query(`ALTER TABLE declaracoes ADD COLUMN IF NOT EXISTS emitida_por INTEGER REFERENCES usuarios(id) ON DELETE SET NULL`);
+  // Recibo e Termo de rematrícula ONLINE (verificáveis por código/QR; via destinada ao responsável)
+  await pool.query(`CREATE TABLE IF NOT EXISTS rematriculas_online (
+    id SERIAL PRIMARY KEY,
+    codigo TEXT UNIQUE NOT NULL,
+    tipo TEXT NOT NULL,
+    matricula_id INTEGER REFERENCES matriculas(id) ON DELETE SET NULL,
+    aluno_id INTEGER REFERENCES alunos(id) ON DELETE SET NULL,
+    aluno_nome TEXT NOT NULL,
+    aluno_cpf TEXT,
+    responsavel_id INTEGER REFERENCES responsaveis(id) ON DELETE SET NULL,
+    responsavel_nome TEXT,
+    curso TEXT,
+    nivel TEXT,
+    turma TEXT,
+    turno TEXT,
+    semestre TEXT,
+    valor NUMERIC(10,2),
+    forma TEXT,
+    emitida_em TIMESTAMP DEFAULT NOW(),
+    emitida_por INTEGER REFERENCES usuarios(id) ON DELETE SET NULL
+  )`);
   // Folha de professores (hora-aula)
   await pool.query(`CREATE TABLE IF NOT EXISTS professor_horas (
     id SERIAL PRIMARY KEY,
@@ -3344,6 +3365,56 @@ app.post('/admin/declaracoes/estudos', autenticar, somenteGestao, async (req, re
   } catch (e) { console.error('Erro declaração de estudos:', e); res.status(500).json({ erro: 'Erro ao emitir a declaração.' }); }
 });
 
+// ---------- Recibo e Termo de rematrícula ONLINE (somente Gestão) ----------
+app.post('/admin/rematricula-online/emitir', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const matriculaId = Number(req.body.matricula_id);
+    const tipo = String(req.body.tipo || '').trim();
+    if (!matriculaId) return res.status(400).json({ erro: 'Matrícula não informada.' });
+    if (!['recibo', 'termo'].includes(tipo)) return res.status(400).json({ erro: 'Tipo de documento inválido.' });
+    const mr = await pool.query(
+      `SELECT m.id, t.semestre, a.id AS aluno_id, a.nome AS aluno_nome, a.cpf AS aluno_cpf,
+              c.nome AS curso_nome, n.nome AS nivel_nome, t.nome AS turma_nome, t.turno
+       FROM matriculas m
+       JOIN alunos a ON a.id = m.aluno_id
+       JOIN turmas t ON t.id = m.turma_id
+       JOIN niveis n ON n.id = t.nivel_id
+       JOIN cursos c ON c.id = n.curso_id
+       WHERE m.id = $1`, [matriculaId]);
+    if (!mr.rows.length) return res.status(404).json({ erro: 'Matrícula não encontrada.' });
+    const m = mr.rows[0];
+    const rr = await pool.query(
+      `SELECT r.id, r.nome
+       FROM aluno_responsavel ar JOIN responsaveis r ON r.id = ar.responsavel_id
+       WHERE ar.aluno_id = $1
+       ORDER BY ar.responsavel_financeiro DESC NULLS LAST, ar.id ASC LIMIT 1`, [m.aluno_id]);
+    const resp = rr.rows[0] || null;
+    const valor = (tipo === 'recibo' && req.body.valor != null && req.body.valor !== '') ? Number(req.body.valor) : null;
+    const forma = (tipo === 'recibo') ? (String(req.body.forma || '').trim() || null) : null;
+    let codigo, ok = false;
+    for (let i = 0; i < 6 && !ok; i++) {
+      codigo = 'CEMIC-' + crypto.randomBytes(2).toString('hex').toUpperCase() + '-' + crypto.randomBytes(2).toString('hex').toUpperCase();
+      const ex = await pool.query(
+        `SELECT 1 FROM rematriculas_online WHERE codigo = $1 UNION ALL SELECT 1 FROM declaracoes WHERE codigo = $1`, [codigo]);
+      if (!ex.rows.length) ok = true;
+    }
+    const ins = await pool.query(
+      `INSERT INTO rematriculas_online
+         (codigo, tipo, matricula_id, aluno_id, aluno_nome, aluno_cpf, responsavel_id, responsavel_nome,
+          curso, nivel, turma, turno, semestre, valor, forma, emitida_por)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+       RETURNING codigo, emitida_em`,
+      [codigo, tipo, matriculaId, m.aluno_id, m.aluno_nome, m.aluno_cpf, resp ? resp.id : null, resp ? resp.nome : null,
+       m.curso_nome, m.nivel_nome, m.turma_nome, m.turno, m.semestre, valor, forma, req.usuario.id]);
+    res.status(201).json({
+      codigo: ins.rows[0].codigo, emitida_em: ins.rows[0].emitida_em, tipo,
+      aluno_nome: m.aluno_nome, aluno_cpf: m.aluno_cpf, responsavel_nome: resp ? resp.nome : '',
+      curso: m.curso_nome, nivel: m.nivel_nome, turma: m.turma_nome, turno: m.turno, semestre: m.semestre,
+      valor, forma
+    });
+  } catch (e) { console.error('Erro emitir documento de rematrícula online:', e); res.status(500).json({ erro: 'Erro ao emitir o documento.' }); }
+});
+
 // ---------- Portal dos Pais: acadêmico (professor -> responsável) ----------
 async function vinculoOk(respId, alunoId) {
   const r = await pool.query(`SELECT 1 FROM aluno_responsavel WHERE responsavel_id = $1 AND aluno_id = $2`, [respId, alunoId]);
@@ -3620,6 +3691,21 @@ app.get('/publico/verificar/:codigo', async (req, res) => {
           valido: true, codigo: k.codigo, tipo: 'vinculo_professor', professor_nome: k.professor_nome, professor_cpf: cpfKMasc,
           formacao: k.formacao, funcao: k.funcao, data_ingresso: k.data_ingresso, turnos: k.turnos, semestre: k.semestre,
           vigencia_inicio: k.vigencia_inicio, vigencia_fim: k.vigencia_fim, emitida_em: k.emitida_em
+        });
+      }
+      // Pode ser um Recibo ou Termo de rematrícula ONLINE
+      const ro = await pool.query(
+        `SELECT codigo, tipo, aluno_nome, aluno_cpf, responsavel_nome, curso, nivel, turma, turno, semestre, valor, forma, emitida_em
+         FROM rematriculas_online WHERE codigo = $1`, [codigo]);
+      if (ro.rows.length) {
+        const k = ro.rows[0];
+        const cpfK = (k.aluno_cpf || '').replace(/\D/g, '');
+        const cpfKMasc = cpfK.length === 11 ? `${cpfK.slice(0, 3)}.***.***-${cpfK.slice(9)}` : null;
+        return res.json({
+          valido: true, codigo: k.codigo, tipo: k.tipo === 'recibo' ? 'recibo_rematricula' : 'termo_rematricula',
+          aluno_nome: k.aluno_nome, aluno_cpf: cpfKMasc, responsavel_nome: k.responsavel_nome,
+          curso: k.curso, modulo: k.nivel, turma_nome: k.turma, turno: k.turno, semestre: k.semestre,
+          valor: k.valor, forma: k.forma, emitida_em: k.emitida_em
         });
       }
       return res.status(404).json({ valido: false, erro: 'Documento não encontrado. Verifique o código.' });
@@ -5035,7 +5121,7 @@ app.get('/health', async (req, res) => {
     res.json({
       status: (erroInicializacao || falhasMigracao.length) ? 'degradado' : 'ok',
       sistema: 'CEMIC Gestão',
-      versao: '3.62 (Vínculo explícito nível→módulo da English Platform: niveis.plataforma_modulo, devolvido em modulo_key)',
+      versao: '3.63 (Recibo e Termo de rematrícula ONLINE verificáveis por QR)',
       inicializacao: erroInicializacao || 'ok',
       migracoes_com_falha: falhasMigracao
     });
@@ -5052,7 +5138,7 @@ initDB()
     console.error('Falha ao inicializar o banco:', e);
   })
   .finally(() => app.listen(PORT, () => {
-    console.log(`CEMIC Gestão — backend v3.62 rodando na porta ${PORT}`);
+    console.log(`CEMIC Gestão — backend v3.63 rodando na porta ${PORT}`);
     if (erroInicializacao) console.error('ATENÇÃO: o sistema subiu com falha de inicialização —', erroInicializacao);
     if (falhasMigracao.length) console.error('ATENÇÃO: migrações com falha —', falhasMigracao.join(' | '));
   }));
