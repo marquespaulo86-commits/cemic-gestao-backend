@@ -1,5 +1,5 @@
 // ============================================================
-// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v3.65 (baixa da Taxa da Plataforma recortada por semestre; … + Justificativa de Faltas: Portal dos Pais -> Pedagógico -> chamada)
+// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v3.66 (Relatório de Entrega de Livro por turma; baixa da Taxa da Plataforma recortada por semestre; … + Justificativa de Faltas: Portal dos Pais -> Pedagógico -> chamada)
 // Banco + Autenticação com perfis + Configurações + CRUDs
 // Stack: Node.js/Express + PostgreSQL (Railway)
 // ============================================================
@@ -1429,6 +1429,33 @@ app.get('/admin/professores/:id/folha-chamada', autenticar, somenteGestao, async
       turmas
     });
   } catch (e) { console.error('Erro folha de chamada:', e); res.status(500).json({ erro: 'Erro ao montar a folha de chamada.' }); }
+});
+
+app.get('/admin/turmas/:id/entrega-livros', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const turmaId = Number(req.params.id);
+    const inst = (await getConfig('dados_instituicao', {})) || {};
+    const t = await pool.query(
+      `SELECT t.nome AS turma_nome, t.turno, t.horario, t.semestre,
+              n.nome AS nivel_nome, n.plataforma_modulo AS modulo_key,
+              c.nome AS curso_nome, p.nome AS professor_nome
+         FROM turmas t
+         JOIN niveis n ON n.id = t.nivel_id
+         JOIN cursos c ON c.id = n.curso_id
+         LEFT JOIN professores p ON p.id = t.professor_id
+        WHERE t.id = $1`, [turmaId]);
+    if (!t.rows.length) return res.status(404).json({ erro: 'Turma não encontrada.' });
+    const al = await pool.query(
+      `SELECT a.nome, to_char(m.data_matricula, 'DD/MM/YYYY') AS data_matricula
+         FROM matriculas m JOIN alunos a ON a.id = m.aluno_id
+        WHERE m.turma_id = $1 AND m.status = 'ativa'
+        ORDER BY a.nome`, [turmaId]);
+    res.json({
+      instituicao: { nome: inst.nome || 'CEMIC — Centro Maranhense de Idiomas e Culturas', cnpj: inst.cnpj || '' },
+      turma: t.rows[0],
+      alunos: al.rows
+    });
+  } catch (e) { console.error('Erro entrega de livros:', e); res.status(500).json({ erro: 'Erro ao montar o relatório de entrega de livro.' }); }
 });
 
 app.get('/admin/turmas', autenticar, somenteGestao, async (req, res) => {
@@ -5323,7 +5350,7 @@ app.get('/health', async (req, res) => {
     res.json({
       status: (erroInicializacao || falhasMigracao.length) ? 'degradado' : 'ok',
       sistema: 'CEMIC Gestão',
-      versao: '3.65 (baixa da Taxa da Plataforma recortada por semestre)',
+      versao: '3.66 (Relatório de Entrega de Livro por turma)',
       inicializacao: erroInicializacao || 'ok',
       migracoes_com_falha: falhasMigracao
     });
