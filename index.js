@@ -1,5 +1,5 @@
 // ============================================================
-// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v3.66 (Relatório de Entrega de Livro por turma; baixa da Taxa da Plataforma recortada por semestre; … + Justificativa de Faltas: Portal dos Pais -> Pedagógico -> chamada)
+// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v3.67 (uma turma por aluno + selo de falta justificada na chamada; baixa da Taxa da Plataforma recortada por semestre; … + Justificativa de Faltas: Portal dos Pais -> Pedagógico -> chamada)
 // Banco + Autenticação com perfis + Configurações + CRUDs
 // Stack: Node.js/Express + PostgreSQL (Railway)
 // ============================================================
@@ -1651,6 +1651,16 @@ app.post('/admin/matriculas', autenticar, somenteGestao, async (req, res) => {
     const dupq = await client.query(`SELECT 1 FROM matriculas WHERE aluno_id = $1 AND turma_id = $2 AND status IN ('ativa','trancada')`, [aluno.id, turma.id]);
     if (dupq.rows.length) { await client.query('ROLLBACK'); client.release(); return res.status(409).json({ erro: 'O aluno já possui matrícula ativa nesta turma.' }); }
 
+    // Um aluno não pode estar em duas turmas ao mesmo tempo
+    const outraq = await client.query(
+      `SELECT t.nome AS turma_nome FROM matriculas m JOIN turmas t ON t.id = m.turma_id
+        WHERE m.aluno_id = $1 AND m.turma_id <> $2 AND m.status IN ('ativa','trancada')
+        ORDER BY m.data_matricula DESC LIMIT 1`, [aluno.id, turma.id]);
+    if (outraq.rows.length) {
+      await client.query('ROLLBACK'); client.release();
+      return res.status(409).json({ erro: `Este aluno já está matriculado na turma "${outraq.rows[0].turma_nome}". Um aluno não pode estar em duas turmas ao mesmo tempo — encerre ou transfira a matrícula atual antes.` });
+    }
+
     const ocup = await client.query(`SELECT COUNT(*)::int AS n FROM matriculas WHERE turma_id = $1 AND status = 'ativa'`, [turma.id]);
     if (ocup.rows[0].n >= turma.capacidade) {
       await client.query('ROLLBACK'); client.release();
@@ -3244,6 +3254,7 @@ app.get('/professor/aulas/:id/chamada', autenticar, somenteProfessor, async (req
     const r = await pool.query(
       `SELECT m.id AS matricula_id, a.nome,
               COALESCE(f.presente, TRUE) AS presente, f.justificativa,
+              COALESCE(f.justificada, FALSE) AS justificada,
               (f.id IS NOT NULL) AS lancado
        FROM matriculas m
        JOIN alunos a ON a.id = m.aluno_id
@@ -5350,7 +5361,7 @@ app.get('/health', async (req, res) => {
     res.json({
       status: (erroInicializacao || falhasMigracao.length) ? 'degradado' : 'ok',
       sistema: 'CEMIC Gestão',
-      versao: '3.66 (Relatório de Entrega de Livro por turma)',
+      versao: '3.67 (uma turma por aluno + selo de falta justificada)',
       inicializacao: erroInicializacao || 'ok',
       migracoes_com_falha: falhasMigracao
     });
