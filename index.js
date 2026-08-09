@@ -1,5 +1,5 @@
 // ============================================================
-// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v3.71 (backup de progresso/respostas/áudio da English Platform; baixa da Taxa da Plataforma recortada por semestre; … + Justificativa de Faltas: Portal dos Pais -> Pedagógico -> chamada)
+// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v3.72 (visualização do progresso EP no admin: respostas + áudio; baixa da Taxa da Plataforma recortada por semestre; … + Justificativa de Faltas: Portal dos Pais -> Pedagógico -> chamada)
 // Banco + Autenticação com perfis + Configurações + CRUDs
 // Stack: Node.js/Express + PostgreSQL (Railway)
 // ============================================================
@@ -2666,6 +2666,27 @@ app.post('/admin/english-platform/autorizar-lote', autenticar, exigirPerfil('mas
     }
     res.json({ ok: true, autorizados: n });
   } catch (e) { console.error('Erro EP autorizar-lote:', e); res.status(500).json({ erro: 'Erro ao autorizar em lote.' }); }
+});
+app.get('/admin/english-platform/progresso/:alunoId', autenticar, exigirPerfil('master'), async (req, res) => {
+  try {
+    const alunoId = Number(req.params.alunoId);
+    const al = await pool.query(`SELECT id, nome, codigo FROM alunos WHERE id = $1`, [alunoId]);
+    if (!al.rows.length) return res.status(404).json({ erro: 'Aluno não encontrado.' });
+    const r = await pool.query(
+      `SELECT id, modulo_key, atividade_idx, estacao, concluida, respostas,
+              (audio_base64 IS NOT NULL) AS tem_audio, atualizado_em
+         FROM english_platform_progresso
+        WHERE aluno_id = $1
+        ORDER BY modulo_key, atividade_idx, estacao`, [alunoId]);
+    res.json({ aluno: al.rows[0], itens: r.rows });
+  } catch (e) { console.error('Erro progresso EP (admin):', e); res.status(500).json({ erro: 'Erro ao carregar o progresso.' }); }
+});
+app.get('/admin/english-platform/progresso-audio/:id', autenticar, exigirPerfil('master'), async (req, res) => {
+  try {
+    const r = await pool.query(`SELECT audio_base64, audio_mime FROM english_platform_progresso WHERE id = $1`, [Number(req.params.id)]);
+    if (!r.rows.length || !r.rows[0].audio_base64) return res.status(404).json({ erro: 'Áudio não encontrado.' });
+    res.json({ audio_base64: r.rows[0].audio_base64, audio_mime: r.rows[0].audio_mime || 'audio/webm' });
+  } catch (e) { console.error('Erro áudio EP (admin):', e); res.status(500).json({ erro: 'Erro ao carregar o áudio.' }); }
 });
 app.post('/admin/english-platform/:alunoId/revogar', autenticar, exigirPerfil('master'), async (req, res) => {
   try {
@@ -5507,7 +5528,7 @@ app.get('/health', async (req, res) => {
     res.json({
       status: (erroInicializacao || falhasMigracao.length) ? 'degradado' : 'ok',
       sistema: 'CEMIC Gestão',
-      versao: '3.71 (Backup de progresso/respostas/áudio da English Platform)',
+      versao: '3.72 (Visualização do progresso da English Platform no admin)',
       inicializacao: erroInicializacao || 'ok',
       migracoes_com_falha: falhasMigracao
     });
