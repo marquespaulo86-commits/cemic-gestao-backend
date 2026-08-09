@@ -1,5 +1,5 @@
 // ============================================================
-// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v3.70 (módulo da English Platform vinculado por turma; baixa da Taxa da Plataforma recortada por semestre; … + Justificativa de Faltas: Portal dos Pais -> Pedagógico -> chamada)
+// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v3.71 (backup de progresso/respostas/áudio da English Platform; baixa da Taxa da Plataforma recortada por semestre; … + Justificativa de Faltas: Portal dos Pais -> Pedagógico -> chamada)
 // Banco + Autenticação com perfis + Configurações + CRUDs
 // Stack: Node.js/Express + PostgreSQL (Railway)
 // ============================================================
@@ -638,6 +638,21 @@ async function initDB() {
     atualizado_em TIMESTAMP DEFAULT NOW()
   )`);
   await migrar('idx_ep_status', `CREATE INDEX IF NOT EXISTS idx_ep_status ON english_platform_acesso (status)`);
+  // English Platform: progresso/respostas/áudio por aluno (backup no banco = fonte da verdade).
+  await migrar('english_platform_progresso', `CREATE TABLE IF NOT EXISTS english_platform_progresso (
+    id SERIAL PRIMARY KEY,
+    aluno_id INTEGER NOT NULL REFERENCES alunos(id) ON DELETE CASCADE,
+    modulo_key TEXT NOT NULL,
+    atividade_idx INTEGER NOT NULL DEFAULT 0,
+    estacao TEXT NOT NULL,
+    concluida BOOLEAN NOT NULL DEFAULT FALSE,
+    respostas JSONB,
+    audio_base64 TEXT,
+    audio_mime TEXT,
+    atualizado_em TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (aluno_id, modulo_key, atividade_idx, estacao)
+  )`);
+  await migrar('idx_ep_prog_aluno', `CREATE INDEX IF NOT EXISTS idx_ep_prog_aluno ON english_platform_progresso (aluno_id)`);
   // English Platform: cobranças PIX do credenciamento (R$35 × nº de filhos, um pagamento por família).
   await migrar('english_platform_pagamentos', `CREATE TABLE IF NOT EXISTS english_platform_pagamentos (
     txid TEXT PRIMARY KEY,
@@ -2438,6 +2453,45 @@ async function statusEnglishPlatform(respId) {
 app.get('/publico/portal/english-platform/status', autenticarResponsavel, async (req, res) => {
   try { res.json(await statusEnglishPlatform(req.responsavelId)); }
   catch (e) { console.error('Erro EP status:', e); res.status(500).json({ erro: 'Erro ao consultar o acesso.' }); }
+});
+app.post('/publico/portal/english-platform/progresso', autenticarResponsavel, async (req, res) => {
+  try {
+    const b = req.body || {};
+    const alunoId = Number(b.aluno_id);
+    const modulo = String(b.modulo_key || '').slice(0, 40);
+    const atividade = Number.isFinite(Number(b.atividade_idx)) ? Number(b.atividade_idx) : 0;
+    const estacao = String(b.estacao || '').slice(0, 40);
+    if (!alunoId || !modulo || !estacao) return res.status(400).json({ erro: 'Dados incompletos.' });
+    const pert = await pool.query(`SELECT 1 FROM aluno_responsavel WHERE aluno_id = $1 AND responsavel_id = $2`, [alunoId, req.responsavelId]);
+    if (!pert.rows.length) return res.status(403).json({ erro: 'Aluno não vinculado a este responsável.' });
+    let audio = (typeof b.audio_base64 === 'string' && b.audio_base64) ? b.audio_base64 : null;
+    if (audio && audio.length > 4200000) audio = null; // ~3 MB máx. de áudio por estação (protege o banco)
+    const mime = audio ? String(b.audio_mime || 'audio/webm').slice(0, 40) : null;
+    const respostas = (b.respostas && typeof b.respostas === 'object') ? b.respostas : {};
+    await pool.query(
+      `INSERT INTO english_platform_progresso (aluno_id, modulo_key, atividade_idx, estacao, concluida, respostas, audio_base64, audio_mime, atualizado_em)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW())
+       ON CONFLICT (aluno_id, modulo_key, atividade_idx, estacao) DO UPDATE SET
+         concluida = EXCLUDED.concluida,
+         respostas = EXCLUDED.respostas,
+         audio_base64 = COALESCE(EXCLUDED.audio_base64, english_platform_progresso.audio_base64),
+         audio_mime = COALESCE(EXCLUDED.audio_mime, english_platform_progresso.audio_mime),
+         atualizado_em = NOW()`,
+      [alunoId, modulo, atividade, estacao, b.concluida !== false, JSON.stringify(respostas), audio, mime]);
+    res.json({ ok: true });
+  } catch (e) { console.error('Erro salvar progresso EP:', e); res.status(500).json({ erro: 'Erro ao salvar o progresso.' }); }
+});
+app.get('/publico/portal/english-platform/progresso', autenticarResponsavel, async (req, res) => {
+  try {
+    const alunoId = Number(req.query.aluno_id);
+    if (!alunoId) return res.status(400).json({ erro: 'aluno_id é obrigatório.' });
+    const pert = await pool.query(`SELECT 1 FROM aluno_responsavel WHERE aluno_id = $1 AND responsavel_id = $2`, [alunoId, req.responsavelId]);
+    if (!pert.rows.length) return res.status(403).json({ erro: 'Aluno não vinculado a este responsável.' });
+    const r = await pool.query(
+      `SELECT modulo_key, atividade_idx, estacao, concluida, (audio_base64 IS NOT NULL) AS tem_audio, atualizado_em
+         FROM english_platform_progresso WHERE aluno_id = $1`, [alunoId]);
+    res.json({ itens: r.rows });
+  } catch (e) { console.error('Erro carregar progresso EP:', e); res.status(500).json({ erro: 'Erro ao carregar o progresso.' }); }
 });
 app.post('/publico/portal/english-platform/solicitar', autenticarResponsavel, async (req, res) => {
   try {
@@ -5453,7 +5507,7 @@ app.get('/health', async (req, res) => {
     res.json({
       status: (erroInicializacao || falhasMigracao.length) ? 'degradado' : 'ok',
       sistema: 'CEMIC Gestão',
-      versao: '3.70 (Módulo da English Platform vinculado por turma)',
+      versao: '3.71 (Backup de progresso/respostas/áudio da English Platform)',
       inicializacao: erroInicializacao || 'ok',
       migracoes_com_falha: falhasMigracao
     });
