@@ -1,5 +1,5 @@
 // ============================================================
-// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v3.69 (transferência de turma reconcilia financeiro, sem duplicar; baixa da Taxa da Plataforma recortada por semestre; … + Justificativa de Faltas: Portal dos Pais -> Pedagógico -> chamada)
+// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v3.70 (módulo da English Platform vinculado por turma; baixa da Taxa da Plataforma recortada por semestre; … + Justificativa de Faltas: Portal dos Pais -> Pedagógico -> chamada)
 // Banco + Autenticação com perfis + Configurações + CRUDs
 // Stack: Node.js/Express + PostgreSQL (Railway)
 // ============================================================
@@ -412,6 +412,7 @@ async function initDB() {
   await pool.query(`ALTER TABLE aulas ADD COLUMN IF NOT EXISTS avaliacao TEXT`);
   await pool.query(`ALTER TABLE aulas ADD COLUMN IF NOT EXISTS habilidades TEXT[]`);
   await pool.query(`ALTER TABLE niveis ADD COLUMN IF NOT EXISTS plataforma_modulo TEXT`);
+  await pool.query(`ALTER TABLE turmas ADD COLUMN IF NOT EXISTS plataforma_modulo TEXT`);
   await pool.query(`CREATE TABLE IF NOT EXISTS ocorrencias (
     id SERIAL PRIMARY KEY,
     aluno_id INTEGER NOT NULL REFERENCES alunos(id) ON DELETE CASCADE,
@@ -885,7 +886,7 @@ function autenticarResponsavel(req, res, next) {
 async function alunosDoResponsavel(respId) {
   const r = await pool.query(
     `SELECT a.id, a.nome, a.cpf, a.codigo, a.data_nascimento,
-            t.nome AS turma_nome, t.turno, n.nome AS nivel_nome, n.plataforma_modulo AS modulo_key, c.nome AS curso_nome,
+            t.nome AS turma_nome, t.turno, n.nome AS nivel_nome, COALESCE(t.plataforma_modulo, n.plataforma_modulo) AS modulo_key, c.nome AS curso_nome,
             p.nome AS professor_nome,
             COALESCE(ep.status, 'nenhum') AS english_platform_status
      FROM aluno_responsavel ar
@@ -1491,10 +1492,10 @@ app.post('/admin/turmas', autenticar, somenteGestao, async (req, res) => {
       capacidade = (await getConfig('capacidade_padrao_turma', 15)) || 15;
     }
     const r = await pool.query(
-      `INSERT INTO turmas (nivel_id, nome, semestre, turno, horario, professor_id, capacidade)
-       VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
+      `INSERT INTO turmas (nivel_id, nome, semestre, turno, horario, professor_id, capacidade, plataforma_modulo)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
       [req.body.nivel_id, req.body.nome, req.body.semestre, req.body.turno || null,
-       req.body.horario || null, req.body.professor_id || null, Number(capacidade)]
+       req.body.horario || null, req.body.professor_id || null, Number(capacidade), req.body.plataforma_modulo || null]
     );
     res.status(201).json(r.rows[0]);
   } catch (e) {
@@ -1511,13 +1512,14 @@ app.put('/admin/turmas/:id', autenticar, somenteGestao, async (req, res) => {
     if (!atual.rows.length) return res.status(404).json({ erro: 'Turma não encontrada.' });
     const x = atual.rows[0];
     const r = await pool.query(
-      `UPDATE turmas SET nivel_id=$1, nome=$2, semestre=$3, turno=$4, horario=$5, professor_id=$6, capacidade=$7, status=$8
-       WHERE id=$9 RETURNING *`,
+      `UPDATE turmas SET nivel_id=$1, nome=$2, semestre=$3, turno=$4, horario=$5, professor_id=$6, capacidade=$7, status=$8, plataforma_modulo=$9
+       WHERE id=$10 RETURNING *`,
       [
         req.body.nivel_id ?? x.nivel_id, req.body.nome ?? x.nome, req.body.semestre ?? x.semestre,
         req.body.turno ?? x.turno, req.body.horario ?? x.horario,
         req.body.professor_id !== undefined ? req.body.professor_id : x.professor_id,
-        req.body.capacidade ?? x.capacidade, req.body.status ?? x.status, req.params.id
+        req.body.capacidade ?? x.capacidade, req.body.status ?? x.status,
+        req.body.plataforma_modulo !== undefined ? req.body.plataforma_modulo : x.plataforma_modulo, req.params.id
       ]
     );
     res.json(r.rows[0]);
@@ -5451,7 +5453,7 @@ app.get('/health', async (req, res) => {
     res.json({
       status: (erroInicializacao || falhasMigracao.length) ? 'degradado' : 'ok',
       sistema: 'CEMIC Gestão',
-      versao: '3.69 (Transferência de turma reconcilia financeiro sem duplicar)',
+      versao: '3.70 (Módulo da English Platform vinculado por turma)',
       inicializacao: erroInicializacao || 'ok',
       migracoes_com_falha: falhasMigracao
     });
