@@ -1,5 +1,5 @@
 // ============================================================
-// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v3.67 (uma turma por aluno + selo de falta justificada na chamada; baixa da Taxa da Plataforma recortada por semestre; … + Justificativa de Faltas: Portal dos Pais -> Pedagógico -> chamada)
+// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v3.69 (transferência de turma reconcilia financeiro, sem duplicar; baixa da Taxa da Plataforma recortada por semestre; … + Justificativa de Faltas: Portal dos Pais -> Pedagógico -> chamada)
 // Banco + Autenticação com perfis + Configurações + CRUDs
 // Stack: Node.js/Express + PostgreSQL (Railway)
 // ============================================================
@@ -4936,26 +4936,81 @@ app.get('/admin/professor-folha', autenticar, somenteGestao, async (req, res) =>
 
 // ---------- Alteração de turma (transfere matrícula ativa sem cancelar) ----------
 app.put('/admin/matriculas/:id/turma', autenticar, somenteGestao, async (req, res) => {
+  const client = await pool.connect();
   try {
     const matId = Number(req.params.id);
     const novaTurmaId = Number(req.body.turma_id);
-    if (!novaTurmaId) return res.status(400).json({ erro: 'Selecione a turma de destino.' });
-    const mr = await pool.query(`SELECT * FROM matriculas WHERE id = $1`, [matId]);
+    if (!novaTurmaId) { client.release(); return res.status(400).json({ erro: 'Selecione a turma de destino.' }); }
+
+    await client.query('BEGIN');
+    const mr = await client.query(`SELECT * FROM matriculas WHERE id = $1 FOR UPDATE`, [matId]);
     const mat = mr.rows[0];
-    if (!mat) return res.status(404).json({ erro: 'Matrícula não encontrada.' });
-    if (mat.status !== 'ativa') return res.status(409).json({ erro: 'Só é possível alterar a turma de uma matrícula ativa.' });
-    if (mat.turma_id === novaTurmaId) return res.status(400).json({ erro: 'A turma de destino é a mesma da turma atual.' });
-    const tr = await pool.query(`SELECT * FROM turmas WHERE id = $1`, [novaTurmaId]);
+    if (!mat) { await client.query('ROLLBACK'); client.release(); return res.status(404).json({ erro: 'Matrícula não encontrada.' }); }
+    if (mat.status !== 'ativa') { await client.query('ROLLBACK'); client.release(); return res.status(409).json({ erro: 'Só é possível alterar a turma de uma matrícula ativa.' }); }
+    if (mat.turma_id === novaTurmaId) { await client.query('ROLLBACK'); client.release(); return res.status(400).json({ erro: 'A turma de destino é a mesma da turma atual.' }); }
+
+    const tr = await client.query(
+      `SELECT t.*, n.nome AS nivel_nome, c.nome AS curso_nome
+         FROM turmas t JOIN niveis n ON n.id = t.nivel_id JOIN cursos c ON c.id = n.curso_id
+        WHERE t.id = $1 FOR UPDATE OF t`, [novaTurmaId]);
     const turma = tr.rows[0];
-    if (!turma) return res.status(404).json({ erro: 'Turma de destino não encontrada.' });
-    if (turma.status === 'encerrada') return res.status(409).json({ erro: 'A turma de destino está encerrada.' });
-    const dup = await pool.query(`SELECT 1 FROM matriculas WHERE aluno_id = $1 AND turma_id = $2 AND status IN ('ativa','trancada')`, [mat.aluno_id, novaTurmaId]);
-    if (dup.rows.length) return res.status(409).json({ erro: 'O aluno já possui matrícula ativa nessa turma.' });
-    const ocup = await pool.query(`SELECT COUNT(*)::int AS n FROM matriculas WHERE turma_id = $1 AND status = 'ativa'`, [novaTurmaId]);
-    if (ocup.rows[0].n >= turma.capacidade) return res.status(409).json({ erro: 'A turma de destino está lotada.' });
-    await pool.query(`UPDATE matriculas SET turma_id = $1 WHERE id = $2`, [novaTurmaId, matId]);
-    res.json({ ok: true, turma_id: novaTurmaId });
-  } catch (e) { console.error('Erro alterar turma:', e); res.status(500).json({ erro: 'Erro ao alterar a turma.' }); }
+    if (!turma) { await client.query('ROLLBACK'); client.release(); return res.status(404).json({ erro: 'Turma de destino não encontrada.' }); }
+    if (turma.status === 'encerrada') { await client.query('ROLLBACK'); client.release(); return res.status(409).json({ erro: 'A turma de destino está encerrada.' }); }
+
+    const dup = await client.query(`SELECT 1 FROM matriculas WHERE aluno_id = $1 AND turma_id = $2 AND status IN ('ativa','trancada')`, [mat.aluno_id, novaTurmaId]);
+    if (dup.rows.length) { await client.query('ROLLBACK'); client.release(); return res.status(409).json({ erro: 'O aluno já possui matrícula ativa nessa turma.' }); }
+
+    const ocup = await client.query(`SELECT COUNT(*)::int AS n FROM matriculas WHERE turma_id = $1 AND status = 'ativa'`, [novaTurmaId]);
+    if (ocup.rows[0].n >= turma.capacidade) { await client.query('ROLLBACK'); client.release(); return res.status(409).json({ erro: 'A turma de destino está lotada.' }); }
+
+    // Curso/nível de origem (para saber se o valor da mensalidade muda de fato)
+    const origem = (await client.query(
+      `SELECT c.nome AS curso_nome, n.nome AS nivel_nome
+         FROM turmas t JOIN niveis n ON n.id = t.nivel_id JOIN cursos c ON c.id = n.curso_id
+        WHERE t.id = $1`, [mat.turma_id])).rows[0] || {};
+
+    // Move a matrícula: MESMO matricula_id → as mensalidades já existentes acompanham a turma.
+    // Nenhuma parcela nova é criada aqui, portanto não há como duplicar o financeiro.
+    await client.query(`UPDATE matriculas SET turma_id = $1 WHERE id = $2`, [novaTurmaId, matId]);
+
+    // Reconcilia SOMENTE as parcelas de mensalidade ainda em aberto (pendente/atrasada) para
+    // refletir a turma de destino. Parcelas pagas/canceladas e taxas ficam intactas.
+    const alvo = (turma.curso_nome + ' ' + turma.nivel_nome).trim();
+    let parcelasAjustadas = 0, valorAtualizado = false;
+    if ((origem.curso_nome || '') !== turma.curso_nome) {
+      const tabela = (await getConfig('mensalidades', {})) || {};
+      const novoValor = Number(tabela[turma.curso_nome] || 0);
+      if (novoValor > 0) {
+        const descAluno = Number(mat.desconto_aplicado || 0);
+        const novoDesc = +Math.min(descAluno, novoValor).toFixed(2);
+        const novoFinal = +(novoValor - novoDesc).toFixed(2);
+        await client.query(`UPDATE matriculas SET valor_mensalidade = $1, desconto_aplicado = $2 WHERE id = $3`, [novoValor, novoDesc, matId]);
+        const upd = await client.query(
+          `UPDATE contas_receber
+              SET valor_original = $1, desconto = $2, valor_final = $3,
+                  descricao = 'Mensalidade ' || substring(competencia from 6 for 2) || '/' || substring(competencia from 1 for 4) || ' — ' || $4
+            WHERE matricula_id = $5 AND status IN ('pendente','atrasada') AND descricao LIKE 'Mensalidade %'`,
+          [novoValor, novoDesc, novoFinal, alvo, matId]);
+        parcelasAjustadas = upd.rowCount; valorAtualizado = true;
+      }
+    }
+    if (!valorAtualizado) {
+      const upd = await client.query(
+        `UPDATE contas_receber
+            SET descricao = 'Mensalidade ' || substring(competencia from 6 for 2) || '/' || substring(competencia from 1 for 4) || ' — ' || $1
+          WHERE matricula_id = $2 AND status IN ('pendente','atrasada') AND descricao LIKE 'Mensalidade %'`,
+        [alvo, matId]);
+      parcelasAjustadas = upd.rowCount;
+    }
+
+    await client.query('COMMIT'); client.release();
+    res.json({ ok: true, turma_id: novaTurmaId, parcelas_ajustadas: parcelasAjustadas, valor_atualizado: valorAtualizado });
+  } catch (e) {
+    try { await client.query('ROLLBACK'); } catch (_) {}
+    client.release();
+    console.error('Erro alterar turma:', e);
+    res.status(500).json({ erro: 'Erro ao alterar a turma.' });
+  }
 });
 
 // ---------- Relatório: pais cadastrados no Portal, por turma ----------
@@ -4982,6 +5037,41 @@ app.get('/admin/relatorios/pais-por-turma', autenticar, somenteGestao, async (re
        ORDER BY t.nome, a.nome, r.nome`, params);
     res.json(r.rows);
   } catch (e) { console.error('Erro relatório pais por turma:', e); res.status(500).json({ erro: 'Erro ao gerar o relatório.' }); }
+});
+
+app.get('/admin/relatorios/notificacao-cadastro', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const turmaId = req.query.turma_id ? Number(req.query.turma_id) : null;
+    const inst = (await getConfig('dados_instituicao', {})) || {};
+    const r = await pool.query(
+      `SELECT a.nome AS aluno_nome,
+              t.nome AS turma_nome, t.turno, t.horario, t.semestre,
+              n.nome AS nivel_nome, n.plataforma_modulo AS modulo_key, c.nome AS curso_nome,
+              resp.nome AS responsavel_nome,
+              (resp.senha_hash IS NOT NULL) AS portal_ok,
+              (COALESCE(ep.status, 'nenhum') = 'autorizado') AS english_ok
+         FROM matriculas m
+         JOIN alunos a ON a.id = m.aluno_id
+         JOIN turmas t ON t.id = m.turma_id
+         JOIN niveis n ON n.id = t.nivel_id
+         JOIN cursos c ON c.id = n.curso_id
+         LEFT JOIN english_platform_acesso ep ON ep.aluno_id = a.id
+         LEFT JOIN LATERAL (
+           SELECT r2.nome, r2.senha_hash
+             FROM aluno_responsavel ar JOIN responsaveis r2 ON r2.id = ar.responsavel_id
+            WHERE ar.aluno_id = a.id
+            ORDER BY ar.responsavel_financeiro DESC, ar.id
+            LIMIT 1
+         ) resp ON TRUE
+        WHERE m.status = 'ativa'
+          AND ($1::int IS NULL OR m.turma_id = $1)
+          AND (resp.senha_hash IS NULL OR COALESCE(ep.status, 'nenhum') <> 'autorizado')
+        ORDER BY t.nome, a.nome`, [turmaId]);
+    res.json({
+      instituicao: { nome: inst.nome || 'CEMIC — Centro Maranhense de Idiomas e Culturas', cnpj: inst.cnpj || '' },
+      itens: r.rows
+    });
+  } catch (e) { console.error('Erro notificação de cadastro:', e); res.status(500).json({ erro: 'Erro ao gerar a notificação de cadastro.' }); }
 });
 
 app.get('/admin/pre-inscricoes', autenticar, somenteGestao, async (req, res) => {
@@ -5361,7 +5451,7 @@ app.get('/health', async (req, res) => {
     res.json({
       status: (erroInicializacao || falhasMigracao.length) ? 'degradado' : 'ok',
       sistema: 'CEMIC Gestão',
-      versao: '3.67 (uma turma por aluno + selo de falta justificada)',
+      versao: '3.69 (Transferência de turma reconcilia financeiro sem duplicar)',
       inicializacao: erroInicializacao || 'ok',
       migracoes_com_falha: falhasMigracao
     });
