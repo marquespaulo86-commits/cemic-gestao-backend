@@ -1,5 +1,5 @@
 // ============================================================
-// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v3.72 (visualização do progresso EP no admin: respostas + áudio; baixa da Taxa da Plataforma recortada por semestre; … + Justificativa de Faltas: Portal dos Pais -> Pedagógico -> chamada)
+// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v3.74 (rotina de entrega de livros por aluno + relatório entregues/não entregues; baixa da Taxa da Plataforma recortada por semestre; … + Justificativa de Faltas: Portal dos Pais -> Pedagógico -> chamada)
 // Banco + Autenticação com perfis + Configurações + CRUDs
 // Stack: Node.js/Express + PostgreSQL (Railway)
 // ============================================================
@@ -653,6 +653,13 @@ async function initDB() {
     UNIQUE (aluno_id, modulo_key, atividade_idx, estacao)
   )`);
   await migrar('idx_ep_prog_aluno', `CREATE INDEX IF NOT EXISTS idx_ep_prog_aluno ON english_platform_progresso (aluno_id)`);
+  // Entrega de livros: registro por matrícula (existir a linha = livro entregue).
+  await migrar('entrega_livros', `CREATE TABLE IF NOT EXISTS entrega_livros (
+    matricula_id INTEGER PRIMARY KEY REFERENCES matriculas(id) ON DELETE CASCADE,
+    data_entrega DATE NOT NULL DEFAULT CURRENT_DATE,
+    entregue_por TEXT,
+    criado_em TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  )`);
   // English Platform: cobranças PIX do credenciamento (R$35 × nº de filhos, um pagamento por família).
   await migrar('english_platform_pagamentos', `CREATE TABLE IF NOT EXISTS english_platform_pagamentos (
     txid TEXT PRIMARY KEY,
@@ -1462,8 +1469,11 @@ app.get('/admin/turmas/:id/entrega-livros', autenticar, somenteGestao, async (re
         WHERE t.id = $1`, [turmaId]);
     if (!t.rows.length) return res.status(404).json({ erro: 'Turma não encontrada.' });
     const al = await pool.query(
-      `SELECT a.nome, to_char(m.data_matricula, 'DD/MM/YYYY') AS data_matricula
-         FROM matriculas m JOIN alunos a ON a.id = m.aluno_id
+      `SELECT m.id AS matricula_id, a.nome, to_char(m.data_matricula, 'DD/MM/YYYY') AS data_matricula,
+              (el.matricula_id IS NOT NULL) AS entregue, to_char(el.data_entrega, 'DD/MM/YYYY') AS data_entrega
+         FROM matriculas m
+         JOIN alunos a ON a.id = m.aluno_id
+         LEFT JOIN entrega_livros el ON el.matricula_id = m.id
         WHERE m.turma_id = $1 AND m.status = 'ativa'
         ORDER BY a.nome`, [turmaId]);
     res.json({
@@ -1472,6 +1482,26 @@ app.get('/admin/turmas/:id/entrega-livros', autenticar, somenteGestao, async (re
       alunos: al.rows
     });
   } catch (e) { console.error('Erro entrega de livros:', e); res.status(500).json({ erro: 'Erro ao montar o relatório de entrega de livro.' }); }
+});
+
+app.post('/admin/matriculas/:id/entrega-livro', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const matId = Number(req.params.id);
+    const entregue = req.body.entregue !== false;
+    const mr = await pool.query(`SELECT id FROM matriculas WHERE id = $1`, [matId]);
+    if (!mr.rows.length) return res.status(404).json({ erro: 'Matrícula não encontrada.' });
+    if (entregue) {
+      const quem = (req.usuario && req.usuario.nome) ? String(req.usuario.nome).slice(0, 80) : null;
+      await pool.query(
+        `INSERT INTO entrega_livros (matricula_id, data_entrega, entregue_por)
+         VALUES ($1, CURRENT_DATE, $2)
+         ON CONFLICT (matricula_id) DO UPDATE SET data_entrega = CURRENT_DATE, entregue_por = EXCLUDED.entregue_por`,
+        [matId, quem]);
+    } else {
+      await pool.query(`DELETE FROM entrega_livros WHERE matricula_id = $1`, [matId]);
+    }
+    res.json({ ok: true, entregue });
+  } catch (e) { console.error('Erro registrar entrega de livro:', e); res.status(500).json({ erro: 'Erro ao registrar a entrega.' }); }
 });
 
 app.get('/admin/turmas', autenticar, somenteGestao, async (req, res) => {
@@ -2492,6 +2522,32 @@ app.get('/publico/portal/english-platform/progresso', autenticarResponsavel, asy
          FROM english_platform_progresso WHERE aluno_id = $1`, [alunoId]);
     res.json({ itens: r.rows });
   } catch (e) { console.error('Erro carregar progresso EP:', e); res.status(500).json({ erro: 'Erro ao carregar o progresso.' }); }
+});
+app.get('/publico/portal/english-platform/relatorio', autenticarResponsavel, async (req, res) => {
+  try {
+    const alunoId = Number(req.query.aluno_id);
+    if (!alunoId) return res.status(400).json({ erro: 'aluno_id é obrigatório.' });
+    const pert = await pool.query(`SELECT 1 FROM aluno_responsavel WHERE aluno_id = $1 AND responsavel_id = $2`, [alunoId, req.responsavelId]);
+    if (!pert.rows.length) return res.status(403).json({ erro: 'Aluno não vinculado a este responsável.' });
+    const r = await pool.query(
+      `SELECT id, modulo_key, atividade_idx, estacao, concluida, respostas,
+              (audio_base64 IS NOT NULL) AS tem_audio, atualizado_em
+         FROM english_platform_progresso
+        WHERE aluno_id = $1
+        ORDER BY modulo_key, atividade_idx, estacao`, [alunoId]);
+    res.json({ itens: r.rows });
+  } catch (e) { console.error('Erro relatório EP (pais):', e); res.status(500).json({ erro: 'Erro ao carregar o relatório.' }); }
+});
+app.get('/publico/portal/english-platform/progresso-audio/:id', autenticarResponsavel, async (req, res) => {
+  try {
+    const r = await pool.query(
+      `SELECT p.audio_base64, p.audio_mime
+         FROM english_platform_progresso p
+         JOIN aluno_responsavel ar ON ar.aluno_id = p.aluno_id
+        WHERE p.id = $1 AND ar.responsavel_id = $2`, [Number(req.params.id), req.responsavelId]);
+    if (!r.rows.length || !r.rows[0].audio_base64) return res.status(404).json({ erro: 'Áudio não encontrado.' });
+    res.json({ audio_base64: r.rows[0].audio_base64, audio_mime: r.rows[0].audio_mime || 'audio/webm' });
+  } catch (e) { console.error('Erro áudio EP (pais):', e); res.status(500).json({ erro: 'Erro ao carregar o áudio.' }); }
 });
 app.post('/publico/portal/english-platform/solicitar', autenticarResponsavel, async (req, res) => {
   try {
@@ -5528,7 +5584,7 @@ app.get('/health', async (req, res) => {
     res.json({
       status: (erroInicializacao || falhasMigracao.length) ? 'degradado' : 'ok',
       sistema: 'CEMIC Gestão',
-      versao: '3.72 (Visualização do progresso da English Platform no admin)',
+      versao: '3.74 (Entrega de livros por aluno + relatório por turma)',
       inicializacao: erroInicializacao || 'ok',
       migracoes_com_falha: falhasMigracao
     });
