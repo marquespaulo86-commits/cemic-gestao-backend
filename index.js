@@ -1,5 +1,5 @@
 // ============================================================
-// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v3.78 (editar responsável na ficha do aluno + relatório de conclusão da English Platform (gestão e professor); baixa da Taxa da Plataforma recortada por semestre; … + Justificativa de Faltas: Portal dos Pais -> Pedagógico -> chamada)
+// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v3.79 (correção: rota de conclusão do professor movida para depois de somenteProfessor — evita crash no boot; baixa da Taxa da Plataforma recortada por semestre; … + Justificativa de Faltas: Portal dos Pais -> Pedagógico -> chamada)
 // Banco + Autenticação com perfis + Configurações + CRUDs
 // Stack: Node.js/Express + PostgreSQL (Railway)
 // ============================================================
@@ -2801,23 +2801,6 @@ app.get('/admin/english-platform/conclusao', autenticar, exigirPerfil('master'),
     res.json({ turma: (tu.rows[0] || {}).nome || '', itens: r.rows });
   } catch (e) { console.error('Erro conclusão EP (admin):', e); res.status(500).json({ erro: 'Erro ao montar o relatório de conclusão.' }); }
 });
-app.get('/professor/turmas/:id/english-conclusao', autenticar, somenteProfessor, async (req, res) => {
-  try {
-    if (!await podeTurma(req, req.params.id)) return res.status(403).json({ erro: 'Turma não vinculada ao seu cadastro.' });
-    const r = await pool.query(
-      `WITH conclu AS (
-         SELECT aluno_id FROM english_platform_progresso
-          WHERE concluida = TRUE AND estacao IN ('listening','pron','speaking','vocab','check')
-          GROUP BY aluno_id, modulo_key, atividade_idx
-         HAVING COUNT(DISTINCT estacao) = 5
-       )
-       SELECT a.nome, a.codigo, (a.id IN (SELECT aluno_id FROM conclu)) AS concluida
-         FROM alunos a
-         JOIN matriculas m ON m.aluno_id = a.id AND m.status = 'ativa' AND m.turma_id = $1
-        ORDER BY a.nome`, [req.params.id]);
-    res.json({ itens: r.rows });
-  } catch (e) { console.error('Erro conclusão EP (prof):', e); res.status(500).json({ erro: 'Erro ao montar o relatório de conclusão.' }); }
-});
 app.post('/admin/english-platform/:alunoId/revogar', autenticar, exigirPerfil('master'), async (req, res) => {
   try {
     const alunoId = Number(req.params.alunoId);
@@ -3083,6 +3066,23 @@ app.post('/admin/justificativas/:id/analisar', autenticar, somenteGestao, async 
 // PORTAL DO PROFESSOR
 // ============================================================
 const somenteProfessor = exigirPerfil('professor', 'master', 'secretaria');
+app.get('/professor/turmas/:id/english-conclusao', autenticar, somenteProfessor, async (req, res) => {
+  try {
+    if (!await podeTurma(req, req.params.id)) return res.status(403).json({ erro: 'Turma não vinculada ao seu cadastro.' });
+    const r = await pool.query(
+      `WITH conclu AS (
+         SELECT aluno_id FROM english_platform_progresso
+          WHERE concluida = TRUE AND estacao IN ('listening','pron','speaking','vocab','check')
+          GROUP BY aluno_id, modulo_key, atividade_idx
+         HAVING COUNT(DISTINCT estacao) = 5
+       )
+       SELECT a.nome, a.codigo, (a.id IN (SELECT aluno_id FROM conclu)) AS concluida
+         FROM alunos a
+         JOIN matriculas m ON m.aluno_id = a.id AND m.status = 'ativa' AND m.turma_id = $1
+        ORDER BY a.nome`, [req.params.id]);
+    res.json({ itens: r.rows });
+  } catch (e) { console.error('Erro conclusão EP (prof):', e); res.status(500).json({ erro: 'Erro ao montar o relatório de conclusão.' }); }
+});
 
 // professor -> só as próprias turmas; gestão -> acesso amplo (null)
 function escopoProfessor(req) {
@@ -5671,7 +5671,7 @@ app.get('/health', async (req, res) => {
     res.json({
       status: (erroInicializacao || falhasMigracao.length) ? 'degradado' : 'ok',
       sistema: 'CEMIC Gestão',
-      versao: '3.78 (Editar responsável + relatório de conclusão EP)',
+      versao: '3.79 (Correção de boot: rota de conclusão do professor)',
       inicializacao: erroInicializacao || 'ok',
       migracoes_com_falha: falhasMigracao
     });
