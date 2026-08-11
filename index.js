@@ -1,5 +1,5 @@
 // ============================================================
-// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v3.76 (editar conteúdo do professor sem duplicar faltas + Turno da Reunião de Pais; baixa da Taxa da Plataforma recortada por semestre; … + Justificativa de Faltas: Portal dos Pais -> Pedagógico -> chamada)
+// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v3.77 (percentual de progresso da English Platform no Portal dos Pais + reparação de conclusões; baixa da Taxa da Plataforma recortada por semestre; … + Justificativa de Faltas: Portal dos Pais -> Pedagógico -> chamada)
 // Banco + Autenticação com perfis + Configurações + CRUDs
 // Stack: Node.js/Express + PostgreSQL (Railway)
 // ============================================================
@@ -2744,6 +2744,29 @@ app.get('/admin/english-platform/progresso-audio/:id', autenticar, exigirPerfil(
     if (!r.rows.length || !r.rows[0].audio_base64) return res.status(404).json({ erro: 'Áudio não encontrado.' });
     res.json({ audio_base64: r.rows[0].audio_base64, audio_mime: r.rows[0].audio_mime || 'audio/webm' });
   } catch (e) { console.error('Erro áudio EP (admin):', e); res.status(500).json({ erro: 'Erro ao carregar o áudio.' }); }
+});
+app.post('/admin/english-platform/reparar-conclusoes', autenticar, exigirPerfil('master'), async (req, res) => {
+  try {
+    const r = await pool.query(
+      `INSERT INTO english_platform_progresso (aluno_id, modulo_key, atividade_idx, estacao, concluida, respostas, atualizado_em)
+       SELECT s.aluno_id, s.modulo_key, s.atividade_idx, 'atividade', TRUE, '{}'::jsonb, NOW()
+         FROM (
+           SELECT aluno_id, modulo_key, atividade_idx
+             FROM english_platform_progresso
+            WHERE estacao IN ('listening','pron','speaking','vocab','check') AND concluida = TRUE
+            GROUP BY aluno_id, modulo_key, atividade_idx
+           HAVING COUNT(DISTINCT estacao) = 5
+         ) s
+        WHERE NOT EXISTS (
+          SELECT 1 FROM english_platform_progresso p
+           WHERE p.aluno_id = s.aluno_id AND p.modulo_key = s.modulo_key
+             AND p.atividade_idx = s.atividade_idx AND p.estacao = 'atividade' AND p.concluida = TRUE
+        )
+       ON CONFLICT (aluno_id, modulo_key, atividade_idx, estacao)
+       DO UPDATE SET concluida = TRUE, atualizado_em = NOW()
+       RETURNING aluno_id`);
+    res.json({ ok: true, reparadas: r.rowCount });
+  } catch (e) { console.error('Erro reparar conclusões EP:', e); res.status(500).json({ erro: 'Erro ao reparar as conclusões.' }); }
 });
 app.post('/admin/english-platform/:alunoId/revogar', autenticar, exigirPerfil('master'), async (req, res) => {
   try {
@@ -5598,7 +5621,7 @@ app.get('/health', async (req, res) => {
     res.json({
       status: (erroInicializacao || falhasMigracao.length) ? 'degradado' : 'ok',
       sistema: 'CEMIC Gestão',
-      versao: '3.76 (Editar conteúdo do professor + Turno da Reunião de Pais)',
+      versao: '3.77 (Percentual de progresso EP nos pais + reparação de conclusões)',
       inicializacao: erroInicializacao || 'ok',
       migracoes_com_falha: falhasMigracao
     });
