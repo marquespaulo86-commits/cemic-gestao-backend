@@ -1,5 +1,5 @@
 // ============================================================
-// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v3.74 (rotina de entrega de livros por aluno + relatório entregues/não entregues; baixa da Taxa da Plataforma recortada por semestre; … + Justificativa de Faltas: Portal dos Pais -> Pedagógico -> chamada)
+// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v3.76 (editar conteúdo do professor sem duplicar faltas + Turno da Reunião de Pais; baixa da Taxa da Plataforma recortada por semestre; … + Justificativa de Faltas: Portal dos Pais -> Pedagógico -> chamada)
 // Banco + Autenticação com perfis + Configurações + CRUDs
 // Stack: Node.js/Express + PostgreSQL (Railway)
 // ============================================================
@@ -466,6 +466,7 @@ async function initDB() {
     UNIQUE(reuniao_id, responsavel_id)
   )`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_reuniao_presencas ON reuniao_presencas (reuniao_id, responsavel_id)`);
+  await pool.query(`ALTER TABLE reunioes_pais ADD COLUMN IF NOT EXISTS turno TEXT`);
   // Justificativa de faltas (Portal dos Pais -> Pedagógico -> chamada)
   await pool.query(`CREATE TABLE IF NOT EXISTS justificativas_falta (
     id SERIAL PRIMARY KEY,
@@ -3102,7 +3103,7 @@ const _totalResponsaveisElegiveis = async () => {
 app.get('/admin/reunioes', autenticar, somenteGestao, async (req, res) => {
   try {
     const r = await pool.query(
-      `SELECT r.id, r.titulo, r.data, r.hora, r.semestre, r.descricao,
+      `SELECT r.id, r.titulo, r.data, r.hora, r.semestre, r.descricao, r.turno,
               (SELECT COUNT(*) FROM reuniao_presencas rp WHERE rp.reuniao_id = r.id AND rp.presente = TRUE) AS presentes,
               (SELECT COUNT(*) FROM reuniao_presencas rp WHERE rp.reuniao_id = r.id AND rp.presente = FALSE) AS ausentes
          FROM reunioes_pais r ORDER BY r.data DESC, r.id DESC`);
@@ -3116,9 +3117,10 @@ app.post('/admin/reunioes', autenticar, somenteGestao, async (req, res) => {
     const data = String(req.body.data || '').trim();
     if (!titulo || !data) return res.status(400).json({ erro: 'Título e data são obrigatórios.' });
     const semestre = String(req.body.semestre || '').trim() || await _semestreVigente();
+    const turno = ['manha','tarde','unificado'].includes(req.body.turno) ? req.body.turno : 'unificado';
     const r = await pool.query(
-      `INSERT INTO reunioes_pais (titulo, data, hora, semestre, descricao) VALUES ($1,$2,$3,$4,$5) RETURNING *`,
-      [titulo, data, String(req.body.hora || '').trim() || null, semestre || null, String(req.body.descricao || '').trim() || null]);
+      `INSERT INTO reunioes_pais (titulo, data, hora, semestre, descricao, turno) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
+      [titulo, data, String(req.body.hora || '').trim() || null, semestre || null, String(req.body.descricao || '').trim() || null, turno]);
     res.json(r.rows[0]);
   } catch (e) { console.error('Erro criar reuniao:', e); res.status(500).json({ erro: 'Erro ao criar a reunião.' }); }
 });
@@ -3128,9 +3130,10 @@ app.put('/admin/reunioes/:id', autenticar, somenteGestao, async (req, res) => {
     const titulo = String(req.body.titulo || '').trim();
     const data = String(req.body.data || '').trim();
     if (!titulo || !data) return res.status(400).json({ erro: 'Título e data são obrigatórios.' });
+    const turno = ['manha','tarde','unificado'].includes(req.body.turno) ? req.body.turno : 'unificado';
     const r = await pool.query(
-      `UPDATE reunioes_pais SET titulo=$1, data=$2, hora=$3, semestre=$4, descricao=$5 WHERE id=$6 RETURNING *`,
-      [titulo, data, String(req.body.hora || '').trim() || null, String(req.body.semestre || '').trim() || null, String(req.body.descricao || '').trim() || null, Number(req.params.id)]);
+      `UPDATE reunioes_pais SET titulo=$1, data=$2, hora=$3, semestre=$4, descricao=$5, turno=$6 WHERE id=$7 RETURNING *`,
+      [titulo, data, String(req.body.hora || '').trim() || null, String(req.body.semestre || '').trim() || null, String(req.body.descricao || '').trim() || null, turno, Number(req.params.id)]);
     if (!r.rows.length) return res.status(404).json({ erro: 'Reunião não encontrada.' });
     res.json(r.rows[0]);
   } catch (e) { console.error('Erro editar reuniao:', e); res.status(500).json({ erro: 'Erro ao editar a reunião.' }); }
@@ -3145,8 +3148,10 @@ app.delete('/admin/reunioes/:id', autenticar, somenteGestao, async (req, res) =>
 app.get('/admin/reunioes/:id/presencas', autenticar, somenteGestao, async (req, res) => {
   try {
     const id = Number(req.params.id);
-    const rh = await pool.query(`SELECT id, titulo, data, hora, semestre, descricao FROM reunioes_pais WHERE id = $1`, [id]);
+    const rh = await pool.query(`SELECT id, titulo, data, hora, semestre, descricao, turno FROM reunioes_pais WHERE id = $1`, [id]);
     if (!rh.rows.length) return res.status(404).json({ erro: 'Reunião não encontrada.' });
+    const turnoRe = rh.rows[0].turno;
+    const condTurno = turnoRe === 'manha' ? " AND t.turno = 'Matutino'" : turnoRe === 'tarde' ? " AND t.turno = 'Vespertino'" : '';
     const busca = req.query.busca ? String(req.query.busca).trim() : '';
     const params = [id];
     let filtro = '';
@@ -3159,7 +3164,7 @@ app.get('/admin/reunioes/:id/presencas', autenticar, somenteGestao, async (req, 
                 WHERE ar.responsavel_id = r.id) AS filhos
          FROM responsaveis r
          LEFT JOIN reuniao_presencas rp ON rp.reuniao_id = $1 AND rp.responsavel_id = r.id
-        WHERE EXISTS (SELECT 1 FROM aluno_responsavel ar JOIN matriculas m ON m.aluno_id = ar.aluno_id AND m.status = 'ativa' WHERE ar.responsavel_id = r.id)${filtro}
+        WHERE EXISTS (SELECT 1 FROM aluno_responsavel ar JOIN matriculas m ON m.aluno_id = ar.aluno_id AND m.status = 'ativa' JOIN turmas t ON t.id = m.turma_id WHERE ar.responsavel_id = r.id${condTurno})${filtro}
         ORDER BY r.nome`, params);
     res.json({ reuniao: rh.rows[0], responsaveis: lista.rows });
   } catch (e) { console.error('Erro presencas reuniao:', e); res.status(500).json({ erro: 'Erro ao carregar a lista de presença.' }); }
@@ -3362,8 +3367,17 @@ app.put('/professor/aulas/:id', autenticar, somenteProfessor, async (req, res) =
     if (!await podeTurma(req, tId)) return res.status(403).json({ erro: 'Aula de turma não vinculada ao seu cadastro.' });
     const conteudo = (req.body.conteudo || '').trim();
     if (!conteudo) return res.status(400).json({ erro: 'Descreva o conteúdo trabalhado.' });
-    await pool.query(`UPDATE aulas SET conteudo = $1, data = COALESCE($2, data) WHERE id = $3`,
-      [conteudo, req.body.data || null, req.params.id]);
+    const HAB = ['listening', 'speaking', 'writing', 'reading'];
+    const habilidades = Array.isArray(req.body.habilidades) ? req.body.habilidades.filter(x => HAB.includes(x)) : [];
+    await pool.query(
+      `UPDATE aulas SET conteudo = $1, data = COALESCE($2, data),
+              objetivo = $3, metodologia = $4, avaliacao = $5, habilidades = $6
+         WHERE id = $7`,
+      [conteudo, req.body.data || null,
+       (req.body.objetivo || '').trim() || null,
+       (req.body.metodologia || '').trim() || null,
+       (req.body.avaliacao || '').trim() || null,
+       habilidades, req.params.id]);
     res.json({ ok: true });
   } catch (e) { console.error('Erro PUT aula:', e); res.status(500).json({ erro: 'Erro ao atualizar a aula.' }); }
 });
@@ -5584,7 +5598,7 @@ app.get('/health', async (req, res) => {
     res.json({
       status: (erroInicializacao || falhasMigracao.length) ? 'degradado' : 'ok',
       sistema: 'CEMIC Gestão',
-      versao: '3.74 (Entrega de livros por aluno + relatório por turma)',
+      versao: '3.76 (Editar conteúdo do professor + Turno da Reunião de Pais)',
       inicializacao: erroInicializacao || 'ok',
       migracoes_com_falha: falhasMigracao
     });
