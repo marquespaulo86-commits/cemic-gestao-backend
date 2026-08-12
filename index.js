@@ -1,5 +1,5 @@
 // ============================================================
-// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v3.79 (correção: rota de conclusão do professor movida para depois de somenteProfessor — evita crash no boot; baixa da Taxa da Plataforma recortada por semestre; … + Justificativa de Faltas: Portal dos Pais -> Pedagógico -> chamada)
+// SISTEMA DE GESTÃO ESCOLAR CEMIC — Backend v3.80 (Contas a Receber: editar vencimento/valor + filtro por tipo de conta; baixa da Taxa da Plataforma recortada por semestre; … + Justificativa de Faltas: Portal dos Pais -> Pedagógico -> chamada)
 // Banco + Autenticação com perfis + Configurações + CRUDs
 // Stack: Node.js/Express + PostgreSQL (Railway)
 // ============================================================
@@ -1869,6 +1869,12 @@ app.get('/admin/contas-receber', autenticar, somenteGestao, async (req, res) => 
     if (req.query.aluno_id) { params.push(req.query.aluno_id); cond.push(`cr.aluno_id = $${params.length}`); }
     if (req.query.status) { params.push(req.query.status); cond.push(`cr.status = $${params.length}`); }
     if (req.query.competencia) { params.push(req.query.competencia); cond.push(`cr.competencia = $${params.length}`); }
+    if (req.query.tipo) {
+      const t = req.query.tipo;
+      if (t === 'mensalidade') cond.push(`cr.descricao ILIKE 'Mensalidade%'`);
+      else if (t === 'plataforma') cond.push(`cr.descricao ILIKE 'Taxa da Plataforma%'`);
+      else if (t === 'matricula') cond.push(`cr.descricao ILIKE 'Taxa de Matrícula%'`);
+    }
     if (req.query.busca) {
       params.push(`%${req.query.busca}%`);
       cond.push(`(a.nome ILIKE $${params.length} OR cr.cliente_nome ILIKE $${params.length} OR cr.numero_documento ILIKE $${params.length} OR EXISTS (
@@ -1894,6 +1900,29 @@ app.get('/admin/contas-receber', autenticar, somenteGestao, async (req, res) => 
        ${where} ORDER BY cr.vencimento, cr.id`, params);
     res.json(r.rows);
   } catch (e) { console.error('Erro GET contas-receber:', e); res.status(500).json({ erro: 'Erro ao listar cobranças.' }); }
+});
+
+app.put('/admin/contas-receber/:id', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const c = await pool.query(`SELECT status FROM contas_receber WHERE id = $1`, [req.params.id]);
+    if (!c.rows.length) return res.status(404).json({ erro: 'Cobrança não encontrada.' });
+    const sets = []; const params = [];
+    if (req.body.vencimento) { params.push(req.body.vencimento); sets.push(`vencimento = $${params.length}`); }
+    if (req.body.valor_final !== undefined && req.body.valor_final !== null && req.body.valor_final !== '') {
+      params.push(Number(req.body.valor_final)); sets.push(`valor_final = $${params.length}`);
+    }
+    if (typeof req.body.descricao === 'string' && req.body.descricao.trim()) {
+      params.push(req.body.descricao.trim()); sets.push(`descricao = $${params.length}`);
+    }
+    if (!sets.length) return res.status(400).json({ erro: 'Nada para atualizar.' });
+    params.push(req.params.id);
+    await pool.query(`UPDATE contas_receber SET ${sets.join(', ')} WHERE id = $${params.length}`, params);
+    // reavalia atrasada/pendente pelo novo vencimento (não mexe em paga/cancelada)
+    await pool.query(
+      `UPDATE contas_receber SET status = CASE WHEN vencimento < CURRENT_DATE THEN 'atrasada' ELSE 'pendente' END
+         WHERE id = $1 AND status IN ('pendente','atrasada')`, [req.params.id]);
+    res.json({ ok: true });
+  } catch (e) { console.error('Erro editar conta:', e); res.status(500).json({ erro: 'Erro ao salvar a cobrança.' }); }
 });
 
 app.post('/admin/contas-receber', autenticar, somenteGestao, async (req, res) => {
@@ -5671,7 +5700,7 @@ app.get('/health', async (req, res) => {
     res.json({
       status: (erroInicializacao || falhasMigracao.length) ? 'degradado' : 'ok',
       sistema: 'CEMIC Gestão',
-      versao: '3.79 (Correção de boot: rota de conclusão do professor)',
+      versao: '3.80 (Editar Contas a Receber + filtro por tipo)',
       inicializacao: erroInicializacao || 'ok',
       migracoes_com_falha: falhasMigracao
     });
