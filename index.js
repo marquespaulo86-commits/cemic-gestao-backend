@@ -2830,6 +2830,54 @@ app.get('/admin/english-platform/conclusao', autenticar, exigirPerfil('master'),
     res.json({ turma: (tu.rows[0] || {}).nome || '', itens: r.rows });
   } catch (e) { console.error('Erro conclusão EP (admin):', e); res.status(500).json({ erro: 'Erro ao montar o relatório de conclusão.' }); }
 });
+app.get('/admin/english-platform/atividades', autenticar, exigirPerfil('master'), async (req, res) => {
+  try {
+    const turmaId = Number(req.query.turma_id);
+    if (!turmaId) return res.status(400).json({ erro: 'turma_id é obrigatório.' });
+    const ti = await pool.query(
+      `SELECT t.id, t.nome, t.turno, t.semestre, c.nome AS curso_nome, n.nome AS nivel_nome,
+              COALESCE(t.plataforma_modulo, n.plataforma_modulo) AS modulo_key
+         FROM turmas t
+         JOIN niveis n ON n.id = t.nivel_id
+         JOIN cursos c ON c.id = n.curso_id
+        WHERE t.id = $1`, [turmaId]);
+    if (!ti.rows.length) return res.status(404).json({ erro: 'Turma não encontrada.' });
+    const turma = ti.rows[0];
+    const moduloKey = turma.modulo_key;
+    const al = await pool.query(
+      `SELECT a.id AS aluno_id, a.nome, a.codigo
+         FROM alunos a
+         JOIN matriculas m ON m.aluno_id = a.id AND m.status = 'ativa' AND m.turma_id = $1
+        ORDER BY a.nome`, [turmaId]);
+    let conclusoes = [], maxIdx = null;
+    if (moduloKey) {
+      const cc = await pool.query(
+        `SELECT p.aluno_id, p.atividade_idx,
+                to_char(MAX(p.atualizado_em) AT TIME ZONE 'America/Fortaleza','YYYY-MM-DD') AS em
+           FROM english_platform_progresso p
+           JOIN matriculas m ON m.aluno_id = p.aluno_id AND m.status = 'ativa' AND m.turma_id = $1
+          WHERE p.modulo_key = $2
+            AND p.estacao IN ('listening','pron','speaking','vocab','check')
+            AND p.concluida = TRUE
+          GROUP BY p.aluno_id, p.atividade_idx
+         HAVING COUNT(DISTINCT p.estacao) = 5`, [turmaId, moduloKey]);
+      conclusoes = cc.rows;
+      const mx = await pool.query(
+        `SELECT MAX(atividade_idx) AS mx FROM english_platform_progresso WHERE modulo_key = $1`, [moduloKey]);
+      maxIdx = (mx.rows[0].mx === null || mx.rows[0].mx === undefined) ? null : Number(mx.rows[0].mx);
+    }
+    let eventos = [];
+    if (turma.semestre) {
+      const ev = await pool.query(
+        `SELECT to_char(data,'YYYY-MM-DD') AS data, titulo
+           FROM calendario
+          WHERE semestre = $1 AND modalidade = 'Online'
+          ORDER BY data`, [turma.semestre]);
+      eventos = ev.rows;
+    }
+    res.json({ turma, alunos: al.rows, conclusoes, eventos, max_atividade_idx: maxIdx });
+  } catch (e) { console.error('Erro relatório atividades EP:', e); res.status(500).json({ erro: 'Erro ao montar o relatório de atividades.' }); }
+});
 app.post('/admin/english-platform/:alunoId/revogar', autenticar, exigirPerfil('master'), async (req, res) => {
   try {
     const alunoId = Number(req.params.alunoId);
@@ -5700,7 +5748,7 @@ app.get('/health', async (req, res) => {
     res.json({
       status: (erroInicializacao || falhasMigracao.length) ? 'degradado' : 'ok',
       sistema: 'CEMIC Gestão',
-      versao: '3.80 (Editar Contas a Receber + filtro por tipo)',
+      versao: '3.81 (Relatório de Atividades da English Platform por turma)',
       inicializacao: erroInicializacao || 'ok',
       migracoes_com_falha: falhasMigracao
     });
@@ -5717,7 +5765,7 @@ initDB()
     console.error('Falha ao inicializar o banco:', e);
   })
   .finally(() => app.listen(PORT, () => {
-    console.log(`CEMIC Gestão — backend v3.64 rodando na porta ${PORT}`);
+    console.log(`CEMIC Gestão — backend v3.81 rodando na porta ${PORT}`);
     if (erroInicializacao) console.error('ATENÇÃO: o sistema subiu com falha de inicialização —', erroInicializacao);
     if (falhasMigracao.length) console.error('ATENÇÃO: migrações com falha —', falhasMigracao.join(' | '));
   }));
