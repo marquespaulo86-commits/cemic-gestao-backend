@@ -654,6 +654,13 @@ async function initDB() {
     UNIQUE (aluno_id, modulo_key, atividade_idx, estacao)
   )`);
   await migrar('idx_ep_prog_aluno', `CREATE INDEX IF NOT EXISTS idx_ep_prog_aluno ON english_platform_progresso (aluno_id)`);
+  // SVA (Atividade Programada Virtual): conclusão por aluno (existir a linha = concluiu).
+  await migrar('sva_conclusoes', `CREATE TABLE IF NOT EXISTS sva_conclusoes (
+    aluno_id INTEGER PRIMARY KEY REFERENCES alunos(id) ON DELETE CASCADE,
+    modulo_key TEXT,
+    turno TEXT,
+    concluido_em TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  )`);
   // Entrega de livros: registro por matrícula (existir a linha = livro entregue).
   await migrar('entrega_livros', `CREATE TABLE IF NOT EXISTS entrega_livros (
     matricula_id INTEGER PRIMARY KEY REFERENCES matriculas(id) ON DELETE CASCADE,
@@ -2596,6 +2603,38 @@ app.get('/publico/portal/english-platform/relatorio', autenticarResponsavel, asy
     res.json({ itens: r.rows });
   } catch (e) { console.error('Erro relatório EP (pais):', e); res.status(500).json({ erro: 'Erro ao carregar o relatório.' }); }
 });
+// SVA: gravar conclusão da Atividade Programada Virtual (aluno via responsável).
+app.post('/publico/portal/english-platform/sva-concluir', autenticarResponsavel, async (req, res) => {
+  try {
+    const b = req.body || {};
+    const alunoId = Number(b.aluno_id);
+    if (!alunoId) return res.status(400).json({ erro: 'aluno_id é obrigatório.' });
+    const pert = await pool.query(`SELECT 1 FROM aluno_responsavel WHERE aluno_id = $1 AND responsavel_id = $2`, [alunoId, req.responsavelId]);
+    if (!pert.rows.length) return res.status(403).json({ erro: 'Aluno não vinculado a este responsável.' });
+    const modulo = (String(b.nivel || b.modulo_key || '').slice(0, 40)) || null;
+    const turno = (String(b.turno || '').slice(0, 20)) || null;
+    await pool.query(
+      `INSERT INTO sva_conclusoes (aluno_id, modulo_key, turno, concluido_em)
+       VALUES ($1,$2,$3,NOW())
+       ON CONFLICT (aluno_id) DO UPDATE SET
+         modulo_key = COALESCE(EXCLUDED.modulo_key, sva_conclusoes.modulo_key),
+         turno = COALESCE(EXCLUDED.turno, sva_conclusoes.turno),
+         concluido_em = NOW()`,
+      [alunoId, modulo, turno]);
+    res.json({ ok: true });
+  } catch (e) { console.error('Erro SVA concluir:', e); res.status(500).json({ erro: 'Erro ao registrar a conclusão.' }); }
+});
+// SVA: status de conclusão (para pintar o card em qualquer aparelho).
+app.get('/publico/portal/english-platform/sva-status', autenticarResponsavel, async (req, res) => {
+  try {
+    const alunoId = Number(req.query.aluno_id);
+    if (!alunoId) return res.status(400).json({ erro: 'aluno_id é obrigatório.' });
+    const pert = await pool.query(`SELECT 1 FROM aluno_responsavel WHERE aluno_id = $1 AND responsavel_id = $2`, [alunoId, req.responsavelId]);
+    if (!pert.rows.length) return res.status(403).json({ erro: 'Aluno não vinculado a este responsável.' });
+    const r = await pool.query(`SELECT concluido_em FROM sva_conclusoes WHERE aluno_id = $1`, [alunoId]);
+    res.json({ concluido: r.rows.length > 0, concluido_em: r.rows[0] ? r.rows[0].concluido_em : null });
+  } catch (e) { console.error('Erro SVA status:', e); res.status(500).json({ erro: 'Erro ao consultar.' }); }
+});
 app.get('/publico/portal/english-platform/progresso-audio/:id', autenticarResponsavel, async (req, res) => {
   try {
     const r = await pool.query(
@@ -2780,6 +2819,23 @@ app.post('/admin/english-platform/autorizar-lote', autenticar, exigirPerfil('mas
     }
     res.json({ ok: true, autorizados: n });
   } catch (e) { console.error('Erro EP autorizar-lote:', e); res.status(500).json({ erro: 'Erro ao autorizar em lote.' }); }
+});
+// SVA: relatório de todos os concluintes (gestão).
+app.get('/admin/english-platform/sva-conclusoes', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const r = await pool.query(
+      `SELECT a.codigo, a.nome,
+              t.nome AS turma, t.turno,
+              n.nome AS nivel,
+              s.modulo_key, s.concluido_em
+         FROM sva_conclusoes s
+         JOIN alunos a ON a.id = s.aluno_id
+         LEFT JOIN matriculas m ON m.aluno_id = a.id AND m.status = 'ativa'
+         LEFT JOIN turmas t ON t.id = m.turma_id
+         LEFT JOIN niveis n ON n.id = t.nivel_id
+        ORDER BY s.concluido_em DESC`);
+    res.json({ total: r.rows.length, itens: r.rows });
+  } catch (e) { console.error('Erro relatório SVA:', e); res.status(500).json({ erro: 'Erro ao carregar o relatório.' }); }
 });
 app.get('/admin/english-platform/progresso/:alunoId', autenticar, exigirPerfil('master'), async (req, res) => {
   try {
@@ -5781,7 +5837,7 @@ app.get('/health', async (req, res) => {
     res.json({
       status: (erroInicializacao || falhasMigracao.length) ? 'degradado' : 'ok',
       sistema: 'CEMIC Gestão',
-      versao: '3.83 (Rate limit de login mais tolerante p/ acesso em massa + primeiro-acesso isolado)',
+      versao: '3.84 (SVA: conclusão gravada no servidor + relatório de concluintes)',
       inicializacao: erroInicializacao || 'ok',
       migracoes_com_falha: falhasMigracao
     });
@@ -5798,7 +5854,7 @@ initDB()
     console.error('Falha ao inicializar o banco:', e);
   })
   .finally(() => app.listen(PORT, () => {
-    console.log(`CEMIC Gestão — backend v3.83 rodando na porta ${PORT}`);
+    console.log(`CEMIC Gestão — backend v3.84 rodando na porta ${PORT}`);
     if (erroInicializacao) console.error('ATENÇÃO: o sistema subiu com falha de inicialização —', erroInicializacao);
     if (falhasMigracao.length) console.error('ATENÇÃO: migrações com falha —', falhasMigracao.join(' | '));
   }));
