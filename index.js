@@ -774,7 +774,7 @@ async function seedConfiguracoes() {
         ]
       }
     }), 'Composição da nota por bimestre (etapas e pesos) — base para as avaliações das turmas'],
-    ['calendario_observacao', JSON.stringify('O presente calendário está sujeito a modificações, considerando o Calendário Escolar Regular do IEMA Pleno Dr.º João Bacelar Portela.'), 'Observação exibida ao pé do calendário acadêmico'],
+    ['calendario_observacao', JSON.stringify('O presente calendário está sujeito a modificações, considerando o Calendário Escolar Regular do IEMA Pleno Dr.º João Bacelar Portela.'), 'Observação exibida ao pé do calendário acadêmico']
     ['valor_hora_aula', JSON.stringify(0), 'Valor padrão da hora-aula do professor (R$)']
   ];
   for (const [chave, valor, descricao] of padroes) {
@@ -824,8 +824,8 @@ async function seedMaster() {
 // 2. AUTENTICAÇÃO E MIDDLEWARES
 // ============================================================
 const limiterLogin = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 20,
+  windowMs: 10 * 60 * 1000,
+  max: 40,
   standardHeaders: true,
   legacyHeaders: false,
   // Conta tentativas por CPF, não por IP: numa escola, dezenas de professores
@@ -836,7 +836,21 @@ const limiterLogin = rateLimit({
   },
   // Só tentativas malsucedidas contam; quem acerta a senha nunca é barrado.
   skipSuccessfulRequests: true,
-  message: { erro: 'Muitas tentativas para este CPF. Aguarde 15 minutos ou peça à secretaria para redefinir seu acesso.' }
+  message: { erro: 'Muitas tentativas para este CPF. Aguarde alguns minutos ou peça à secretaria para redefinir seu acesso.' }
+});
+
+// Primeiro acesso (criar senha): balde próprio, por CPF, para NÃO consumir o orçamento de login.
+const limiterPrimeiroAcesso = rateLimit({
+  windowMs: 10 * 60 * 1000,
+  max: 25,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => {
+    const cpf = String((req.body && req.body.cpf) || '').replace(/\D/g, '');
+    return 'pa:' + (cpf || (req.ip || 'sem-ip'));
+  },
+  skipSuccessfulRequests: true,
+  message: { erro: 'Muitas tentativas de primeiro acesso. Aguarde alguns minutos ou peça ajuda à secretaria.' }
 });
 
 const limiterPublico = rateLimit({
@@ -2471,7 +2485,7 @@ app.post('/publico/rematricula', limiterPublico, async (req, res) => {
   } catch (e) { console.error('Erro /publico/rematricula:', e); res.status(500).json({ erro: 'Erro ao registrar a rematrícula.' }); }
 });
 
-app.post('/publico/portal/primeiro-acesso', limiterLogin, async (req, res) => {
+app.post('/publico/portal/primeiro-acesso', limiterPrimeiroAcesso, async (req, res) => {
   try {
     const cpf = soDigitos(req.body.cpf);
     const senha = String(req.body.senha || '');
@@ -5767,7 +5781,7 @@ app.get('/health', async (req, res) => {
     res.json({
       status: (erroInicializacao || falhasMigracao.length) ? 'degradado' : 'ok',
       sistema: 'CEMIC Gestão',
-      versao: '3.82 (Relatório de Atividades da EP — admin e Portal do Professor)',
+      versao: '3.83 (Rate limit de login mais tolerante p/ acesso em massa + primeiro-acesso isolado)',
       inicializacao: erroInicializacao || 'ok',
       migracoes_com_falha: falhasMigracao
     });
@@ -5784,7 +5798,7 @@ initDB()
     console.error('Falha ao inicializar o banco:', e);
   })
   .finally(() => app.listen(PORT, () => {
-    console.log(`CEMIC Gestão — backend v3.82 rodando na porta ${PORT}`);
+    console.log(`CEMIC Gestão — backend v3.83 rodando na porta ${PORT}`);
     if (erroInicializacao) console.error('ATENÇÃO: o sistema subiu com falha de inicialização —', erroInicializacao);
     if (falhasMigracao.length) console.error('ATENÇÃO: migrações com falha —', falhasMigracao.join(' | '));
   }));
