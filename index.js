@@ -2701,7 +2701,8 @@ app.post('/publico/portal/assistant', autenticarResponsavel, limiterIA, async (r
     const nivel = String((req.body && req.body.nivel) || '').slice(0, 40).replace(/[\r\n]+/g, ' ');
     const SYS_ASSIST = "You are the friendly English tutor of CEMIC's English Platform." + (nivel ? " The student's level is " + nivel + "." : "") + " Help with English learning only: grammar, vocabulary, pronunciation, how to say things. Keep answers short and simple, matching the level. Reply in English and add a brief Portuguese note in parentheses when it helps a Brazilian learner. Be encouraging.";
     const SYS_DICT = "You are an English-Portuguese learner's dictionary. Return ONLY a JSON object, no markdown, with keys: word, ipa (IPA or empty), pos (part of speech), en (short English definition), pt (Brazilian Portuguese translation), example (one simple English sentence using the word). Keep it concise and level-appropriate.";
-    const system = modo === 'dicionario' ? SYS_DICT : SYS_ASSIST;
+    const SYS_DIALOGO = "You are a translator for a Brazilian child or teen learning English. The student wrote a short family dialogue, usually in Portuguese. Translate it into natural, simple, level-appropriate English. Keep the dialogue layout: one line per speaker and keep any speaker labels or names. Output ONLY the English translation - no notes, no explanations, no markdown, no quotes.";
+    const system = modo === 'dicionario' ? SYS_DICT : (modo === 'dialogo' ? SYS_DIALOGO : SYS_ASSIST);
     const r = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: { 'content-type': 'application/json', 'x-api-key': key, 'anthropic-version': '2023-06-01' },
@@ -2836,6 +2837,41 @@ app.get('/admin/english-platform/sva-conclusoes', autenticar, somenteGestao, asy
         ORDER BY s.concluido_em DESC`);
     res.json({ total: r.rows.length, itens: r.rows });
   } catch (e) { console.error('Erro relatório SVA:', e); res.status(500).json({ erro: 'Erro ao carregar o relatório.' }); }
+});
+// SVA: importar/backfill de concluintes por lista de códigos (ALU-xxxx) ou CPFs (gestão).
+app.post('/admin/english-platform/sva-conclusoes/importar', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const b = req.body || {};
+    const bruta = Array.isArray(b.lista) ? b.lista : String(b.lista || '').split(/[\s,;]+/);
+    const turno = (String(b.turno || '').slice(0, 20)) || null;
+    let quando = null;
+    if (b.data) { const d = new Date(b.data); if (!isNaN(d.getTime())) quando = d.toISOString(); }
+    const termos = [...new Set(bruta.map(x => String(x || '').trim()).filter(Boolean))];
+    if (!termos.length) return res.status(400).json({ erro: 'Lista vazia.' });
+    let inseridos = 0; const naoEncontrados = [];
+    for (const termo of termos) {
+      const cpf = termo.replace(/\D/g, '');
+      let al = null;
+      if (cpf.length === 11) {
+        const r = await pool.query(`SELECT id FROM alunos WHERE regexp_replace(COALESCE(cpf,''),'\\D','','g') = $1 LIMIT 1`, [cpf]);
+        al = r.rows[0];
+      }
+      if (!al) {
+        const r = await pool.query(`SELECT id FROM alunos WHERE upper(codigo) = upper($1) LIMIT 1`, [termo]);
+        al = r.rows[0];
+      }
+      if (!al) { naoEncontrados.push(termo); continue; }
+      await pool.query(
+        `INSERT INTO sva_conclusoes (aluno_id, turno, concluido_em)
+         VALUES ($1,$2,COALESCE($3::timestamptz, NOW()))
+         ON CONFLICT (aluno_id) DO UPDATE SET
+           turno = COALESCE(EXCLUDED.turno, sva_conclusoes.turno),
+           concluido_em = COALESCE($3::timestamptz, sva_conclusoes.concluido_em)`,
+        [al.id, turno, quando]);
+      inseridos++;
+    }
+    res.json({ ok: true, inseridos, naoEncontrados, total: termos.length });
+  } catch (e) { console.error('Erro import SVA:', e); res.status(500).json({ erro: 'Erro ao importar.' }); }
 });
 app.get('/admin/english-platform/progresso/:alunoId', autenticar, exigirPerfil('master'), async (req, res) => {
   try {
@@ -5837,7 +5873,7 @@ app.get('/health', async (req, res) => {
     res.json({
       status: (erroInicializacao || falhasMigracao.length) ? 'degradado' : 'ok',
       sistema: 'CEMIC Gestão',
-      versao: '3.84 (SVA: conclusão gravada no servidor + relatório de concluintes)',
+      versao: '3.86 (English Platform: tradutor de diálogo familiar PT->EN)',
       inicializacao: erroInicializacao || 'ok',
       migracoes_com_falha: falhasMigracao
     });
@@ -5854,7 +5890,7 @@ initDB()
     console.error('Falha ao inicializar o banco:', e);
   })
   .finally(() => app.listen(PORT, () => {
-    console.log(`CEMIC Gestão — backend v3.84 rodando na porta ${PORT}`);
+    console.log(`CEMIC Gestão — backend v3.86 rodando na porta ${PORT}`);
     if (erroInicializacao) console.error('ATENÇÃO: o sistema subiu com falha de inicialização —', erroInicializacao);
     if (falhasMigracao.length) console.error('ATENÇÃO: migrações com falha —', falhasMigracao.join(' | '));
   }));
