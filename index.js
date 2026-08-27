@@ -661,6 +661,31 @@ async function initDB() {
     turno TEXT,
     concluido_em TIMESTAMPTZ NOT NULL DEFAULT NOW()
   )`);
+  // Controle de Almoço: cardápio por data + escolhas dos professores.
+  await migrar('almoco_cardapio', `CREATE TABLE IF NOT EXISTS almoco_cardapio (
+    id SERIAL PRIMARY KEY,
+    data DATE NOT NULL UNIQUE,
+    proteina1 TEXT, proteina2 TEXT, proteina3 TEXT,
+    arroz1 TEXT, arroz2 TEXT,
+    salada1 TEXT, salada2 TEXT,
+    feijao1 TEXT, feijao2 TEXT,
+    farofa1 TEXT, farofa2 TEXT,
+    criado_em TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  )`);
+  await migrar('almoco_escolhas', `CREATE TABLE IF NOT EXISTS almoco_escolhas (
+    id SERIAL PRIMARY KEY,
+    cardapio_id INTEGER NOT NULL REFERENCES almoco_cardapio(id) ON DELETE CASCADE,
+    professor_id INTEGER REFERENCES professores(id) ON DELETE CASCADE,
+    nome_avulso TEXT,
+    funcao TEXT,
+    proteina TEXT, arroz TEXT, salada TEXT, feijao TEXT, farofa TEXT,
+    atualizado_em TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (cardapio_id, professor_id)
+  )`);
+  // Bases já existentes: relaxa professor_id e adiciona campos de avulso.
+  await migrar('almoco_escolhas_prof_null', `ALTER TABLE almoco_escolhas ALTER COLUMN professor_id DROP NOT NULL`);
+  await migrar('almoco_escolhas_nome_avulso', `ALTER TABLE almoco_escolhas ADD COLUMN IF NOT EXISTS nome_avulso TEXT`);
+  await migrar('almoco_escolhas_funcao', `ALTER TABLE almoco_escolhas ADD COLUMN IF NOT EXISTS funcao TEXT`);
   // Entrega de livros: registro por matrícula (existir a linha = livro entregue).
   await migrar('entrega_livros', `CREATE TABLE IF NOT EXISTS entrega_livros (
     matricula_id INTEGER PRIMARY KEY REFERENCES matriculas(id) ON DELETE CASCADE,
@@ -1147,6 +1172,51 @@ app.put('/admin/alunos/:id', autenticar, somenteGestao, async (req, res) => {
   }
 });
 
+// Prévia da inativação: o que o aluno tem hoje (para o diálogo mostrar antes de confirmar).
+app.get('/admin/alunos/:id/inativar-previa', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const a = await pool.query(`SELECT nome, status FROM alunos WHERE id = $1`, [id]);
+    if (!a.rows.length) return res.status(404).json({ erro: 'Aluno não encontrado.' });
+    const mat = await pool.query(`SELECT COUNT(*)::int AS n FROM matriculas WHERE aluno_id = $1 AND status IN ('ativa','trancada')`, [id]);
+    const fin = await pool.query(`SELECT COUNT(*)::int AS abertas, COALESCE(SUM(valor_final),0)::numeric AS total FROM contas_receber WHERE aluno_id = $1 AND status IN ('pendente','atrasada')`, [id]);
+    res.json({ nome: a.rows[0].nome, status: a.rows[0].status, matriculasAtivas: mat.rows[0].n, financeiroAberto: fin.rows[0].abertas, valorAberto: Number(fin.rows[0].total) });
+  } catch (e) { console.error('Erro prévia inativar:', e); res.status(500).json({ erro: 'Erro ao consultar a prévia.' }); }
+});
+// Inativar aluno com efeitos opcionais (turma e financeiro), tudo numa transação.
+//   body: { removerDaTurma: bool, financeiro: 'manter' | 'cancelar' | 'excluir' }
+//   Regras: matrícula ativa/trancada -> 'cancelada' (preserva histórico).
+//           financeiro só afeta parcelas EM ABERTO (pendente/atrasada); pagas nunca são tocadas.
+app.post('/admin/alunos/:id/inativar', autenticar, somenteGestao, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const id = Number(req.params.id);
+    const removerDaTurma = (req.body && (req.body.removerDaTurma === true || req.body.removerDaTurma === 'true'));
+    const financeiro = (req.body && ['manter','cancelar','excluir'].includes(req.body.financeiro)) ? req.body.financeiro : 'manter';
+    const a = await client.query(`SELECT nome FROM alunos WHERE id = $1`, [id]);
+    if (!a.rows.length) { client.release(); return res.status(404).json({ erro: 'Aluno não encontrado.' }); }
+    await client.query('BEGIN');
+    await client.query(`UPDATE alunos SET status = 'inativo' WHERE id = $1`, [id]);
+    let matriculasCanceladas = 0, financeiroCancelado = 0, financeiroExcluido = 0;
+    if (removerDaTurma) {
+      const m = await client.query(`UPDATE matriculas SET status = 'cancelada' WHERE aluno_id = $1 AND status IN ('ativa','trancada')`, [id]);
+      matriculasCanceladas = m.rowCount;
+    }
+    if (financeiro === 'cancelar') {
+      const f = await client.query(`UPDATE contas_receber SET status = 'cancelada' WHERE aluno_id = $1 AND status IN ('pendente','atrasada')`, [id]);
+      financeiroCancelado = f.rowCount;
+    } else if (financeiro === 'excluir') {
+      const f = await client.query(`DELETE FROM contas_receber WHERE aluno_id = $1 AND status IN ('pendente','atrasada')`, [id]);
+      financeiroExcluido = f.rowCount;
+    }
+    await client.query('COMMIT');
+    res.json({ ok: true, aluno: a.rows[0].nome, removerDaTurma, financeiro, matriculasCanceladas, financeiroCancelado, financeiroExcluido });
+  } catch (e) {
+    try { await client.query('ROLLBACK'); } catch (_) {}
+    console.error('Erro inativar aluno:', e);
+    res.status(500).json({ erro: 'Erro ao inativar o aluno.' });
+  } finally { client.release(); }
+});
 app.delete('/admin/alunos/:id', autenticar, somenteGestao, async (req, res) => {
   try {
     const m = await pool.query(`SELECT COUNT(*)::int AS n FROM matriculas WHERE aluno_id = $1`, [req.params.id]);
@@ -2929,7 +2999,8 @@ app.get('/admin/english-platform/conclusao', autenticar, exigirPerfil('master'),
           GROUP BY aluno_id, modulo_key, atividade_idx
          HAVING COUNT(DISTINCT estacao) = 5
        )
-       SELECT a.nome, a.codigo, (a.id IN (SELECT aluno_id FROM conclu)) AS concluida
+       SELECT a.nome, a.codigo, (a.id IN (SELECT aluno_id FROM conclu)) AS concluida,
+              (a.id IN (SELECT aluno_id FROM sva_conclusoes)) AS sva
          FROM alunos a
          JOIN matriculas m ON m.aluno_id = a.id AND m.status = 'ativa' AND m.turma_id = $1
         ORDER BY a.nome`, [turmaId]);
@@ -3270,7 +3341,8 @@ app.get('/professor/turmas/:id/english-conclusao', autenticar, somenteProfessor,
           GROUP BY aluno_id, modulo_key, atividade_idx
          HAVING COUNT(DISTINCT estacao) = 5
        )
-       SELECT a.nome, a.codigo, (a.id IN (SELECT aluno_id FROM conclu)) AS concluida
+       SELECT a.nome, a.codigo, (a.id IN (SELECT aluno_id FROM conclu)) AS concluida,
+              (a.id IN (SELECT aluno_id FROM sva_conclusoes)) AS sva
          FROM alunos a
          JOIN matriculas m ON m.aluno_id = a.id AND m.status = 'ativa' AND m.turma_id = $1
         ORDER BY a.nome`, [req.params.id]);
@@ -3571,6 +3643,128 @@ app.get('/publico/portal/vencidas', autenticarResponsavel, async (req, res) => {
   } catch (e) { console.error('Erro portal vencidas:', e); res.status(500).json({ erro: 'Erro ao verificar pendências.' }); }
 });
 
+// ===================== Controle de Almoço =====================
+// Gestão cadastra o cardápio por data; professores escolhem; relatório retorna as escolhas.
+app.get('/admin/almoco/cardapios', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const r = await pool.query(`SELECT c.*, (SELECT COUNT(*)::int FROM almoco_escolhas e WHERE e.cardapio_id = c.id) AS escolhas FROM almoco_cardapio c ORDER BY c.data DESC`);
+    res.json({ itens: r.rows });
+  } catch (e) { console.error('Erro cardapios:', e); res.status(500).json({ erro: 'Erro ao listar cardápios.' }); }
+});
+app.get('/admin/almoco/cardapio/:id', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const r = await pool.query(`SELECT * FROM almoco_cardapio WHERE id = $1`, [req.params.id]);
+    if (!r.rows.length) return res.status(404).json({ erro: 'Cardápio não encontrado.' });
+    res.json(r.rows[0]);
+  } catch (e) { console.error('Erro cardapio:', e); res.status(500).json({ erro: 'Erro ao buscar cardápio.' }); }
+});
+app.post('/admin/almoco/cardapio', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const b = req.body || {};
+    if (!b.data) return res.status(400).json({ erro: 'Informe a data.' });
+    const campos = ['proteina1','proteina2','proteina3','arroz1','arroz2','salada1','salada2','feijao1','feijao2','farofa1','farofa2'];
+    const vals = campos.map(k => (b[k] != null ? String(b[k]).trim() : '') || null);
+    const r = await pool.query(
+      `INSERT INTO almoco_cardapio (data, proteina1,proteina2,proteina3, arroz1,arroz2, salada1,salada2, feijao1,feijao2, farofa1,farofa2)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+       ON CONFLICT (data) DO UPDATE SET
+         proteina1=EXCLUDED.proteina1, proteina2=EXCLUDED.proteina2, proteina3=EXCLUDED.proteina3,
+         arroz1=EXCLUDED.arroz1, arroz2=EXCLUDED.arroz2, salada1=EXCLUDED.salada1, salada2=EXCLUDED.salada2,
+         feijao1=EXCLUDED.feijao1, feijao2=EXCLUDED.feijao2, farofa1=EXCLUDED.farofa1, farofa2=EXCLUDED.farofa2
+       RETURNING *`,
+      [b.data, ...vals]);
+    res.json(r.rows[0]);
+  } catch (e) { console.error('Erro salvar cardapio:', e); res.status(500).json({ erro: 'Erro ao salvar o cardápio.' }); }
+});
+app.delete('/admin/almoco/cardapio/:id', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const r = await pool.query(`DELETE FROM almoco_cardapio WHERE id = $1 RETURNING id`, [req.params.id]);
+    if (!r.rows.length) return res.status(404).json({ erro: 'Cardápio não encontrado.' });
+    res.json({ mensagem: 'Cardápio excluído.' });
+  } catch (e) { console.error('Erro excluir cardapio:', e); res.status(500).json({ erro: 'Erro ao excluir.' }); }
+});
+app.get('/admin/almoco/relatorio/:id', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const c = await pool.query(`SELECT * FROM almoco_cardapio WHERE id = $1`, [req.params.id]);
+    if (!c.rows.length) return res.status(404).json({ erro: 'Cardápio não encontrado.' });
+    const e = await pool.query(
+      `SELECT x.id, COALESCE(p.nome, x.nome_avulso) AS professor, x.funcao, p.codigo, x.proteina, x.arroz, x.salada, x.feijao, x.farofa, x.atualizado_em, (x.professor_id IS NULL) AS avulso
+         FROM almoco_escolhas x LEFT JOIN professores p ON p.id = x.professor_id
+        WHERE x.cardapio_id = $1 ORDER BY COALESCE(p.nome, x.nome_avulso)`, [req.params.id]);
+    const tot = await pool.query(`SELECT proteina, COUNT(*)::int AS n FROM almoco_escolhas WHERE cardapio_id = $1 AND proteina IS NOT NULL GROUP BY proteina ORDER BY n DESC`, [req.params.id]);
+    res.json({ cardapio: c.rows[0], total: e.rows.length, itens: e.rows, totaisProteina: tot.rows });
+  } catch (e) { console.error('Erro relatorio almoco:', e); res.status(500).json({ erro: 'Erro ao montar o relatório.' }); }
+});
+// Gestão: acrescentar escolha de funcionário SEM cadastro (porteiro, vigilante...).
+app.post('/admin/almoco/escolha-avulsa', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const b = req.body || {};
+    const cardapioId = Number(b.cardapio_id);
+    const nome = (b.nome_avulso != null ? String(b.nome_avulso).trim() : '');
+    if (!cardapioId) return res.status(400).json({ erro: 'Cardápio inválido.' });
+    if (!nome) return res.status(400).json({ erro: 'Informe o nome do funcionário.' });
+    const c = await pool.query(`SELECT * FROM almoco_cardapio WHERE id = $1`, [cardapioId]);
+    if (!c.rows.length) return res.status(404).json({ erro: 'Cardápio não encontrado.' });
+    const card = c.rows[0];
+    const norm = (x) => (x != null ? String(x).trim() : '') || null;
+    const proteina = norm(b.proteina), arroz = norm(b.arroz), salada = norm(b.salada), feijao = norm(b.feijao), farofa = norm(b.farofa);
+    const oneOf = (val, opts) => { const o = opts.filter(Boolean); return val == null || o.length === 0 || o.includes(val); };
+    if (!oneOf(proteina, [card.proteina1, card.proteina2, card.proteina3]) || !oneOf(arroz, [card.arroz1, card.arroz2]) || !oneOf(salada, [card.salada1, card.salada2]) || !oneOf(feijao, [card.feijao1, card.feijao2]) || !oneOf(farofa, [card.farofa1, card.farofa2])) {
+      return res.status(400).json({ erro: 'Opção fora do cardápio.' });
+    }
+    const r = await pool.query(
+      `INSERT INTO almoco_escolhas (cardapio_id, professor_id, nome_avulso, funcao, proteina, arroz, salada, feijao, farofa, atualizado_em)
+       VALUES ($1, NULL, $2, $3, $4, $5, $6, $7, $8, NOW()) RETURNING id`,
+      [cardapioId, nome, norm(b.funcao), proteina, arroz, salada, feijao, farofa]);
+    res.json({ ok: true, id: r.rows[0].id });
+  } catch (e) { console.error('Erro avulso almoco:', e); res.status(500).json({ erro: 'Erro ao adicionar funcionário.' }); }
+});
+// Gestão: remover uma escolha (avulsa ou de professor).
+app.delete('/admin/almoco/escolha/:id', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const r = await pool.query(`DELETE FROM almoco_escolhas WHERE id = $1 RETURNING id`, [req.params.id]);
+    if (!r.rows.length) return res.status(404).json({ erro: 'Escolha não encontrada.' });
+    res.json({ mensagem: 'Escolha removida.' });
+  } catch (e) { console.error('Erro remover escolha:', e); res.status(500).json({ erro: 'Erro ao remover.' }); }
+});
+// Professor: ver cardápios (hoje em diante) com a própria escolha, e registrar a escolha.
+app.get('/professor/almoco/cardapios', autenticar, somenteProfessor, async (req, res) => {
+  try {
+    const prof = escopoProfessor(req);
+    const r = await pool.query(
+      `SELECT c.*, x.proteina AS esc_proteina, x.arroz AS esc_arroz, x.salada AS esc_salada, x.feijao AS esc_feijao, x.farofa AS esc_farofa
+         FROM almoco_cardapio c
+         LEFT JOIN almoco_escolhas x ON x.cardapio_id = c.id AND x.professor_id = $1
+        WHERE c.data >= CURRENT_DATE - INTERVAL '1 day'
+        ORDER BY c.data ASC`, [prof]);
+    res.json({ itens: r.rows });
+  } catch (e) { console.error('Erro cardapios prof:', e); res.status(500).json({ erro: 'Erro ao carregar o cardápio.' }); }
+});
+app.post('/professor/almoco/escolha', autenticar, somenteProfessor, async (req, res) => {
+  try {
+    const prof = escopoProfessor(req);
+    if (!prof) return res.status(400).json({ erro: 'Apenas professores registram a escolha do almoço.' });
+    const b = req.body || {};
+    const cardapioId = Number(b.cardapio_id);
+    if (!cardapioId) return res.status(400).json({ erro: 'Cardápio inválido.' });
+    const c = await pool.query(`SELECT * FROM almoco_cardapio WHERE id = $1`, [cardapioId]);
+    if (!c.rows.length) return res.status(404).json({ erro: 'Cardápio não encontrado.' });
+    const card = c.rows[0];
+    const norm = (x) => (x != null ? String(x).trim() : '') || null;
+    const proteina = norm(b.proteina), arroz = norm(b.arroz), salada = norm(b.salada), feijao = norm(b.feijao), farofa = norm(b.farofa);
+    const oneOf = (val, opts) => { const o = opts.filter(Boolean); return val == null || o.length === 0 || o.includes(val); };
+    if (!oneOf(proteina, [card.proteina1, card.proteina2, card.proteina3]) || !oneOf(arroz, [card.arroz1, card.arroz2]) || !oneOf(salada, [card.salada1, card.salada2]) || !oneOf(feijao, [card.feijao1, card.feijao2]) || !oneOf(farofa, [card.farofa1, card.farofa2])) {
+      return res.status(400).json({ erro: 'Opção fora do cardápio.' });
+    }
+    await pool.query(
+      `INSERT INTO almoco_escolhas (cardapio_id, professor_id, proteina, arroz, salada, feijao, farofa, atualizado_em)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,NOW())
+       ON CONFLICT (cardapio_id, professor_id) DO UPDATE SET
+         proteina=EXCLUDED.proteina, arroz=EXCLUDED.arroz, salada=EXCLUDED.salada, feijao=EXCLUDED.feijao, farofa=EXCLUDED.farofa, atualizado_em=NOW()`,
+      [cardapioId, prof, proteina, arroz, salada, feijao, farofa]);
+    res.json({ ok: true });
+  } catch (e) { console.error('Erro escolha almoco:', e); res.status(500).json({ erro: 'Erro ao salvar a escolha.' }); }
+});
 app.get('/professor/turmas', autenticar, somenteProfessor, async (req, res) => {
   try {
     const prof = escopoProfessor(req);
@@ -5873,7 +6067,7 @@ app.get('/health', async (req, res) => {
     res.json({
       status: (erroInicializacao || falhasMigracao.length) ? 'degradado' : 'ok',
       sistema: 'CEMIC Gestão',
-      versao: '3.86 (English Platform: tradutor de diálogo familiar PT->EN)',
+      versao: '3.90 (Almoço: escolha avulsa de funcionários sem cadastro)',
       inicializacao: erroInicializacao || 'ok',
       migracoes_com_falha: falhasMigracao
     });
@@ -5890,7 +6084,7 @@ initDB()
     console.error('Falha ao inicializar o banco:', e);
   })
   .finally(() => app.listen(PORT, () => {
-    console.log(`CEMIC Gestão — backend v3.86 rodando na porta ${PORT}`);
+    console.log(`CEMIC Gestão — backend v3.90 rodando na porta ${PORT}`);
     if (erroInicializacao) console.error('ATENÇÃO: o sistema subiu com falha de inicialização —', erroInicializacao);
     if (falhasMigracao.length) console.error('ATENÇÃO: migrações com falha —', falhasMigracao.join(' | '));
   }));
