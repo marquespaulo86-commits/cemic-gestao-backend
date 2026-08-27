@@ -3728,6 +3728,18 @@ app.delete('/admin/almoco/escolha/:id', autenticar, somenteGestao, async (req, r
   } catch (e) { console.error('Erro remover escolha:', e); res.status(500).json({ erro: 'Erro ao remover.' }); }
 });
 // Professor: ver cardápios (hoje em diante) com a própria escolha, e registrar a escolha.
+// Professor: níveis (módulos) das próprias turmas — para experimentar na English Platform.
+app.get('/professor/english-platform/meus-modulos', autenticar, somenteProfessor, async (req, res) => {
+  try {
+    const prof = escopoProfessor(req);
+    const r = await pool.query(
+      `SELECT DISTINCT COALESCE(t.plataforma_modulo, n.plataforma_modulo) AS modulo_key, n.nome AS nivel
+         FROM turmas t JOIN niveis n ON n.id = t.nivel_id
+        WHERE t.professor_id = $1 AND COALESCE(t.plataforma_modulo, n.plataforma_modulo) IS NOT NULL
+        ORDER BY n.nome`, [prof]);
+    res.json({ itens: r.rows });
+  } catch (e) { console.error('Erro meus-modulos:', e); res.status(500).json({ erro: 'Erro ao carregar seus níveis.' }); }
+});
 app.get('/professor/almoco/cardapios', autenticar, somenteProfessor, async (req, res) => {
   try {
     const prof = escopoProfessor(req);
@@ -6067,7 +6079,7 @@ app.get('/health', async (req, res) => {
     res.json({
       status: (erroInicializacao || falhasMigracao.length) ? 'degradado' : 'ok',
       sistema: 'CEMIC Gestão',
-      versao: '3.90 (Almoço: escolha avulsa de funcionários sem cadastro)',
+      versao: '3.91 (English Platform: pré-visualização do professor pelas turmas dele)',
       inicializacao: erroInicializacao || 'ok',
       migracoes_com_falha: falhasMigracao
     });
@@ -6084,7 +6096,7 @@ initDB()
     console.error('Falha ao inicializar o banco:', e);
   })
   .finally(() => app.listen(PORT, () => {
-    console.log(`CEMIC Gestão — backend v3.90 rodando na porta ${PORT}`);
+    console.log(`CEMIC Gestão — backend v3.91 rodando na porta ${PORT}`);
     if (erroInicializacao) console.error('ATENÇÃO: o sistema subiu com falha de inicialização —', erroInicializacao);
     if (falhasMigracao.length) console.error('ATENÇÃO: migrações com falha —', falhasMigracao.join(' | '));
   }));
