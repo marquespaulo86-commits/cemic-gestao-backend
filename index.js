@@ -670,6 +670,7 @@ async function initDB() {
     salada1 TEXT, salada2 TEXT,
     feijao1 TEXT, feijao2 TEXT,
     farofa1 TEXT, farofa2 TEXT,
+    macarrao1 TEXT, macarrao2 TEXT,
     criado_em TIMESTAMPTZ NOT NULL DEFAULT NOW()
   )`);
   await migrar('almoco_escolhas', `CREATE TABLE IF NOT EXISTS almoco_escolhas (
@@ -678,7 +679,7 @@ async function initDB() {
     professor_id INTEGER REFERENCES professores(id) ON DELETE CASCADE,
     nome_avulso TEXT,
     funcao TEXT,
-    proteina TEXT, arroz TEXT, salada TEXT, feijao TEXT, farofa TEXT,
+    proteina TEXT, arroz TEXT, salada TEXT, feijao TEXT, farofa TEXT, macarrao TEXT,
     atualizado_em TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     UNIQUE (cardapio_id, professor_id)
   )`);
@@ -686,6 +687,9 @@ async function initDB() {
   await migrar('almoco_escolhas_prof_null', `ALTER TABLE almoco_escolhas ALTER COLUMN professor_id DROP NOT NULL`);
   await migrar('almoco_escolhas_nome_avulso', `ALTER TABLE almoco_escolhas ADD COLUMN IF NOT EXISTS nome_avulso TEXT`);
   await migrar('almoco_escolhas_funcao', `ALTER TABLE almoco_escolhas ADD COLUMN IF NOT EXISTS funcao TEXT`);
+  await migrar('almoco_cardapio_macarrao1', `ALTER TABLE almoco_cardapio ADD COLUMN IF NOT EXISTS macarrao1 TEXT`);
+  await migrar('almoco_cardapio_macarrao2', `ALTER TABLE almoco_cardapio ADD COLUMN IF NOT EXISTS macarrao2 TEXT`);
+  await migrar('almoco_escolhas_macarrao', `ALTER TABLE almoco_escolhas ADD COLUMN IF NOT EXISTS macarrao TEXT`);
   // Entrega de livros: registro por matrícula (existir a linha = livro entregue).
   await migrar('entrega_livros', `CREATE TABLE IF NOT EXISTS entrega_livros (
     matricula_id INTEGER PRIMARY KEY REFERENCES matriculas(id) ON DELETE CASCADE,
@@ -947,6 +951,21 @@ function autenticarResponsavel(req, res, next) {
     if (dados.perfil !== 'responsavel') return res.status(403).json({ erro: 'Acesso negado.' });
     req.responsavelId = dados.responsavel_id;
     req.responsavelNome = dados.nome;
+    next();
+  } catch {
+    return res.status(401).json({ erro: 'Sessão inválida ou expirada. Faça login novamente.' });
+  }
+}
+// Aceita responsável (uso normal) OU staff professor/master/secretaria (pré-visualização) para ferramentas de IA.
+function autenticarAssistente(req, res, next) {
+  const header = req.headers.authorization || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7) : null;
+  if (!token) return res.status(401).json({ erro: 'Sessão não encontrada. Faça login.' });
+  try {
+    const dados = jwt.verify(token, JWT_SECRET);
+    if (dados.perfil === 'responsavel') { req.responsavelId = dados.responsavel_id; req.responsavelNome = dados.nome; }
+    else if (['professor','master','secretaria'].includes(dados.perfil)) { req.responsavelId = 'staff-' + (dados.id || dados.referencia_id || 'x'); req.responsavelNome = dados.nome; req.staff = true; }
+    else return res.status(403).json({ erro: 'Acesso negado.' });
     next();
   } catch {
     return res.status(401).json({ erro: 'Sessão inválida ou expirada. Faça login novamente.' });
@@ -1430,16 +1449,43 @@ app.put('/admin/professores/:id', autenticar, somenteGestao, async (req, res) =>
   }
 });
 
-app.delete('/admin/professores/:id', autenticar, somenteGestao, async (req, res) => {
+app.get('/admin/professores/:id/excluir-previa', autenticar, somenteGestao, async (req, res) => {
   try {
-    const t = await pool.query(`SELECT COUNT(*)::int AS n FROM turmas WHERE professor_id = $1`, [req.params.id]);
+    const p = await pool.query(`SELECT nome FROM professores WHERE id = $1`, [req.params.id]);
+    if (!p.rows.length) return res.status(404).json({ erro: 'Professor não encontrado.' });
+    const t = await pool.query(`SELECT id, nome FROM turmas WHERE professor_id = $1 ORDER BY nome`, [req.params.id]);
+    res.json({ nome: p.rows[0].nome, turmas: t.rows.length, listaTurmas: t.rows });
+  } catch (e) { console.error('Erro prévia excluir professor:', e); res.status(500).json({ erro: 'Erro ao consultar a prévia.' }); }
+});
+app.delete('/admin/professores/:id', autenticar, somenteGestao, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const id = Number(req.params.id);
+    const modo = (req.body && req.body.turmas) || '';
+    const novo = req.body && Number(req.body.novo_professor_id);
+    const t = await client.query(`SELECT COUNT(*)::int AS n FROM turmas WHERE professor_id = $1`, [id]);
     if (t.rows[0].n > 0) {
-      return res.status(409).json({ erro: 'Professor vinculado a turmas. Altere o status para "inativo" ou troque o professor das turmas antes de excluir.' });
+      if (modo === 'reatribuir') {
+        if (!novo) { client.release(); return res.status(400).json({ erro: 'Escolha o professor que assumirá as turmas.' }); }
+        const ok = await client.query(`SELECT 1 FROM professores WHERE id = $1`, [novo]);
+        if (!ok.rows.length) { client.release(); return res.status(400).json({ erro: 'Professor de destino inválido.' }); }
+      } else if (modo !== 'limpar') {
+        client.release();
+        return res.status(409).json({ erro: 'Professor vinculado a turmas. Reatribua a outro professor, deixe as turmas sem professor, ou inative em vez de excluir.' });
+      }
     }
-    const r = await pool.query(`DELETE FROM professores WHERE id = $1 RETURNING id`, [req.params.id]);
+    await client.query('BEGIN');
+    if (t.rows[0].n > 0) {
+      if (modo === 'reatribuir') await client.query(`UPDATE turmas SET professor_id = $1 WHERE professor_id = $2`, [novo, id]);
+      else await client.query(`UPDATE turmas SET professor_id = NULL WHERE professor_id = $1`, [id]);
+    }
+    const r = await client.query(`DELETE FROM professores WHERE id = $1 RETURNING id`, [id]);
+    await client.query('COMMIT'); client.release();
     if (!r.rows.length) return res.status(404).json({ erro: 'Professor não encontrado.' });
     res.json({ mensagem: 'Professor excluído.' });
   } catch (e) {
+    try { await client.query('ROLLBACK'); } catch (_) {}
+    client.release();
     console.error('Erro DELETE professor:', e);
     res.status(500).json({ erro: 'Erro ao excluir professor.' });
   }
@@ -1764,15 +1810,30 @@ app.delete('/admin/contas-receber/:id', autenticar, somenteGestao, async (req, r
   } catch (e) { console.error('Erro DELETE contas-receber:', e); res.status(500).json({ erro: 'Erro ao excluir a parcela.' }); }
 });
 
+app.get('/admin/turmas/:id/encerrar-previa', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const t = await pool.query(`SELECT nome FROM turmas WHERE id = $1`, [req.params.id]);
+    if (!t.rows.length) return res.status(404).json({ erro: 'Turma não encontrada.' });
+    const m = await pool.query(`SELECT COUNT(*)::int AS n FROM matriculas WHERE turma_id = $1 AND status = 'ativa'`, [req.params.id]);
+    const f = await pool.query(`SELECT COUNT(*)::int AS abertas, COALESCE(SUM(valor_final),0)::numeric AS total FROM contas_receber WHERE status IN ('pendente','atrasada') AND matricula_id IN (SELECT id FROM matriculas WHERE turma_id = $1)`, [req.params.id]);
+    res.json({ nome: t.rows[0].nome, matriculasAtivas: m.rows[0].n, financeiroAberto: f.rows[0].abertas, valorAberto: Number(f.rows[0].total) });
+  } catch (e) { console.error('Erro prévia encerrar:', e); res.status(500).json({ erro: 'Erro ao consultar a prévia.' }); }
+});
 app.post('/admin/turmas/:id/encerrar', autenticar, somenteGestao, async (req, res) => {
   const client = await pool.connect();
   try {
+    const financeiro = (req.body && req.body.financeiro === 'cancelar') ? 'cancelar' : 'manter';
     await client.query('BEGIN');
     const t = await client.query(`UPDATE turmas SET status='encerrada' WHERE id = $1 RETURNING id, nome`, [req.params.id]);
     if (!t.rows.length) { await client.query('ROLLBACK'); client.release(); return res.status(404).json({ erro: 'Turma não encontrada.' }); }
     const m = await client.query(`UPDATE matriculas SET status='concluida' WHERE turma_id = $1 AND status = 'ativa' RETURNING id`, [req.params.id]);
+    let financeiroCancelado = 0;
+    if (financeiro === 'cancelar') {
+      const f = await client.query(`UPDATE contas_receber SET status='cancelada' WHERE status IN ('pendente','atrasada') AND matricula_id IN (SELECT id FROM matriculas WHERE turma_id = $1)`, [req.params.id]);
+      financeiroCancelado = f.rowCount;
+    }
     await client.query('COMMIT'); client.release();
-    res.json({ mensagem: 'Turma encerrada.', matriculas_concluidas: m.rows.length });
+    res.json({ mensagem: 'Turma encerrada.', matriculas_concluidas: m.rows.length, financeiro_cancelado: financeiroCancelado });
   } catch (e) {
     try { await client.query('ROLLBACK'); } catch {}
     client.release();
@@ -1944,7 +2005,7 @@ app.put('/admin/matriculas/:id', autenticar, somenteGestao, async (req, res) => 
       [novo, req.params.id]);
     if (!r.rows.length) return res.status(404).json({ erro: 'Matrícula não encontrada (ou já concluída).' });
     if (novo === 'cancelada' || novo === 'trancada') {
-      await pool.query(`UPDATE contas_receber SET status = 'cancelada' WHERE matricula_id = $1 AND status = 'pendente'`, [req.params.id]);
+      await pool.query(`UPDATE contas_receber SET status = 'cancelada' WHERE matricula_id = $1 AND status IN ('pendente','atrasada')`, [req.params.id]);
     }
     res.json({ mensagem: 'Matrícula atualizada.', matricula: r.rows[0] });
   } catch (e) { console.error('Erro PUT matricula:', e); res.status(500).json({ erro: 'Erro ao atualizar matrícula.' }); }
@@ -2759,7 +2820,7 @@ function epIaOkDia(respId) {
   reg.n++; return true;
 }
 // Só para responsáveis autenticados e com limite de uso. Configure ANTHROPIC_API_KEY no ambiente (Railway).
-app.post('/publico/portal/assistant', autenticarResponsavel, limiterIA, async (req, res) => {
+app.post('/publico/portal/assistant', autenticarAssistente, limiterIA, async (req, res) => {
   try {
     const key = process.env.ANTHROPIC_API_KEY;
     if (!key) return res.status(503).json({ erro: 'Assistente indisponível: falta configurar a chave da IA no servidor.' });
@@ -3662,15 +3723,16 @@ app.post('/admin/almoco/cardapio', autenticar, somenteGestao, async (req, res) =
   try {
     const b = req.body || {};
     if (!b.data) return res.status(400).json({ erro: 'Informe a data.' });
-    const campos = ['proteina1','proteina2','proteina3','arroz1','arroz2','salada1','salada2','feijao1','feijao2','farofa1','farofa2'];
+    const campos = ['proteina1','proteina2','proteina3','arroz1','arroz2','salada1','salada2','feijao1','feijao2','farofa1','farofa2','macarrao1','macarrao2'];
     const vals = campos.map(k => (b[k] != null ? String(b[k]).trim() : '') || null);
     const r = await pool.query(
-      `INSERT INTO almoco_cardapio (data, proteina1,proteina2,proteina3, arroz1,arroz2, salada1,salada2, feijao1,feijao2, farofa1,farofa2)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+      `INSERT INTO almoco_cardapio (data, proteina1,proteina2,proteina3, arroz1,arroz2, salada1,salada2, feijao1,feijao2, farofa1,farofa2, macarrao1,macarrao2)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
        ON CONFLICT (data) DO UPDATE SET
          proteina1=EXCLUDED.proteina1, proteina2=EXCLUDED.proteina2, proteina3=EXCLUDED.proteina3,
          arroz1=EXCLUDED.arroz1, arroz2=EXCLUDED.arroz2, salada1=EXCLUDED.salada1, salada2=EXCLUDED.salada2,
-         feijao1=EXCLUDED.feijao1, feijao2=EXCLUDED.feijao2, farofa1=EXCLUDED.farofa1, farofa2=EXCLUDED.farofa2
+         feijao1=EXCLUDED.feijao1, feijao2=EXCLUDED.feijao2, farofa1=EXCLUDED.farofa1, farofa2=EXCLUDED.farofa2,
+         macarrao1=EXCLUDED.macarrao1, macarrao2=EXCLUDED.macarrao2
        RETURNING *`,
       [b.data, ...vals]);
     res.json(r.rows[0]);
@@ -3688,7 +3750,7 @@ app.get('/admin/almoco/relatorio/:id', autenticar, somenteGestao, async (req, re
     const c = await pool.query(`SELECT * FROM almoco_cardapio WHERE id = $1`, [req.params.id]);
     if (!c.rows.length) return res.status(404).json({ erro: 'Cardápio não encontrado.' });
     const e = await pool.query(
-      `SELECT x.id, COALESCE(p.nome, x.nome_avulso) AS professor, x.funcao, p.codigo, x.proteina, x.arroz, x.salada, x.feijao, x.farofa, x.atualizado_em, (x.professor_id IS NULL) AS avulso
+      `SELECT x.id, COALESCE(p.nome, x.nome_avulso) AS professor, x.funcao, p.codigo, x.proteina, x.arroz, x.salada, x.feijao, x.farofa, x.macarrao, x.atualizado_em, (x.professor_id IS NULL) AS avulso
          FROM almoco_escolhas x LEFT JOIN professores p ON p.id = x.professor_id
         WHERE x.cardapio_id = $1 ORDER BY COALESCE(p.nome, x.nome_avulso)`, [req.params.id]);
     const tot = await pool.query(`SELECT proteina, COUNT(*)::int AS n FROM almoco_escolhas WHERE cardapio_id = $1 AND proteina IS NOT NULL GROUP BY proteina ORDER BY n DESC`, [req.params.id]);
@@ -3707,15 +3769,15 @@ app.post('/admin/almoco/escolha-avulsa', autenticar, somenteGestao, async (req, 
     if (!c.rows.length) return res.status(404).json({ erro: 'Cardápio não encontrado.' });
     const card = c.rows[0];
     const norm = (x) => (x != null ? String(x).trim() : '') || null;
-    const proteina = norm(b.proteina), arroz = norm(b.arroz), salada = norm(b.salada), feijao = norm(b.feijao), farofa = norm(b.farofa);
+    const proteina = norm(b.proteina), arroz = norm(b.arroz), salada = norm(b.salada), feijao = norm(b.feijao), farofa = norm(b.farofa), macarrao = norm(b.macarrao);
     const oneOf = (val, opts) => { const o = opts.filter(Boolean); return val == null || o.length === 0 || o.includes(val); };
-    if (!oneOf(proteina, [card.proteina1, card.proteina2, card.proteina3]) || !oneOf(arroz, [card.arroz1, card.arroz2]) || !oneOf(salada, [card.salada1, card.salada2]) || !oneOf(feijao, [card.feijao1, card.feijao2]) || !oneOf(farofa, [card.farofa1, card.farofa2])) {
+    if (!oneOf(proteina, [card.proteina1, card.proteina2, card.proteina3]) || !oneOf(arroz, [card.arroz1, card.arroz2]) || !oneOf(salada, [card.salada1, card.salada2]) || !oneOf(feijao, [card.feijao1, card.feijao2]) || !oneOf(farofa, [card.farofa1, card.farofa2]) || !oneOf(macarrao, [card.macarrao1, card.macarrao2])) {
       return res.status(400).json({ erro: 'Opção fora do cardápio.' });
     }
     const r = await pool.query(
-      `INSERT INTO almoco_escolhas (cardapio_id, professor_id, nome_avulso, funcao, proteina, arroz, salada, feijao, farofa, atualizado_em)
-       VALUES ($1, NULL, $2, $3, $4, $5, $6, $7, $8, NOW()) RETURNING id`,
-      [cardapioId, nome, norm(b.funcao), proteina, arroz, salada, feijao, farofa]);
+      `INSERT INTO almoco_escolhas (cardapio_id, professor_id, nome_avulso, funcao, proteina, arroz, salada, feijao, farofa, macarrao, atualizado_em)
+       VALUES ($1, NULL, $2, $3, $4, $5, $6, $7, $8, $9, NOW()) RETURNING id`,
+      [cardapioId, nome, norm(b.funcao), proteina, arroz, salada, feijao, farofa, macarrao]);
     res.json({ ok: true, id: r.rows[0].id });
   } catch (e) { console.error('Erro avulso almoco:', e); res.status(500).json({ erro: 'Erro ao adicionar funcionário.' }); }
 });
@@ -3744,7 +3806,7 @@ app.get('/professor/almoco/cardapios', autenticar, somenteProfessor, async (req,
   try {
     const prof = escopoProfessor(req);
     const r = await pool.query(
-      `SELECT c.*, x.proteina AS esc_proteina, x.arroz AS esc_arroz, x.salada AS esc_salada, x.feijao AS esc_feijao, x.farofa AS esc_farofa
+      `SELECT c.*, x.proteina AS esc_proteina, x.arroz AS esc_arroz, x.salada AS esc_salada, x.feijao AS esc_feijao, x.farofa AS esc_farofa, x.macarrao AS esc_macarrao
          FROM almoco_cardapio c
          LEFT JOIN almoco_escolhas x ON x.cardapio_id = c.id AND x.professor_id = $1
         WHERE c.data >= CURRENT_DATE - INTERVAL '1 day'
@@ -3763,17 +3825,17 @@ app.post('/professor/almoco/escolha', autenticar, somenteProfessor, async (req, 
     if (!c.rows.length) return res.status(404).json({ erro: 'Cardápio não encontrado.' });
     const card = c.rows[0];
     const norm = (x) => (x != null ? String(x).trim() : '') || null;
-    const proteina = norm(b.proteina), arroz = norm(b.arroz), salada = norm(b.salada), feijao = norm(b.feijao), farofa = norm(b.farofa);
+    const proteina = norm(b.proteina), arroz = norm(b.arroz), salada = norm(b.salada), feijao = norm(b.feijao), farofa = norm(b.farofa), macarrao = norm(b.macarrao);
     const oneOf = (val, opts) => { const o = opts.filter(Boolean); return val == null || o.length === 0 || o.includes(val); };
-    if (!oneOf(proteina, [card.proteina1, card.proteina2, card.proteina3]) || !oneOf(arroz, [card.arroz1, card.arroz2]) || !oneOf(salada, [card.salada1, card.salada2]) || !oneOf(feijao, [card.feijao1, card.feijao2]) || !oneOf(farofa, [card.farofa1, card.farofa2])) {
+    if (!oneOf(proteina, [card.proteina1, card.proteina2, card.proteina3]) || !oneOf(arroz, [card.arroz1, card.arroz2]) || !oneOf(salada, [card.salada1, card.salada2]) || !oneOf(feijao, [card.feijao1, card.feijao2]) || !oneOf(farofa, [card.farofa1, card.farofa2]) || !oneOf(macarrao, [card.macarrao1, card.macarrao2])) {
       return res.status(400).json({ erro: 'Opção fora do cardápio.' });
     }
     await pool.query(
-      `INSERT INTO almoco_escolhas (cardapio_id, professor_id, proteina, arroz, salada, feijao, farofa, atualizado_em)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,NOW())
+      `INSERT INTO almoco_escolhas (cardapio_id, professor_id, proteina, arroz, salada, feijao, farofa, macarrao, atualizado_em)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW())
        ON CONFLICT (cardapio_id, professor_id) DO UPDATE SET
-         proteina=EXCLUDED.proteina, arroz=EXCLUDED.arroz, salada=EXCLUDED.salada, feijao=EXCLUDED.feijao, farofa=EXCLUDED.farofa, atualizado_em=NOW()`,
-      [cardapioId, prof, proteina, arroz, salada, feijao, farofa]);
+         proteina=EXCLUDED.proteina, arroz=EXCLUDED.arroz, salada=EXCLUDED.salada, feijao=EXCLUDED.feijao, farofa=EXCLUDED.farofa, macarrao=EXCLUDED.macarrao, atualizado_em=NOW()`,
+      [cardapioId, prof, proteina, arroz, salada, feijao, farofa, macarrao]);
     res.json({ ok: true });
   } catch (e) { console.error('Erro escolha almoco:', e); res.status(500).json({ erro: 'Erro ao salvar a escolha.' }); }
 });
@@ -6079,7 +6141,7 @@ app.get('/health', async (req, res) => {
     res.json({
       status: (erroInicializacao || falhasMigracao.length) ? 'degradado' : 'ok',
       sistema: 'CEMIC Gestão',
-      versao: '3.91 (English Platform: pré-visualização do professor pelas turmas dele)',
+      versao: '3.94 (Prática de Diálogo: IA aceita professor na pré-visualização)',
       inicializacao: erroInicializacao || 'ok',
       migracoes_com_falha: falhasMigracao
     });
@@ -6096,7 +6158,7 @@ initDB()
     console.error('Falha ao inicializar o banco:', e);
   })
   .finally(() => app.listen(PORT, () => {
-    console.log(`CEMIC Gestão — backend v3.91 rodando na porta ${PORT}`);
+    console.log(`CEMIC Gestão — backend v3.94 rodando na porta ${PORT}`);
     if (erroInicializacao) console.error('ATENÇÃO: o sistema subiu com falha de inicialização —', erroInicializacao);
     if (falhasMigracao.length) console.error('ATENÇÃO: migrações com falha —', falhasMigracao.join(' | '));
   }));
