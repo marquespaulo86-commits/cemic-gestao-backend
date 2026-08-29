@@ -690,6 +690,14 @@ async function initDB() {
   await migrar('almoco_cardapio_macarrao1', `ALTER TABLE almoco_cardapio ADD COLUMN IF NOT EXISTS macarrao1 TEXT`);
   await migrar('almoco_cardapio_macarrao2', `ALTER TABLE almoco_cardapio ADD COLUMN IF NOT EXISTS macarrao2 TEXT`);
   await migrar('almoco_escolhas_macarrao', `ALTER TABLE almoco_escolhas ADD COLUMN IF NOT EXISTS macarrao TEXT`);
+  await migrar('english_dialogos', `CREATE TABLE IF NOT EXISTS english_dialogos (
+    id SERIAL PRIMARY KEY,
+    aluno_id INTEGER NOT NULL REFERENCES alunos(id) ON DELETE CASCADE,
+    titulo TEXT NOT NULL,
+    conteudo JSONB NOT NULL DEFAULT '{}'::jsonb,
+    criado_em TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  )`);
+  await migrar('idx_english_dialogos_aluno', `CREATE INDEX IF NOT EXISTS idx_english_dialogos_aluno ON english_dialogos (aluno_id)`);
   // Entrega de livros: registro por matrícula (existir a linha = livro entregue).
   await migrar('entrega_livros', `CREATE TABLE IF NOT EXISTS entrega_livros (
     matricula_id INTEGER PRIMARY KEY REFERENCES matriculas(id) ON DELETE CASCADE,
@@ -2851,6 +2859,57 @@ app.post('/publico/portal/assistant', autenticarAssistente, limiterIA, async (re
   } catch (e) { console.error('Erro assistant:', e); res.status(500).json({ erro: 'Erro no assistente.' }); }
 });
 
+// ---------- English Platform · Prática de Diálogo (diálogos salvos por aluno) ----------
+app.post('/publico/portal/english-platform/dialogos', autenticarResponsavel, async (req, res) => {
+  try {
+    const alunoId = Number(req.body && req.body.aluno_id);
+    const titulo = (String((req.body && req.body.titulo) || '').trim().slice(0, 120)) || 'Diálogo';
+    const linhas = Array.isArray(req.body && req.body.linhas) ? req.body.linhas.slice(0, 60) : [];
+    const trad = Array.isArray(req.body && req.body.trad) ? req.body.trad.slice(0, 60) : [];
+    if (!alunoId || !linhas.length) return res.status(400).json({ erro: 'Diálogo inválido.' });
+    const dono = await pool.query(`SELECT 1 FROM aluno_responsavel WHERE aluno_id = $1 AND responsavel_id = $2`, [alunoId, req.responsavelId]);
+    if (!dono.rows.length) return res.status(403).json({ erro: 'Aluno não vinculado a este responsável.' });
+    const r = await pool.query(
+      `INSERT INTO english_dialogos (aluno_id, titulo, conteudo) VALUES ($1, $2, $3::jsonb) RETURNING id, titulo, criado_em`,
+      [alunoId, titulo, JSON.stringify({ linhas, trad })]);
+    res.json({ ok: true, dialogo: r.rows[0] });
+  } catch (e) { console.error('Erro salvar diálogo:', e); res.status(500).json({ erro: 'Erro ao salvar o diálogo.' }); }
+});
+app.get('/publico/portal/english-platform/dialogos', autenticarResponsavel, async (req, res) => {
+  try {
+    const alunoId = Number(req.query.aluno_id);
+    if (!alunoId) return res.status(400).json({ erro: 'Aluno inválido.' });
+    const dono = await pool.query(`SELECT 1 FROM aluno_responsavel WHERE aluno_id = $1 AND responsavel_id = $2`, [alunoId, req.responsavelId]);
+    if (!dono.rows.length) return res.status(403).json({ erro: 'Aluno não vinculado a este responsável.' });
+    const r = await pool.query(
+      `SELECT id, titulo, criado_em,
+              COALESCE(jsonb_array_length(conteudo->'linhas'), 0) AS falas,
+              ((conteudo ? 'trad') AND COALESCE(jsonb_array_length(conteudo->'trad'), 0) > 0) AS traduzido
+         FROM english_dialogos WHERE aluno_id = $1 ORDER BY criado_em DESC LIMIT 100`, [alunoId]);
+    res.json({ itens: r.rows });
+  } catch (e) { console.error('Erro listar diálogos:', e); res.status(500).json({ erro: 'Erro ao listar os diálogos.' }); }
+});
+app.get('/publico/portal/english-platform/dialogos/:id', autenticarResponsavel, async (req, res) => {
+  try {
+    const r = await pool.query(
+      `SELECT d.id, d.titulo, d.conteudo, d.criado_em
+         FROM english_dialogos d
+         JOIN aluno_responsavel ar ON ar.aluno_id = d.aluno_id AND ar.responsavel_id = $2
+        WHERE d.id = $1`, [Number(req.params.id), req.responsavelId]);
+    if (!r.rows.length) return res.status(404).json({ erro: 'Diálogo não encontrado.' });
+    const row = r.rows[0]; const c = row.conteudo || {};
+    res.json({ id: row.id, titulo: row.titulo, criado_em: row.criado_em, linhas: c.linhas || [], trad: c.trad || [] });
+  } catch (e) { console.error('Erro abrir diálogo:', e); res.status(500).json({ erro: 'Erro ao abrir o diálogo.' }); }
+});
+app.delete('/publico/portal/english-platform/dialogos/:id', autenticarResponsavel, async (req, res) => {
+  try {
+    const r = await pool.query(
+      `DELETE FROM english_dialogos WHERE id = $1 AND aluno_id IN (SELECT aluno_id FROM aluno_responsavel WHERE responsavel_id = $2) RETURNING id`,
+      [Number(req.params.id), req.responsavelId]);
+    if (!r.rows.length) return res.status(404).json({ erro: 'Diálogo não encontrado.' });
+    res.json({ ok: true });
+  } catch (e) { console.error('Erro excluir diálogo:', e); res.status(500).json({ erro: 'Erro ao excluir o diálogo.' }); }
+});
 // ---------- English Platform · painel do master ----------
 app.get('/admin/english-platform/solicitacoes', autenticar, exigirPerfil('master'), async (req, res) => {
   try {
@@ -3791,6 +3850,37 @@ app.delete('/admin/almoco/escolha/:id', autenticar, somenteGestao, async (req, r
 });
 // Professor: ver cardápios (hoje em diante) com a própria escolha, e registrar a escolha.
 // Professor: níveis (módulos) das próprias turmas — para experimentar na English Platform.
+app.get('/professor/english-platform/dialogos', autenticar, somenteProfessor, async (req, res) => {
+  try {
+    const prof = escopoProfessor(req);
+    const r = await pool.query(
+      `SELECT DISTINCT d.id, d.titulo, d.criado_em, a.nome AS aluno,
+              COALESCE(jsonb_array_length(d.conteudo->'linhas'), 0) AS falas,
+              ((d.conteudo ? 'trad') AND COALESCE(jsonb_array_length(d.conteudo->'trad'), 0) > 0) AS traduzido
+         FROM english_dialogos d
+         JOIN alunos a ON a.id = d.aluno_id
+         JOIN matriculas m ON m.aluno_id = d.aluno_id
+         JOIN turmas t ON t.id = m.turma_id
+        WHERE t.professor_id = $1
+        ORDER BY d.criado_em DESC LIMIT 200`, [prof]);
+    res.json({ itens: r.rows });
+  } catch (e) { console.error('Erro listar diálogos (prof):', e); res.status(500).json({ erro: 'Erro ao listar os diálogos.' }); }
+});
+app.get('/professor/english-platform/dialogos/:id', autenticar, somenteProfessor, async (req, res) => {
+  try {
+    const prof = escopoProfessor(req);
+    const r = await pool.query(
+      `SELECT d.id, d.titulo, d.conteudo, d.criado_em, a.nome AS aluno
+         FROM english_dialogos d
+         JOIN alunos a ON a.id = d.aluno_id
+        WHERE d.id = $1
+          AND EXISTS (SELECT 1 FROM matriculas m JOIN turmas t ON t.id = m.turma_id WHERE m.aluno_id = d.aluno_id AND t.professor_id = $2)`,
+      [Number(req.params.id), prof]);
+    if (!r.rows.length) return res.status(404).json({ erro: 'Diálogo não encontrado.' });
+    const row = r.rows[0]; const c = row.conteudo || {};
+    res.json({ id: row.id, titulo: row.titulo, aluno: row.aluno, criado_em: row.criado_em, linhas: c.linhas || [], trad: c.trad || [] });
+  } catch (e) { console.error('Erro abrir diálogo (prof):', e); res.status(500).json({ erro: 'Erro ao abrir o diálogo.' }); }
+});
 app.get('/professor/english-platform/meus-modulos', autenticar, somenteProfessor, async (req, res) => {
   try {
     const prof = escopoProfessor(req);
@@ -6141,7 +6231,7 @@ app.get('/health', async (req, res) => {
     res.json({
       status: (erroInicializacao || falhasMigracao.length) ? 'degradado' : 'ok',
       sistema: 'CEMIC Gestão',
-      versao: '3.94 (Prática de Diálogo: IA aceita professor na pré-visualização)',
+      versao: '3.96 (Prática de Diálogo: professor vê os diálogos das turmas dele)',
       inicializacao: erroInicializacao || 'ok',
       migracoes_com_falha: falhasMigracao
     });
@@ -6158,7 +6248,7 @@ initDB()
     console.error('Falha ao inicializar o banco:', e);
   })
   .finally(() => app.listen(PORT, () => {
-    console.log(`CEMIC Gestão — backend v3.94 rodando na porta ${PORT}`);
+    console.log(`CEMIC Gestão — backend v3.96 rodando na porta ${PORT}`);
     if (erroInicializacao) console.error('ATENÇÃO: o sistema subiu com falha de inicialização —', erroInicializacao);
     if (falhasMigracao.length) console.error('ATENÇÃO: migrações com falha —', falhasMigracao.join(' | '));
   }));
