@@ -698,6 +698,23 @@ async function initDB() {
     criado_em TIMESTAMPTZ NOT NULL DEFAULT NOW()
   )`);
   await migrar('idx_english_dialogos_aluno', `CREATE INDEX IF NOT EXISTS idx_english_dialogos_aluno ON english_dialogos (aluno_id)`);
+  await migrar('pix_comprovantes', `CREATE TABLE IF NOT EXISTS pix_comprovantes (
+    id SERIAL PRIMARY KEY,
+    conta_id INTEGER REFERENCES contas_receber(id) ON DELETE SET NULL,
+    aluno_id INTEGER REFERENCES alunos(id) ON DELETE SET NULL,
+    responsavel_id INTEGER REFERENCES responsaveis(id) ON DELETE SET NULL,
+    descricao TEXT,
+    valor NUMERIC(10,2),
+    arquivo_base64 TEXT NOT NULL,
+    mime TEXT,
+    nome_arquivo TEXT,
+    status TEXT NOT NULL DEFAULT 'pendente' CHECK (status IN ('pendente','baixado','recusado')),
+    observacao TEXT,
+    criado_em TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    resolvido_em TIMESTAMPTZ,
+    resolvido_por INTEGER REFERENCES usuarios(id)
+  )`);
+  await migrar('idx_pix_comprovantes_status', `CREATE INDEX IF NOT EXISTS idx_pix_comprovantes_status ON pix_comprovantes (status, criado_em DESC)`);
   // Entrega de livros: registro por matrícula (existir a linha = livro entregue).
   await migrar('entrega_livros', `CREATE TABLE IF NOT EXISTS entrega_livros (
     matricula_id INTEGER PRIMARY KEY REFERENCES matriculas(id) ON DELETE CASCADE,
@@ -794,6 +811,7 @@ async function seedConfiguracoes() {
     ['descontos_disponiveis', JSON.stringify([25, 50, 100]), 'Percentuais de desconto disponíveis para Pagante Parcial (bolsista = 100)'],
     ['mensalidades', JSON.stringify({ 'Inglês': 0, 'Espanhol': 0 }), 'Valor da mensalidade integral por curso (R$) — definir antes das matrículas'],
     ['formas_pagamento', JSON.stringify(['PIX', 'DINHEIRO', 'CARTÃO DE CRÉDITO', 'CARTÃO DE DÉBITO', 'TRANSFERÊNCIA', 'MISTO']), 'Formas de pagamento aceitas'],
+    ['pix_chave_aleatoria', JSON.stringify(''), 'Chave PIX aleatória exibida ao responsável para pagamento manual da mensalidade'],
     ['categorias_contas_pagar', JSON.stringify(['Aluguel', 'Energia', 'Água/Internet', 'Salários', 'Material Didático', 'Manutenção', 'Outros']), 'Categorias de contas a pagar'],
     ['categorias_contas_receber', JSON.stringify(['Mensalidade', 'Matrícula', 'Material', 'Evento', 'Outros']), 'Categorias de contas a receber'],
     ['dados_instituicao', JSON.stringify({
@@ -4593,6 +4611,79 @@ app.get('/publico/portal/aluno/:id/financeiro', autenticarResponsavel, async (re
     res.json({ semestre, semestres, itens: r.rows, resumo: resumoFinanceiro(r.rows) });
   } catch (e) { console.error('Erro portal financeiro:', e); res.status(500).json({ erro: 'Erro ao carregar o financeiro.' }); }
 });
+// ---------- PIX manual: chave aleatória + comprovante ----------
+app.get('/publico/portal/pix-chave', autenticarResponsavel, async (req, res) => {
+  try { const chave = await getConfig('pix_chave_aleatoria', ''); res.json({ chave: chave || '' }); }
+  catch (e) { console.error('Erro pix-chave:', e); res.status(500).json({ erro: 'Erro ao obter a chave PIX.' }); }
+});
+app.post('/publico/portal/aluno/:id/pix-comprovante', autenticarResponsavel, async (req, res) => {
+  try {
+    const alunoId = Number(req.params.id);
+    const vinc = await pool.query(`SELECT 1 FROM aluno_responsavel WHERE responsavel_id = $1 AND aluno_id = $2`, [req.responsavelId, alunoId]);
+    if (!vinc.rows.length) return res.status(403).json({ erro: 'Acesso negado a este aluno.' });
+    const b = req.body || {};
+    let arq = String(b.arquivo_base64 || '');
+    if (arq.slice(0, 5) === 'data:' && arq.indexOf(',') >= 0) arq = arq.slice(arq.indexOf(',') + 1);
+    if (!arq) return res.status(400).json({ erro: 'Anexe o comprovante.' });
+    if (arq.length > 11000000) return res.status(413).json({ erro: 'Arquivo muito grande (máx. aprox. 8 MB).' });
+    const contaId = b.conta_id ? Number(b.conta_id) : null;
+    const r = await pool.query(
+      `INSERT INTO pix_comprovantes (conta_id, aluno_id, responsavel_id, descricao, valor, arquivo_base64, mime, nome_arquivo, status)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'pendente') RETURNING id`,
+      [contaId, alunoId, req.responsavelId, String(b.descricao || '').slice(0, 200), (b.valor != null ? Number(b.valor) : null), arq, String(b.mime || '').slice(0, 100), String(b.nome_arquivo || '').slice(0, 200)]);
+    res.json({ ok: true, id: r.rows[0].id });
+  } catch (e) { console.error('Erro pix-comprovante:', e); res.status(500).json({ erro: 'Erro ao enviar o comprovante.' }); }
+});
+app.get('/admin/pix-comprovantes', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const status = (req.query.status || 'pendente');
+    const r = await pool.query(
+      `SELECT c.id, c.conta_id, c.descricao, c.valor, c.status, c.criado_em, c.mime, c.nome_arquivo, c.observacao,
+              a.nome AS aluno, a.codigo AS aluno_codigo, resp.nome AS responsavel,
+              cr.descricao AS conta_descricao, cr.vencimento AS conta_vencimento, cr.valor_final AS conta_valor, cr.status AS conta_status
+         FROM pix_comprovantes c
+         LEFT JOIN alunos a ON a.id = c.aluno_id
+         LEFT JOIN responsaveis resp ON resp.id = c.responsavel_id
+         LEFT JOIN contas_receber cr ON cr.id = c.conta_id
+        WHERE ($1 = 'todos' OR c.status = $1)
+        ORDER BY c.criado_em DESC LIMIT 300`, [status]);
+    res.json({ itens: r.rows });
+  } catch (e) { console.error('Erro listar comprovantes:', e); res.status(500).json({ erro: 'Erro ao listar os comprovantes.' }); }
+});
+app.get('/admin/pix-comprovantes/:id/arquivo', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const r = await pool.query(`SELECT arquivo_base64, mime, nome_arquivo FROM pix_comprovantes WHERE id = $1`, [Number(req.params.id)]);
+    if (!r.rows.length) return res.status(404).json({ erro: 'Comprovante não encontrado.' });
+    res.json({ base64: r.rows[0].arquivo_base64, mime: r.rows[0].mime || 'application/octet-stream', nome: r.rows[0].nome_arquivo || 'comprovante' });
+  } catch (e) { console.error('Erro arquivo comprovante:', e); res.status(500).json({ erro: 'Erro ao obter o arquivo.' }); }
+});
+app.post('/admin/pix-comprovantes/:id/baixar', autenticar, somenteGestao, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const id = Number(req.params.id);
+    await client.query('BEGIN');
+    const c = await client.query(`SELECT conta_id FROM pix_comprovantes WHERE id = $1 FOR UPDATE`, [id]);
+    if (!c.rows.length) { await client.query('ROLLBACK'); client.release(); return res.status(404).json({ erro: 'Comprovante não encontrado.' }); }
+    let contaPaga = null;
+    if (c.rows[0].conta_id) {
+      const up = await client.query(
+        `UPDATE contas_receber SET status='paga', data_pagamento=CURRENT_DATE, forma_pagamento='PIX', recebido_por=$2 WHERE id=$1 AND status <> 'paga' RETURNING id`,
+        [c.rows[0].conta_id, req.usuario.id]);
+      contaPaga = up.rows.length ? c.rows[0].conta_id : null;
+    }
+    await client.query(`UPDATE pix_comprovantes SET status='baixado', resolvido_em=NOW(), resolvido_por=$2 WHERE id=$1`, [id, req.usuario.id]);
+    await client.query('COMMIT'); client.release();
+    res.json({ ok: true, conta_paga: contaPaga });
+  } catch (e) { try { await client.query('ROLLBACK'); } catch (_) {} client.release(); console.error('Erro baixar comprovante:', e); res.status(500).json({ erro: 'Erro ao dar baixa.' }); }
+});
+app.post('/admin/pix-comprovantes/:id/recusar', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const r = await pool.query(`UPDATE pix_comprovantes SET status='recusado', observacao=$2, resolvido_em=NOW(), resolvido_por=$3 WHERE id=$1 RETURNING id`,
+      [Number(req.params.id), String((req.body && req.body.observacao) || '').slice(0, 300), req.usuario.id]);
+    if (!r.rows.length) return res.status(404).json({ erro: 'Comprovante não encontrado.' });
+    res.json({ ok: true });
+  } catch (e) { console.error('Erro recusar comprovante:', e); res.status(500).json({ erro: 'Erro ao recusar.' }); }
+});
 
 app.post('/publico/portal/aluno/:id/relatorio-financeiro', autenticarResponsavel, async (req, res) => {
   try {
@@ -6231,7 +6322,7 @@ app.get('/health', async (req, res) => {
     res.json({
       status: (erroInicializacao || falhasMigracao.length) ? 'degradado' : 'ok',
       sistema: 'CEMIC Gestão',
-      versao: '3.96 (Prática de Diálogo: professor vê os diálogos das turmas dele)',
+      versao: '3.97 (Contas a Receber: pagamento por comprovante PIX com baixa manual)',
       inicializacao: erroInicializacao || 'ok',
       migracoes_com_falha: falhasMigracao
     });
@@ -6248,7 +6339,7 @@ initDB()
     console.error('Falha ao inicializar o banco:', e);
   })
   .finally(() => app.listen(PORT, () => {
-    console.log(`CEMIC Gestão — backend v3.96 rodando na porta ${PORT}`);
+    console.log(`CEMIC Gestão — backend v3.97 rodando na porta ${PORT}`);
     if (erroInicializacao) console.error('ATENÇÃO: o sistema subiu com falha de inicialização —', erroInicializacao);
     if (falhasMigracao.length) console.error('ATENÇÃO: migrações com falha —', falhasMigracao.join(' | '));
   }));
