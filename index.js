@@ -812,6 +812,7 @@ async function seedConfiguracoes() {
     ['mensalidades', JSON.stringify({ 'Inglês': 0, 'Espanhol': 0 }), 'Valor da mensalidade integral por curso (R$) — definir antes das matrículas'],
     ['formas_pagamento', JSON.stringify(['PIX', 'DINHEIRO', 'CARTÃO DE CRÉDITO', 'CARTÃO DE DÉBITO', 'TRANSFERÊNCIA', 'MISTO']), 'Formas de pagamento aceitas'],
     ['pix_chave_aleatoria', JSON.stringify(''), 'Chave PIX aleatória exibida ao responsável para pagamento manual da mensalidade'],
+    ['pix_qr_imagem', JSON.stringify(''), 'Imagem (data URL) do QR Code fixo do PIX exibido ao responsável'],
     ['categorias_contas_pagar', JSON.stringify(['Aluguel', 'Energia', 'Água/Internet', 'Salários', 'Material Didático', 'Manutenção', 'Outros']), 'Categorias de contas a pagar'],
     ['categorias_contas_receber', JSON.stringify(['Mensalidade', 'Matrícula', 'Material', 'Evento', 'Outros']), 'Categorias de contas a receber'],
     ['dados_instituicao', JSON.stringify({
@@ -4619,7 +4620,7 @@ app.get('/publico/portal/aluno/:id/financeiro', autenticarResponsavel, async (re
 });
 // ---------- PIX manual: chave aleatória + comprovante ----------
 app.get('/publico/portal/pix-chave', autenticarResponsavel, async (req, res) => {
-  try { const chave = await getConfig('pix_chave_aleatoria', ''); res.json({ chave: chave || '' }); }
+  try { const chave = await getConfig('pix_chave_aleatoria', ''); const qr = await getConfig('pix_qr_imagem', ''); res.json({ chave: chave || '', qr: qr || '' }); }
   catch (e) { console.error('Erro pix-chave:', e); res.status(500).json({ erro: 'Erro ao obter a chave PIX.' }); }
 });
 app.post('/publico/portal/aluno/:id/pix-comprovante', autenticarResponsavel, async (req, res) => {
@@ -6328,7 +6329,7 @@ app.get('/health', async (req, res) => {
     res.json({
       status: (erroInicializacao || falhasMigracao.length) ? 'degradado' : 'ok',
       sistema: 'CEMIC Gestão',
-      versao: '3.99 (Portal: aviso de vencidas identifica o aluno e abre o Financeiro certo)',
+      versao: '4.0 (PIX: QR fixo do CEMIC em configurações)',
       inicializacao: erroInicializacao || 'ok',
       migracoes_com_falha: falhasMigracao
     });
@@ -6345,7 +6346,7 @@ initDB()
     console.error('Falha ao inicializar o banco:', e);
   })
   .finally(() => app.listen(PORT, () => {
-    console.log(`CEMIC Gestão — backend v3.99 rodando na porta ${PORT}`);
+    console.log(`CEMIC Gestão — backend v4.0 rodando na porta ${PORT}`);
     if (erroInicializacao) console.error('ATENÇÃO: o sistema subiu com falha de inicialização —', erroInicializacao);
     if (falhasMigracao.length) console.error('ATENÇÃO: migrações com falha —', falhasMigracao.join(' | '));
   }));
