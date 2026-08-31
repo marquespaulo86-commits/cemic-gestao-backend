@@ -837,7 +837,7 @@ async function seedConfiguracoes() {
         ]
       }
     }), 'Composição da nota por bimestre (etapas e pesos) — base para as avaliações das turmas'],
-    ['calendario_observacao', JSON.stringify('O presente calendário está sujeito a modificações, considerando o Calendário Escolar Regular do IEMA Pleno Dr.º João Bacelar Portela.'), 'Observação exibida ao pé do calendário acadêmico']
+    ['calendario_observacao', JSON.stringify('O presente calendário está sujeito a modificações, considerando o Calendário Escolar Regular do IEMA Pleno Dr.º João Bacelar Portela.'), 'Observação exibida ao pé do calendário acadêmico'],
     ['valor_hora_aula', JSON.stringify(0), 'Valor padrão da hora-aula do professor (R$)']
   ];
   for (const [chave, valor, descricao] of padroes) {
@@ -6329,7 +6329,7 @@ app.get('/health', async (req, res) => {
     res.json({
       status: (erroInicializacao || falhasMigracao.length) ? 'degradado' : 'ok',
       sistema: 'CEMIC Gestão',
-      versao: '4.0 (PIX: QR fixo do CEMIC em configurações)',
+      versao: '4.1 (Correção: vírgula faltante quebrava a semeadura de configurações)',
       inicializacao: erroInicializacao || 'ok',
       migracoes_com_falha: falhasMigracao
     });
@@ -6346,7 +6346,7 @@ initDB()
     console.error('Falha ao inicializar o banco:', e);
   })
   .finally(() => app.listen(PORT, () => {
-    console.log(`CEMIC Gestão — backend v4.0 rodando na porta ${PORT}`);
+    console.log(`CEMIC Gestão — backend v4.1 rodando na porta ${PORT}`);
     if (erroInicializacao) console.error('ATENÇÃO: o sistema subiu com falha de inicialização —', erroInicializacao);
     if (falhasMigracao.length) console.error('ATENÇÃO: migrações com falha —', falhasMigracao.join(' | '));
   }));
