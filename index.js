@@ -3772,12 +3772,18 @@ app.post('/admin/english-platform/reconciliar-taxas', autenticar, exigirPerfil('
 app.get('/publico/portal/vencidas', autenticarResponsavel, async (req, res) => {
   try {
     const r = await pool.query(
-      `SELECT COUNT(*)::int AS qtd, COALESCE(SUM(cr.valor_final), 0) AS total
+      `SELECT cr.aluno_id, a.nome, COUNT(*)::int AS qtd, COALESCE(SUM(cr.valor_final), 0) AS total
          FROM contas_receber cr
+         JOIN alunos a ON a.id = cr.aluno_id
         WHERE (cr.status = 'atrasada' OR (cr.status = 'pendente' AND cr.vencimento < CURRENT_DATE))
-          AND cr.aluno_id IN (SELECT ar.aluno_id FROM aluno_responsavel ar WHERE ar.responsavel_id = $1)`,
+          AND cr.aluno_id IN (SELECT ar.aluno_id FROM aluno_responsavel ar WHERE ar.responsavel_id = $1)
+        GROUP BY cr.aluno_id, a.nome
+        ORDER BY total DESC`,
       [req.responsavelId]);
-    res.json({ qtd: r.rows[0].qtd, total: Number(r.rows[0].total) });
+    const alunosV = r.rows.map(x => ({ aluno_id: x.aluno_id, nome: x.nome, qtd: x.qtd, total: Number(x.total) }));
+    const qtd = alunosV.reduce((s, x) => s + x.qtd, 0);
+    const total = alunosV.reduce((s, x) => s + x.total, 0);
+    res.json({ qtd, total, alunos: alunosV });
   } catch (e) { console.error('Erro portal vencidas:', e); res.status(500).json({ erro: 'Erro ao verificar pendências.' }); }
 });
 
@@ -4571,12 +4577,13 @@ const SQL_FIN_ITENS = `
          CASE
            WHEN cr.descricao ILIKE 'Taxa de Matrícula%' THEN 'matricula'
            WHEN cr.descricao ILIKE 'Taxa da Plataforma%' THEN 'plataforma'
+           WHEN cr.matricula_id IS NULL THEN 'avulso'
            ELSE 'mensalidade'
          END AS tipo
   FROM contas_receber cr
-  JOIN matriculas m ON m.id = cr.matricula_id
-  JOIN turmas t ON t.id = m.turma_id
-  WHERE cr.aluno_id = $1 AND t.semestre = $2 AND cr.status <> 'cancelada'
+  LEFT JOIN matriculas m ON m.id = cr.matricula_id
+  LEFT JOIN turmas t ON t.id = m.turma_id
+  WHERE cr.aluno_id = $1 AND cr.status <> 'cancelada' AND (t.semestre = $2 OR cr.matricula_id IS NULL)
   ORDER BY cr.vencimento, cr.id`;
 
 function resumoFinanceiro(itens) {
@@ -4606,7 +4613,6 @@ app.get('/publico/portal/aluno/:id/financeiro', autenticarResponsavel, async (re
       const vig = await getConfig('semestre_vigente', null);
       semestre = (vig && semestres.includes(vig)) ? vig : (semestres[0] || null);
     }
-    if (!semestre) return res.json({ semestre: null, semestres: [], itens: [], resumo: resumoFinanceiro([]) });
     const r = await pool.query(SQL_FIN_ITENS, [alunoId, semestre]);
     res.json({ semestre, semestres, itens: r.rows, resumo: resumoFinanceiro(r.rows) });
   } catch (e) { console.error('Erro portal financeiro:', e); res.status(500).json({ erro: 'Erro ao carregar o financeiro.' }); }
@@ -6322,7 +6328,7 @@ app.get('/health', async (req, res) => {
     res.json({
       status: (erroInicializacao || falhasMigracao.length) ? 'degradado' : 'ok',
       sistema: 'CEMIC Gestão',
-      versao: '3.97 (Contas a Receber: pagamento por comprovante PIX com baixa manual)',
+      versao: '3.99 (Portal: aviso de vencidas identifica o aluno e abre o Financeiro certo)',
       inicializacao: erroInicializacao || 'ok',
       migracoes_com_falha: falhasMigracao
     });
@@ -6339,7 +6345,7 @@ initDB()
     console.error('Falha ao inicializar o banco:', e);
   })
   .finally(() => app.listen(PORT, () => {
-    console.log(`CEMIC Gestão — backend v3.97 rodando na porta ${PORT}`);
+    console.log(`CEMIC Gestão — backend v3.99 rodando na porta ${PORT}`);
     if (erroInicializacao) console.error('ATENÇÃO: o sistema subiu com falha de inicialização —', erroInicializacao);
     if (falhasMigracao.length) console.error('ATENÇÃO: migrações com falha —', falhasMigracao.join(' | '));
   }));
