@@ -813,6 +813,8 @@ async function seedConfiguracoes() {
     ['formas_pagamento', JSON.stringify(['PIX', 'DINHEIRO', 'CARTÃO DE CRÉDITO', 'CARTÃO DE DÉBITO', 'TRANSFERÊNCIA', 'MISTO']), 'Formas de pagamento aceitas'],
     ['pix_chave_aleatoria', JSON.stringify(''), 'Chave PIX aleatória exibida ao responsável para pagamento manual da mensalidade'],
     ['pix_qr_imagem', JSON.stringify(''), 'Imagem (data URL) do QR Code fixo do PIX exibido ao responsável'],
+    ['pix_chave_vencida', JSON.stringify(''), 'Chave PIX exibida ao responsável quando a parcela está vencida (após o vencimento)'],
+    ['pix_qr_vencida', JSON.stringify(''), 'Imagem (data URL) do QR Code exibido quando a parcela está vencida'],
     ['categorias_contas_pagar', JSON.stringify(['Aluguel', 'Energia', 'Água/Internet', 'Salários', 'Material Didático', 'Manutenção', 'Outros']), 'Categorias de contas a pagar'],
     ['categorias_contas_receber', JSON.stringify(['Mensalidade', 'Matrícula', 'Material', 'Evento', 'Outros']), 'Categorias de contas a receber'],
     ['dados_instituicao', JSON.stringify({
@@ -2865,14 +2867,14 @@ app.post('/publico/portal/assistant', autenticarAssistente, limiterIA, async (re
       method: 'POST',
       headers: { 'content-type': 'application/json', 'x-api-key': key, 'anthropic-version': '2023-06-01' },
       body: JSON.stringify({
-        model: process.env.EP_AI_MODEL || 'claude-sonnet-4-5',
+        model: process.env.EP_AI_MODEL || 'claude-sonnet-5',
         max_tokens: 1000,
         ...(system ? { system } : {}),
         messages: [{ role: 'user', content: user }]
       })
     });
     const data = await r.json();
-    if (!r.ok) { console.error('Erro IA upstream:', data && data.error); return res.status(502).json({ erro: 'A IA não respondeu agora. Tente novamente.' }); }
+    if (!r.ok) { console.error('Erro IA upstream:', data && data.error); const _t = (data && data.error && data.error.type) ? (' (' + data.error.type + ')') : (' (' + r.status + ')'); return res.status(502).json({ erro: 'A IA não respondeu agora' + _t + '. Tente novamente.' }); }
     const text = (data.content || []).filter(b => b.type === 'text').map(b => b.text).join('\n').trim();
     res.json({ text });
   } catch (e) { console.error('Erro assistant:', e); res.status(500).json({ erro: 'Erro no assistente.' }); }
@@ -4620,7 +4622,11 @@ app.get('/publico/portal/aluno/:id/financeiro', autenticarResponsavel, async (re
 });
 // ---------- PIX manual: chave aleatória + comprovante ----------
 app.get('/publico/portal/pix-chave', autenticarResponsavel, async (req, res) => {
-  try { const chave = await getConfig('pix_chave_aleatoria', ''); const qr = await getConfig('pix_qr_imagem', ''); res.json({ chave: chave || '', qr: qr || '' }); }
+  try {
+    const chave = await getConfig('pix_chave_aleatoria', ''); const qr = await getConfig('pix_qr_imagem', '');
+    const chaveV = await getConfig('pix_chave_vencida', ''); const qrV = await getConfig('pix_qr_vencida', '');
+    res.json({ chave: chave || '', qr: qr || '', chave_vencida: chaveV || '', qr_vencida: qrV || '' });
+  }
   catch (e) { console.error('Erro pix-chave:', e); res.status(500).json({ erro: 'Erro ao obter a chave PIX.' }); }
 });
 app.post('/publico/portal/aluno/:id/pix-comprovante', autenticarResponsavel, async (req, res) => {
@@ -6329,7 +6335,7 @@ app.get('/health', async (req, res) => {
     res.json({
       status: (erroInicializacao || falhasMigracao.length) ? 'degradado' : 'ok',
       sistema: 'CEMIC Gestão',
-      versao: '4.1 (Correção: vírgula faltante quebrava a semeadura de configurações)',
+      versao: '4.2 (PIX: segundo QR/chave para parcelas vencidas)',
       inicializacao: erroInicializacao || 'ok',
       migracoes_com_falha: falhasMigracao
     });
@@ -6346,7 +6352,7 @@ initDB()
     console.error('Falha ao inicializar o banco:', e);
   })
   .finally(() => app.listen(PORT, () => {
-    console.log(`CEMIC Gestão — backend v4.1 rodando na porta ${PORT}`);
+    console.log(`CEMIC Gestão — backend v4.2 rodando na porta ${PORT}`);
     if (erroInicializacao) console.error('ATENÇÃO: o sistema subiu com falha de inicialização —', erroInicializacao);
     if (falhasMigracao.length) console.error('ATENÇÃO: migrações com falha —', falhasMigracao.join(' | '));
   }));
