@@ -382,6 +382,8 @@ async function initDB() {
     emitida_em TIMESTAMP DEFAULT NOW(),
     emitida_por INTEGER REFERENCES usuarios(id) ON DELETE SET NULL
   )`);
+  await pool.query(`ALTER TABLE rematriculas_online ADD COLUMN IF NOT EXISTS conta_id INTEGER REFERENCES contas_receber(id) ON DELETE SET NULL`);
+  await pool.query(`ALTER TABLE rematriculas_online ADD COLUMN IF NOT EXISTS referente TEXT`);
   // Folha de professores (hora-aula)
   await pool.query(`CREATE TABLE IF NOT EXISTS professor_horas (
     id SERIAL PRIMARY KEY,
@@ -2867,14 +2869,14 @@ app.post('/publico/portal/assistant', autenticarAssistente, limiterIA, async (re
       method: 'POST',
       headers: { 'content-type': 'application/json', 'x-api-key': key, 'anthropic-version': '2023-06-01' },
       body: JSON.stringify({
-        model: process.env.EP_AI_MODEL || 'claude-sonnet-5',
+        model: process.env.EP_AI_MODEL || 'claude-sonnet-4-5',
         max_tokens: 1000,
         ...(system ? { system } : {}),
         messages: [{ role: 'user', content: user }]
       })
     });
     const data = await r.json();
-    if (!r.ok) { console.error('Erro IA upstream:', data && data.error); const _t = (data && data.error && data.error.type) ? (' (' + data.error.type + ')') : (' (' + r.status + ')'); return res.status(502).json({ erro: 'A IA não respondeu agora' + _t + '. Tente novamente.' }); }
+    if (!r.ok) { console.error('Erro IA upstream:', data && data.error); return res.status(502).json({ erro: 'A IA não respondeu agora. Tente novamente.' }); }
     const text = (data.content || []).filter(b => b.type === 'text').map(b => b.text).join('\n').trim();
     res.json({ text });
   } catch (e) { console.error('Erro assistant:', e); res.status(500).json({ erro: 'Erro no assistente.' }); }
@@ -4450,6 +4452,57 @@ app.post('/admin/rematricula-online/emitir', autenticar, somenteGestao, async (r
   } catch (e) { console.error('Erro emitir documento de rematrícula online:', e); res.status(500).json({ erro: 'Erro ao emitir o documento.' }); }
 });
 
+app.post('/admin/recibo-conta/emitir', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const contaId = Number(req.body.conta_id);
+    if (!contaId) return res.status(400).json({ erro: 'Lançamento não informado.' });
+    const cr = await pool.query(
+      `SELECT ct.id, ct.descricao, ct.competencia, ct.valor_final, ct.desconto_pontualidade, ct.juros,
+              ct.valor_recebido, ct.forma_pagamento, ct.data_pagamento, ct.status,
+              a.id AS aluno_id, a.nome AS aluno_nome, a.cpf AS aluno_cpf,
+              t.nome AS turma_nome, t.turno AS turno, c.nome AS curso_nome, n.nome AS nivel_nome
+       FROM contas_receber ct
+       JOIN alunos a ON a.id = ct.aluno_id
+       LEFT JOIN matriculas m ON m.id = ct.matricula_id
+       LEFT JOIN turmas t ON t.id = m.turma_id
+       LEFT JOIN niveis n ON n.id = t.nivel_id
+       LEFT JOIN cursos c ON c.id = n.curso_id
+       WHERE ct.id = $1`, [contaId]);
+    if (!cr.rows.length) return res.status(404).json({ erro: 'Lançamento não encontrado.' });
+    const ct = cr.rows[0];
+    if (ct.status !== 'paga') return res.status(400).json({ erro: 'O recibo só pode ser emitido para um lançamento já pago.' });
+    const desconto = Number(ct.desconto_pontualidade || 0);
+    const juros = Number(ct.juros || 0);
+    const valorBase = Number(ct.valor_final || 0);
+    const valor = ct.valor_recebido != null ? Number(ct.valor_recebido) : +(valorBase - desconto + juros).toFixed(2);
+    const referente = String(ct.descricao || '') + (ct.competencia ? (' · ' + ct.competencia) : '');
+    const rr = await pool.query(
+      `SELECT r.id, r.nome FROM aluno_responsavel ar JOIN responsaveis r ON r.id = ar.responsavel_id
+       WHERE ar.aluno_id = $1 ORDER BY ar.responsavel_financeiro DESC NULLS LAST, ar.id ASC LIMIT 1`, [ct.aluno_id]);
+    const resp = rr.rows[0] || null;
+    let codigo, ok = false;
+    for (let i = 0; i < 6 && !ok; i++) {
+      codigo = 'CEMIC-' + crypto.randomBytes(2).toString('hex').toUpperCase() + '-' + crypto.randomBytes(2).toString('hex').toUpperCase();
+      const ex = await pool.query(`SELECT 1 FROM rematriculas_online WHERE codigo = $1 UNION ALL SELECT 1 FROM declaracoes WHERE codigo = $1`, [codigo]);
+      if (!ex.rows.length) ok = true;
+    }
+    const ins = await pool.query(
+      `INSERT INTO rematriculas_online
+         (codigo, tipo, conta_id, referente, aluno_id, aluno_nome, aluno_cpf, responsavel_id, responsavel_nome,
+          curso, nivel, turma, turno, semestre, valor, forma, emitida_por)
+       VALUES ($1,'recibo_conta',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+       RETURNING codigo, emitida_em`,
+      [codigo, contaId, referente, ct.aluno_id, ct.aluno_nome, ct.aluno_cpf, resp ? resp.id : null, resp ? resp.nome : null,
+       ct.curso_nome, ct.nivel_nome, ct.turma_nome, ct.turno, ct.competencia, valor, ct.forma_pagamento, req.usuario.id]);
+    res.status(201).json({
+      codigo: ins.rows[0].codigo, emitida_em: ins.rows[0].emitida_em,
+      aluno_nome: ct.aluno_nome, aluno_cpf: ct.aluno_cpf, referente,
+      valor, valor_base: valorBase, desconto, juros, forma: ct.forma_pagamento,
+      turma: ct.turma_nome, turno: ct.turno
+    });
+  } catch (e) { console.error('Erro emitir recibo online de conta:', e); res.status(500).json({ erro: 'Erro ao emitir o recibo.' }); }
+});
+
 // ---------- Portal dos Pais: acadêmico (professor -> responsável) ----------
 async function vinculoOk(respId, alunoId) {
   const r = await pool.query(`SELECT 1 FROM aluno_responsavel WHERE responsavel_id = $1 AND aluno_id = $2`, [respId, alunoId]);
@@ -4807,14 +4860,15 @@ app.get('/publico/verificar/:codigo', async (req, res) => {
       }
       // Pode ser um Recibo ou Termo de rematrícula ONLINE
       const ro = await pool.query(
-        `SELECT codigo, tipo, aluno_nome, aluno_cpf, responsavel_nome, curso, nivel, turma, turno, semestre, valor, forma, emitida_em
+        `SELECT codigo, tipo, referente, aluno_nome, aluno_cpf, responsavel_nome, curso, nivel, turma, turno, semestre, valor, forma, emitida_em
          FROM rematriculas_online WHERE codigo = $1`, [codigo]);
       if (ro.rows.length) {
         const k = ro.rows[0];
         const cpfK = (k.aluno_cpf || '').replace(/\D/g, '');
         const cpfKMasc = cpfK.length === 11 ? `${cpfK.slice(0, 3)}.***.***-${cpfK.slice(9)}` : null;
+        const tipoPub = k.tipo === 'recibo' ? 'recibo_rematricula' : (k.tipo === 'recibo_conta' ? 'recibo_conta' : 'termo_rematricula');
         return res.json({
-          valido: true, codigo: k.codigo, tipo: k.tipo === 'recibo' ? 'recibo_rematricula' : 'termo_rematricula',
+          valido: true, codigo: k.codigo, tipo: tipoPub, referente: k.referente,
           aluno_nome: k.aluno_nome, aluno_cpf: cpfKMasc, responsavel_nome: k.responsavel_nome,
           curso: k.curso, modulo: k.nivel, turma_nome: k.turma, turno: k.turno, semestre: k.semestre,
           valor: k.valor, forma: k.forma, emitida_em: k.emitida_em
