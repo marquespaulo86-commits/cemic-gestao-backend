@@ -382,8 +382,6 @@ async function initDB() {
     emitida_em TIMESTAMP DEFAULT NOW(),
     emitida_por INTEGER REFERENCES usuarios(id) ON DELETE SET NULL
   )`);
-  await pool.query(`ALTER TABLE rematriculas_online ADD COLUMN IF NOT EXISTS conta_id INTEGER REFERENCES contas_receber(id) ON DELETE SET NULL`);
-  await pool.query(`ALTER TABLE rematriculas_online ADD COLUMN IF NOT EXISTS referente TEXT`);
   // Folha de professores (hora-aula)
   await pool.query(`CREATE TABLE IF NOT EXISTS professor_horas (
     id SERIAL PRIMARY KEY,
@@ -3559,6 +3557,65 @@ app.get('/admin/acompanhamento-pedagogico', autenticar, somenteGestao, async (re
   } catch (e) { console.error('Erro acompanhamento:', e); res.status(500).json({ erro: 'Erro ao carregar o acompanhamento pedagógico.' }); }
 });
 
+app.get('/admin/relatorios/uso-professores', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const semestre = req.query.semestre ? String(req.query.semestre) : null;
+    const turno = req.query.turno ? String(req.query.turno) : null;
+    const dias = Math.max(1, Number(req.query.dias) || 14);
+    const tf = "t.status <> 'encerrada' AND ($1::text IS NULL OR t.semestre = $1) AND ($2::text IS NULL OR t.turno = $2)";
+    const r = await pool.query(
+      `SELECT p.id, p.nome AS professor_nome, p.status,
+        (SELECT COUNT(*) FROM turmas t WHERE t.professor_id=p.id AND ${tf}) AS turmas,
+        (SELECT COUNT(*) FROM matriculas m JOIN turmas t ON t.id=m.turma_id WHERE t.professor_id=p.id AND m.status='ativa' AND ${tf}) AS alunos,
+        (SELECT COUNT(*) FROM aulas a JOIN turmas t ON t.id=a.turma_id WHERE t.professor_id=p.id AND ${tf}) AS aulas,
+        (SELECT MAX(a.data) FROM aulas a JOIN turmas t ON t.id=a.turma_id WHERE t.professor_id=p.id AND ${tf}) AS ultima_aula,
+        (SELECT COUNT(*) FROM aulas a JOIN turmas t ON t.id=a.turma_id WHERE t.professor_id=p.id AND ${tf} AND (a.conteudo IS NULL OR btrim(a.conteudo)='')) AS aulas_sem_conteudo,
+        (SELECT COUNT(*) FROM aulas a JOIN turmas t ON t.id=a.turma_id WHERE t.professor_id=p.id AND ${tf} AND NOT EXISTS (SELECT 1 FROM frequencias f WHERE f.aula_id=a.id)) AS aulas_sem_chamada,
+        (SELECT MAX(a.data) FROM aulas a JOIN turmas t ON t.id=a.turma_id WHERE t.professor_id=p.id AND ${tf} AND EXISTS (SELECT 1 FROM frequencias f WHERE f.aula_id=a.id)) AS ultima_chamada,
+        (SELECT COUNT(*) FROM avaliacoes av JOIN turmas t ON t.id=av.turma_id WHERE t.professor_id=p.id AND ${tf}) AS avaliacoes,
+        (SELECT COUNT(*) FROM notas n JOIN avaliacoes av ON av.id=n.avaliacao_id JOIN turmas t ON t.id=av.turma_id WHERE t.professor_id=p.id AND ${tf}) AS notas,
+        (SELECT MAX(n.lancada_em) FROM notas n JOIN avaliacoes av ON av.id=n.avaliacao_id JOIN turmas t ON t.id=av.turma_id WHERE t.professor_id=p.id AND ${tf}) AS ultima_nota,
+        (SELECT COUNT(*) FROM atividades atv WHERE atv.professor_id=p.id) AS atividades,
+        (SELECT MAX(atv.criado_em) FROM atividades atv WHERE atv.professor_id=p.id) AS ultima_atividade,
+        (SELECT COUNT(*) FROM ocorrencias oc WHERE oc.professor_id=p.id) AS ocorrencias,
+        (SELECT MAX(oc.criado_em) FROM ocorrencias oc WHERE oc.professor_id=p.id) AS ultima_ocorrencia
+       FROM professores p
+       WHERE p.status='ativo'
+       ORDER BY p.nome`, [semestre, turno]);
+    const agora = Date.now();
+    const limiteMs = dias * 24 * 60 * 60 * 1000;
+    const professores = r.rows.map(p => {
+      const datas = [p.ultima_aula, p.ultima_chamada, p.ultima_nota, p.ultima_atividade, p.ultima_ocorrencia]
+        .filter(Boolean).map(d => new Date(d).getTime());
+      const ultimoUso = datas.length ? new Date(Math.max(...datas)) : null;
+      const totalInsercoes = Number(p.aulas) + Number(p.avaliacoes) + Number(p.notas) + Number(p.atividades) + Number(p.ocorrencias);
+      let situacao;
+      if (totalInsercoes === 0) situacao = 'sem_uso';
+      else if (ultimoUso && (agora - ultimoUso.getTime()) > limiteMs) situacao = 'atrasado';
+      else situacao = 'em_dia';
+      return {
+        professor_id: p.id, professor_nome: p.professor_nome,
+        turmas: Number(p.turmas), alunos: Number(p.alunos),
+        aulas: Number(p.aulas), ultima_aula: p.ultima_aula,
+        aulas_sem_conteudo: Number(p.aulas_sem_conteudo), aulas_sem_chamada: Number(p.aulas_sem_chamada),
+        ultima_chamada: p.ultima_chamada,
+        avaliacoes: Number(p.avaliacoes), notas: Number(p.notas), ultima_nota: p.ultima_nota,
+        atividades: Number(p.atividades), ocorrencias: Number(p.ocorrencias),
+        ultimo_uso: ultimoUso ? ultimoUso.toISOString() : null,
+        total_insercoes: totalInsercoes, situacao
+      };
+    });
+    const geral = {
+      professores: professores.length,
+      em_dia: professores.filter(p => p.situacao === 'em_dia').length,
+      atrasados: professores.filter(p => p.situacao === 'atrasado').length,
+      sem_uso: professores.filter(p => p.situacao === 'sem_uso').length,
+      dias
+    };
+    res.json({ professores, geral, filtros: { semestre, turno, dias } });
+  } catch (e) { console.error('Erro relatorio uso professores:', e); res.status(500).json({ erro: 'Erro ao gerar o relatório de uso dos professores.' }); }
+});
+
 app.get('/admin/acompanhamento-pedagogico/turma/:id', autenticar, somenteGestao, async (req, res) => {
   try {
     const id = Number(req.params.id);
@@ -4452,57 +4509,6 @@ app.post('/admin/rematricula-online/emitir', autenticar, somenteGestao, async (r
   } catch (e) { console.error('Erro emitir documento de rematrícula online:', e); res.status(500).json({ erro: 'Erro ao emitir o documento.' }); }
 });
 
-app.post('/admin/recibo-conta/emitir', autenticar, somenteGestao, async (req, res) => {
-  try {
-    const contaId = Number(req.body.conta_id);
-    if (!contaId) return res.status(400).json({ erro: 'Lançamento não informado.' });
-    const cr = await pool.query(
-      `SELECT ct.id, ct.descricao, ct.competencia, ct.valor_final, ct.desconto_pontualidade, ct.juros,
-              ct.valor_recebido, ct.forma_pagamento, ct.data_pagamento, ct.status,
-              a.id AS aluno_id, a.nome AS aluno_nome, a.cpf AS aluno_cpf,
-              t.nome AS turma_nome, t.turno AS turno, c.nome AS curso_nome, n.nome AS nivel_nome
-       FROM contas_receber ct
-       JOIN alunos a ON a.id = ct.aluno_id
-       LEFT JOIN matriculas m ON m.id = ct.matricula_id
-       LEFT JOIN turmas t ON t.id = m.turma_id
-       LEFT JOIN niveis n ON n.id = t.nivel_id
-       LEFT JOIN cursos c ON c.id = n.curso_id
-       WHERE ct.id = $1`, [contaId]);
-    if (!cr.rows.length) return res.status(404).json({ erro: 'Lançamento não encontrado.' });
-    const ct = cr.rows[0];
-    if (ct.status !== 'paga') return res.status(400).json({ erro: 'O recibo só pode ser emitido para um lançamento já pago.' });
-    const desconto = Number(ct.desconto_pontualidade || 0);
-    const juros = Number(ct.juros || 0);
-    const valorBase = Number(ct.valor_final || 0);
-    const valor = ct.valor_recebido != null ? Number(ct.valor_recebido) : +(valorBase - desconto + juros).toFixed(2);
-    const referente = String(ct.descricao || '') + (ct.competencia ? (' · ' + ct.competencia) : '');
-    const rr = await pool.query(
-      `SELECT r.id, r.nome FROM aluno_responsavel ar JOIN responsaveis r ON r.id = ar.responsavel_id
-       WHERE ar.aluno_id = $1 ORDER BY ar.responsavel_financeiro DESC NULLS LAST, ar.id ASC LIMIT 1`, [ct.aluno_id]);
-    const resp = rr.rows[0] || null;
-    let codigo, ok = false;
-    for (let i = 0; i < 6 && !ok; i++) {
-      codigo = 'CEMIC-' + crypto.randomBytes(2).toString('hex').toUpperCase() + '-' + crypto.randomBytes(2).toString('hex').toUpperCase();
-      const ex = await pool.query(`SELECT 1 FROM rematriculas_online WHERE codigo = $1 UNION ALL SELECT 1 FROM declaracoes WHERE codigo = $1`, [codigo]);
-      if (!ex.rows.length) ok = true;
-    }
-    const ins = await pool.query(
-      `INSERT INTO rematriculas_online
-         (codigo, tipo, conta_id, referente, aluno_id, aluno_nome, aluno_cpf, responsavel_id, responsavel_nome,
-          curso, nivel, turma, turno, semestre, valor, forma, emitida_por)
-       VALUES ($1,'recibo_conta',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
-       RETURNING codigo, emitida_em`,
-      [codigo, contaId, referente, ct.aluno_id, ct.aluno_nome, ct.aluno_cpf, resp ? resp.id : null, resp ? resp.nome : null,
-       ct.curso_nome, ct.nivel_nome, ct.turma_nome, ct.turno, ct.competencia, valor, ct.forma_pagamento, req.usuario.id]);
-    res.status(201).json({
-      codigo: ins.rows[0].codigo, emitida_em: ins.rows[0].emitida_em,
-      aluno_nome: ct.aluno_nome, aluno_cpf: ct.aluno_cpf, referente,
-      valor, valor_base: valorBase, desconto, juros, forma: ct.forma_pagamento,
-      turma: ct.turma_nome, turno: ct.turno
-    });
-  } catch (e) { console.error('Erro emitir recibo online de conta:', e); res.status(500).json({ erro: 'Erro ao emitir o recibo.' }); }
-});
-
 // ---------- Portal dos Pais: acadêmico (professor -> responsável) ----------
 async function vinculoOk(respId, alunoId) {
   const r = await pool.query(`SELECT 1 FROM aluno_responsavel WHERE responsavel_id = $1 AND aluno_id = $2`, [respId, alunoId]);
@@ -4860,15 +4866,14 @@ app.get('/publico/verificar/:codigo', async (req, res) => {
       }
       // Pode ser um Recibo ou Termo de rematrícula ONLINE
       const ro = await pool.query(
-        `SELECT codigo, tipo, referente, aluno_nome, aluno_cpf, responsavel_nome, curso, nivel, turma, turno, semestre, valor, forma, emitida_em
+        `SELECT codigo, tipo, aluno_nome, aluno_cpf, responsavel_nome, curso, nivel, turma, turno, semestre, valor, forma, emitida_em
          FROM rematriculas_online WHERE codigo = $1`, [codigo]);
       if (ro.rows.length) {
         const k = ro.rows[0];
         const cpfK = (k.aluno_cpf || '').replace(/\D/g, '');
         const cpfKMasc = cpfK.length === 11 ? `${cpfK.slice(0, 3)}.***.***-${cpfK.slice(9)}` : null;
-        const tipoPub = k.tipo === 'recibo' ? 'recibo_rematricula' : (k.tipo === 'recibo_conta' ? 'recibo_conta' : 'termo_rematricula');
         return res.json({
-          valido: true, codigo: k.codigo, tipo: tipoPub, referente: k.referente,
+          valido: true, codigo: k.codigo, tipo: k.tipo === 'recibo' ? 'recibo_rematricula' : 'termo_rematricula',
           aluno_nome: k.aluno_nome, aluno_cpf: cpfKMasc, responsavel_nome: k.responsavel_nome,
           curso: k.curso, modulo: k.nivel, turma_nome: k.turma, turno: k.turno, semestre: k.semestre,
           valor: k.valor, forma: k.forma, emitida_em: k.emitida_em
