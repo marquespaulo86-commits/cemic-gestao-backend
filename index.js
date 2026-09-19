@@ -382,6 +382,8 @@ async function initDB() {
     emitida_em TIMESTAMP DEFAULT NOW(),
     emitida_por INTEGER REFERENCES usuarios(id) ON DELETE SET NULL
   )`);
+  await pool.query(`ALTER TABLE rematriculas_online ADD COLUMN IF NOT EXISTS conta_id INTEGER REFERENCES contas_receber(id) ON DELETE SET NULL`);
+  await pool.query(`ALTER TABLE rematriculas_online ADD COLUMN IF NOT EXISTS referente TEXT`);
   // Folha de professores (hora-aula)
   await pool.query(`CREATE TABLE IF NOT EXISTS professor_horas (
     id SERIAL PRIMARY KEY,
@@ -622,20 +624,6 @@ async function initDB() {
     usuario_id INTEGER NOT NULL REFERENCES usuarios(id) ON DELETE CASCADE,
     lida_em TIMESTAMP DEFAULT NOW(),
     PRIMARY KEY (circular_id, usuario_id)
-  )`);
-  // Alunos formados + controle de certificados (emissão e entrega).
-  await migrar('formados', `CREATE TABLE IF NOT EXISTS formados (
-    id SERIAL PRIMARY KEY,
-    nome_aluno TEXT NOT NULL,
-    responsavel TEXT,
-    ano_conclusao TEXT,
-    whatsapp TEXT,
-    certificado_emitido BOOLEAN NOT NULL DEFAULT FALSE,
-    entregue BOOLEAN NOT NULL DEFAULT FALSE,
-    data_entrega DATE,
-    responsavel_recebeu TEXT,
-    criado_em TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    atualizado_em TIMESTAMPTZ NOT NULL DEFAULT NOW()
   )`);
   // English Platform: liberação de acesso por aluno.
   // Fluxo: PIX pago na plataforma -> solicitação (status 'pendente') -> master autoriza aqui -> acesso liberado.
@@ -2195,6 +2183,21 @@ app.post('/admin/contas-receber/:id/baixa', autenticar, somenteGestao, async (re
       }
     });
   } catch (e) { console.error('Erro baixa contas-receber:', e); res.status(500).json({ erro: 'Erro ao registrar o pagamento.' }); }
+});
+
+app.post('/admin/contas-receber/:id/estorno', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const cq = await pool.query(`SELECT id, status, vencimento FROM contas_receber WHERE id = $1`, [req.params.id]);
+    if (!cq.rows.length) return res.status(404).json({ erro: 'Cobrança não encontrada.' });
+    const conta = cq.rows[0];
+    if (conta.status !== 'paga') return res.status(409).json({ erro: 'Só é possível estornar um título já pago.' });
+    const novoStatus = new Date(conta.vencimento) < new Date(new Date().toDateString()) ? 'atrasada' : 'pendente';
+    await pool.query(
+      `UPDATE contas_receber SET status=$1, data_pagamento=NULL, forma_pagamento=NULL,
+         desconto_pontualidade=0, juros=0, valor_recebido=NULL, recebido_por=NULL WHERE id=$2`,
+      [novoStatus, req.params.id]);
+    res.json({ mensagem: 'Pagamento estornado. O título voltou para ' + novoStatus + '.', status: novoStatus });
+  } catch (e) { console.error('Erro estorno contas-receber:', e); res.status(500).json({ erro: 'Erro ao estornar o pagamento.' }); }
 });
 
 // ============================================================
@@ -4464,74 +4467,53 @@ app.post('/admin/rematricula-online/emitir', autenticar, somenteGestao, async (r
   } catch (e) { console.error('Erro emitir documento de rematrícula online:', e); res.status(500).json({ erro: 'Erro ao emitir o documento.' }); }
 });
 
-// ===== Alunos formados / Certificados =====
-app.get('/admin/formados', autenticar, somenteGestao, async (req, res) => {
+app.post('/admin/recibo-conta/emitir', autenticar, somenteGestao, async (req, res) => {
   try {
-    const busca = (req.query.busca || '').trim();
-    const params = []; let where = '';
-    if (busca) { params.push('%' + busca + '%'); where = 'WHERE nome_aluno ILIKE $1'; }
-    const r = await pool.query(`SELECT * FROM formados ${where} ORDER BY entregue ASC, nome_aluno ASC`, params);
-    res.json({ formados: r.rows });
-  } catch (e) { console.error('Erro formados:', e); res.status(500).json({ erro: 'Erro ao listar os formados.' }); }
-});
-app.get('/admin/formados/:id', autenticar, somenteGestao, async (req, res) => {
-  try {
-    const r = await pool.query('SELECT * FROM formados WHERE id = $1', [req.params.id]);
-    if (!r.rows.length) return res.status(404).json({ erro: 'Registro não encontrado.' });
-    res.json(r.rows[0]);
-  } catch (e) { console.error('Erro formado:', e); res.status(500).json({ erro: 'Erro ao buscar o registro.' }); }
-});
-app.post('/admin/formados', autenticar, somenteGestao, async (req, res) => {
-  try {
-    const b = req.body || {};
-    const nome = (b.nome_aluno != null ? String(b.nome_aluno).trim() : '');
-    if (!nome) return res.status(400).json({ erro: 'Informe o nome do aluno.' });
-    const responsavel = (b.responsavel != null ? String(b.responsavel).trim() : '') || null;
-    const ano = (b.ano_conclusao != null ? String(b.ano_conclusao).trim() : '') || null;
-    const whatsapp = (b.whatsapp != null ? String(b.whatsapp).trim() : '') || null;
-    const emitido = !!b.certificado_emitido;
-    if (b.id) {
-      const r = await pool.query(
-        `UPDATE formados SET nome_aluno=$1, responsavel=$2, ano_conclusao=$3, whatsapp=$4, certificado_emitido=$5, atualizado_em=NOW()
-         WHERE id=$6 RETURNING *`, [nome, responsavel, ano, whatsapp, emitido, b.id]);
-      if (!r.rows.length) return res.status(404).json({ erro: 'Registro não encontrado.' });
-      return res.json(r.rows[0]);
+    const contaId = Number(req.body.conta_id);
+    if (!contaId) return res.status(400).json({ erro: 'Lançamento não informado.' });
+    const cr = await pool.query(
+      `SELECT ct.id, ct.descricao, ct.competencia, ct.valor_final, ct.desconto_pontualidade, ct.juros,
+              ct.valor_recebido, ct.forma_pagamento, ct.data_pagamento, ct.status,
+              a.id AS aluno_id, COALESCE(a.nome, ct.cliente_nome) AS aluno_nome, a.cpf AS aluno_cpf,
+              t.nome AS turma_nome, t.turno AS turno, t.semestre AS semestre
+       FROM contas_receber ct
+       LEFT JOIN alunos a ON a.id = ct.aluno_id
+       LEFT JOIN matriculas m ON m.id = ct.matricula_id
+       LEFT JOIN turmas t ON t.id = m.turma_id
+       WHERE ct.id = $1`, [contaId]);
+    if (!cr.rows.length) return res.status(404).json({ erro: 'Lançamento não encontrado.' });
+    const ct = cr.rows[0];
+    if (ct.status !== 'paga') return res.status(400).json({ erro: 'O recibo só pode ser emitido para um lançamento já pago.' });
+    const desconto = Number(ct.desconto_pontualidade || 0);
+    const juros = Number(ct.juros || 0);
+    const valorBase = Number(ct.valor_final || 0);
+    const valor = ct.valor_recebido != null ? Number(ct.valor_recebido) : +(valorBase - desconto + juros).toFixed(2);
+    const referente = String(ct.descricao || '') + (ct.semestre ? (' · Semestre ' + ct.semestre) : (ct.competencia ? (' · ' + ct.competencia) : ''));
+    const rr = await pool.query(
+      `SELECT r.id, r.nome FROM aluno_responsavel ar JOIN responsaveis r ON r.id = ar.responsavel_id
+       WHERE ar.aluno_id = $1 ORDER BY ar.responsavel_financeiro DESC NULLS LAST, ar.id ASC LIMIT 1`, [ct.aluno_id]);
+    const resp = rr.rows[0] || null;
+    let codigo, ok = false;
+    for (let i = 0; i < 6 && !ok; i++) {
+      codigo = 'CEMIC-' + crypto.randomBytes(2).toString('hex').toUpperCase() + '-' + crypto.randomBytes(2).toString('hex').toUpperCase();
+      const ex = await pool.query(`SELECT 1 FROM rematriculas_online WHERE codigo = $1 UNION ALL SELECT 1 FROM declaracoes WHERE codigo = $1`, [codigo]);
+      if (!ex.rows.length) ok = true;
     }
-    const r = await pool.query(
-      `INSERT INTO formados (nome_aluno, responsavel, ano_conclusao, whatsapp, certificado_emitido)
-       VALUES ($1,$2,$3,$4,$5) RETURNING *`, [nome, responsavel, ano, whatsapp, emitido]);
-    res.status(201).json(r.rows[0]);
-  } catch (e) { console.error('Erro salvar formado:', e); res.status(500).json({ erro: 'Erro ao salvar o cadastro.' }); }
-});
-app.post('/admin/formados/:id/emissao', autenticar, somenteGestao, async (req, res) => {
-  try {
-    const emitido = !!(req.body || {}).certificado_emitido;
-    const r = await pool.query(`UPDATE formados SET certificado_emitido=$1, atualizado_em=NOW() WHERE id=$2 RETURNING *`, [emitido, req.params.id]);
-    if (!r.rows.length) return res.status(404).json({ erro: 'Registro não encontrado.' });
-    res.json(r.rows[0]);
-  } catch (e) { console.error('Erro emissao certificado:', e); res.status(500).json({ erro: 'Erro ao atualizar a emissão.' }); }
-});
-app.post('/admin/formados/:id/entrega', autenticar, somenteGestao, async (req, res) => {
-  try {
-    const b = req.body || {};
-    const entregue = !!b.entregue;
-    const hoje = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Fortaleza' });
-    const data = entregue ? (b.data_entrega ? String(b.data_entrega).slice(0, 10) : hoje) : null;
-    const quem = entregue ? ((b.responsavel_recebeu != null ? String(b.responsavel_recebeu).trim() : '') || null) : null;
-    const r = await pool.query(
-      `UPDATE formados SET entregue=$1, data_entrega=$2, responsavel_recebeu=$3,
-         certificado_emitido = CASE WHEN $1 THEN TRUE ELSE certificado_emitido END, atualizado_em=NOW()
-       WHERE id=$4 RETURNING *`, [entregue, data, quem, req.params.id]);
-    if (!r.rows.length) return res.status(404).json({ erro: 'Registro não encontrado.' });
-    res.json(r.rows[0]);
-  } catch (e) { console.error('Erro entrega certificado:', e); res.status(500).json({ erro: 'Erro ao atualizar a entrega.' }); }
-});
-app.delete('/admin/formados/:id', autenticar, somenteGestao, async (req, res) => {
-  try {
-    const r = await pool.query('DELETE FROM formados WHERE id = $1 RETURNING id', [req.params.id]);
-    if (!r.rows.length) return res.status(404).json({ erro: 'Registro não encontrado.' });
-    res.json({ ok: true });
-  } catch (e) { console.error('Erro excluir formado:', e); res.status(500).json({ erro: 'Erro ao excluir.' }); }
+    const ins = await pool.query(
+      `INSERT INTO rematriculas_online
+         (codigo, tipo, conta_id, referente, aluno_id, aluno_nome, aluno_cpf, responsavel_id, responsavel_nome,
+          turma, turno, semestre, valor, forma, emitida_por)
+       VALUES ($1,'recibo_conta',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+       RETURNING codigo, emitida_em`,
+      [codigo, contaId, referente, ct.aluno_id, ct.aluno_nome, ct.aluno_cpf, resp ? resp.id : null, resp ? resp.nome : null,
+       ct.turma_nome, ct.turno, ct.semestre, valor, ct.forma_pagamento, req.usuario.id]);
+    res.status(201).json({
+      codigo: ins.rows[0].codigo, emitida_em: ins.rows[0].emitida_em,
+      aluno_nome: ct.aluno_nome, aluno_cpf: ct.aluno_cpf, referente,
+      valor, valor_base: valorBase, desconto, juros, forma: ct.forma_pagamento,
+      turma: ct.turma_nome, turno: ct.turno, data: ct.data_pagamento
+    });
+  } catch (e) { console.error('Erro emitir recibo online de conta:', e); res.status(500).json({ erro: 'Erro ao emitir o recibo.' }); }
 });
 
 // ---------- Portal dos Pais: acadêmico (professor -> responsável) ----------
@@ -4891,14 +4873,15 @@ app.get('/publico/verificar/:codigo', async (req, res) => {
       }
       // Pode ser um Recibo ou Termo de rematrícula ONLINE
       const ro = await pool.query(
-        `SELECT codigo, tipo, aluno_nome, aluno_cpf, responsavel_nome, curso, nivel, turma, turno, semestre, valor, forma, emitida_em
+        `SELECT codigo, tipo, referente, aluno_nome, aluno_cpf, responsavel_nome, curso, nivel, turma, turno, semestre, valor, forma, emitida_em
          FROM rematriculas_online WHERE codigo = $1`, [codigo]);
       if (ro.rows.length) {
         const k = ro.rows[0];
         const cpfK = (k.aluno_cpf || '').replace(/\D/g, '');
         const cpfKMasc = cpfK.length === 11 ? `${cpfK.slice(0, 3)}.***.***-${cpfK.slice(9)}` : null;
+        const tipoPub = k.tipo === 'recibo' ? 'recibo_rematricula' : (k.tipo === 'recibo_conta' ? 'recibo_conta' : 'termo_rematricula');
         return res.json({
-          valido: true, codigo: k.codigo, tipo: k.tipo === 'recibo' ? 'recibo_rematricula' : 'termo_rematricula',
+          valido: true, codigo: k.codigo, tipo: tipoPub, referente: k.referente,
           aluno_nome: k.aluno_nome, aluno_cpf: cpfKMasc, responsavel_nome: k.responsavel_nome,
           curso: k.curso, modulo: k.nivel, turma_nome: k.turma, turno: k.turno, semestre: k.semestre,
           valor: k.valor, forma: k.forma, emitida_em: k.emitida_em
