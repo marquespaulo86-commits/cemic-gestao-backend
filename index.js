@@ -625,6 +625,12 @@ async function initDB() {
     lida_em TIMESTAMP DEFAULT NOW(),
     PRIMARY KEY (circular_id, usuario_id)
   )`);
+  await migrar('formados', `CREATE TABLE IF NOT EXISTS formados (
+    id SERIAL PRIMARY KEY, nome_aluno TEXT NOT NULL, responsavel TEXT, ano_conclusao TEXT, whatsapp TEXT,
+    certificado_emitido BOOLEAN NOT NULL DEFAULT FALSE, entregue BOOLEAN NOT NULL DEFAULT FALSE,
+    data_entrega DATE, responsavel_recebeu TEXT,
+    criado_em TIMESTAMPTZ NOT NULL DEFAULT NOW(), atualizado_em TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  )`);
   // English Platform: liberação de acesso por aluno.
   // Fluxo: PIX pago na plataforma -> solicitação (status 'pendente') -> master autoriza aqui -> acesso liberado.
   await migrar('english_platform_acesso', `CREATE TABLE IF NOT EXISTS english_platform_acesso (
@@ -3574,6 +3580,45 @@ app.get('/admin/acompanhamento-pedagogico', autenticar, somenteGestao, async (re
   } catch (e) { console.error('Erro acompanhamento:', e); res.status(500).json({ erro: 'Erro ao carregar o acompanhamento pedagógico.' }); }
 });
 
+app.get('/admin/relatorios/uso-professores', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const semestre = req.query.semestre ? String(req.query.semestre) : null;
+    const turno = req.query.turno ? String(req.query.turno) : null;
+    const dias = Math.max(1, Number(req.query.dias) || 14);
+    const tf = "t.status <> 'encerrada' AND ($1::text IS NULL OR t.semestre = $1) AND ($2::text IS NULL OR t.turno = $2)";
+    const r = await pool.query(
+      `SELECT p.id, p.nome AS professor_nome, p.status,
+        (SELECT COUNT(*) FROM turmas t WHERE t.professor_id=p.id AND ${tf}) AS turmas,
+        (SELECT COUNT(*) FROM matriculas m JOIN turmas t ON t.id=m.turma_id WHERE t.professor_id=p.id AND m.status='ativa' AND ${tf}) AS alunos,
+        (SELECT COUNT(*) FROM aulas a JOIN turmas t ON t.id=a.turma_id WHERE t.professor_id=p.id AND ${tf}) AS aulas,
+        (SELECT MAX(a.data) FROM aulas a JOIN turmas t ON t.id=a.turma_id WHERE t.professor_id=p.id AND ${tf}) AS ultima_aula,
+        (SELECT COUNT(*) FROM aulas a JOIN turmas t ON t.id=a.turma_id WHERE t.professor_id=p.id AND ${tf} AND (a.conteudo IS NULL OR btrim(a.conteudo)='')) AS aulas_sem_conteudo,
+        (SELECT COUNT(*) FROM aulas a JOIN turmas t ON t.id=a.turma_id WHERE t.professor_id=p.id AND ${tf} AND NOT EXISTS (SELECT 1 FROM frequencias f WHERE f.aula_id=a.id)) AS aulas_sem_chamada,
+        (SELECT MAX(a.data) FROM aulas a JOIN turmas t ON t.id=a.turma_id WHERE t.professor_id=p.id AND ${tf} AND EXISTS (SELECT 1 FROM frequencias f WHERE f.aula_id=a.id)) AS ultima_chamada,
+        (SELECT COUNT(*) FROM avaliacoes av JOIN turmas t ON t.id=av.turma_id WHERE t.professor_id=p.id AND ${tf}) AS avaliacoes,
+        (SELECT COUNT(*) FROM notas n JOIN avaliacoes av ON av.id=n.avaliacao_id JOIN turmas t ON t.id=av.turma_id WHERE t.professor_id=p.id AND ${tf}) AS notas,
+        (SELECT MAX(n.lancada_em) FROM notas n JOIN avaliacoes av ON av.id=n.avaliacao_id JOIN turmas t ON t.id=av.turma_id WHERE t.professor_id=p.id AND ${tf}) AS ultima_nota,
+        (SELECT COUNT(*) FROM atividades atv WHERE atv.professor_id=p.id) AS atividades,
+        (SELECT MAX(atv.criado_em) FROM atividades atv WHERE atv.professor_id=p.id) AS ultima_atividade,
+        (SELECT COUNT(*) FROM ocorrencias oc WHERE oc.professor_id=p.id) AS ocorrencias,
+        (SELECT MAX(oc.criado_em) FROM ocorrencias oc WHERE oc.professor_id=p.id) AS ultima_ocorrencia
+       FROM professores p WHERE p.status='ativo' ORDER BY p.nome`, [semestre, turno]);
+    const agora = Date.now(); const limiteMs = dias*24*60*60*1000;
+    const professores = r.rows.map(p => {
+      const datas = [p.ultima_aula, p.ultima_chamada, p.ultima_nota, p.ultima_atividade, p.ultima_ocorrencia].filter(Boolean).map(d => new Date(d).getTime());
+      const ultimoUso = datas.length ? new Date(Math.max(...datas)) : null;
+      const totalInsercoes = Number(p.aulas)+Number(p.avaliacoes)+Number(p.notas)+Number(p.atividades)+Number(p.ocorrencias);
+      let situacao; if (totalInsercoes===0) situacao='sem_uso'; else if (ultimoUso && (agora-ultimoUso.getTime())>limiteMs) situacao='atrasado'; else situacao='em_dia';
+      return { professor_id:p.id, professor_nome:p.professor_nome, turmas:Number(p.turmas), alunos:Number(p.alunos), aulas:Number(p.aulas), ultima_aula:p.ultima_aula,
+        aulas_sem_conteudo:Number(p.aulas_sem_conteudo), aulas_sem_chamada:Number(p.aulas_sem_chamada), ultima_chamada:p.ultima_chamada,
+        avaliacoes:Number(p.avaliacoes), notas:Number(p.notas), ultima_nota:p.ultima_nota, atividades:Number(p.atividades), ocorrencias:Number(p.ocorrencias),
+        ultimo_uso: ultimoUso?ultimoUso.toISOString():null, total_insercoes:totalInsercoes, situacao };
+    });
+    const geral = { professores:professores.length, em_dia:professores.filter(p=>p.situacao==='em_dia').length, atrasados:professores.filter(p=>p.situacao==='atrasado').length, sem_uso:professores.filter(p=>p.situacao==='sem_uso').length, dias };
+    res.json({ professores, geral, filtros:{semestre,turno,dias} });
+  } catch (e) { console.error('Erro relatorio uso professores:', e); res.status(500).json({ erro: 'Erro ao gerar o relatório de uso dos professores.' }); }
+});
+
 app.get('/admin/acompanhamento-pedagogico/turma/:id', autenticar, somenteGestao, async (req, res) => {
   try {
     const id = Number(req.params.id);
@@ -4514,6 +4559,95 @@ app.post('/admin/recibo-conta/emitir', autenticar, somenteGestao, async (req, re
       turma: ct.turma_nome, turno: ct.turno, data: ct.data_pagamento
     });
   } catch (e) { console.error('Erro emitir recibo online de conta:', e); res.status(500).json({ erro: 'Erro ao emitir o recibo.' }); }
+});
+
+// ===== Alunos formados / Certificados =====
+app.get('/admin/formados', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const busca = (req.query.busca || '').trim();
+    const params = []; let where = '';
+    if (busca) { params.push('%' + busca + '%'); where = 'WHERE nome_aluno ILIKE $1'; }
+    const r = await pool.query(`SELECT * FROM formados ${where} ORDER BY entregue ASC, nome_aluno ASC`, params);
+    res.json({ formados: r.rows });
+  } catch (e) { console.error('Erro formados:', e); res.status(500).json({ erro: 'Erro ao listar os formados.' }); }
+});
+app.get('/admin/formados/:id', autenticar, somenteGestao, async (req, res) => {
+  try { const r = await pool.query('SELECT * FROM formados WHERE id = $1', [req.params.id]);
+    if (!r.rows.length) return res.status(404).json({ erro: 'Registro não encontrado.' });
+    res.json(r.rows[0]); } catch (e) { console.error('Erro formado:', e); res.status(500).json({ erro: 'Erro ao buscar o registro.' }); }
+});
+app.post('/admin/formados', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const bd = req.body || {}; const nome = (bd.nome_aluno != null ? String(bd.nome_aluno).trim() : '');
+    if (!nome) return res.status(400).json({ erro: 'Informe o nome do aluno.' });
+    const responsavel = (bd.responsavel != null ? String(bd.responsavel).trim() : '') || null;
+    const ano = (bd.ano_conclusao != null ? String(bd.ano_conclusao).trim() : '') || null;
+    const whatsapp = (bd.whatsapp != null ? String(bd.whatsapp).trim() : '') || null;
+    const emitido = !!bd.certificado_emitido;
+    if (bd.id) { const r = await pool.query(`UPDATE formados SET nome_aluno=$1, responsavel=$2, ano_conclusao=$3, whatsapp=$4, certificado_emitido=$5, atualizado_em=NOW() WHERE id=$6 RETURNING *`, [nome, responsavel, ano, whatsapp, emitido, bd.id]);
+      if (!r.rows.length) return res.status(404).json({ erro: 'Registro não encontrado.' }); return res.json(r.rows[0]); }
+    const r = await pool.query(`INSERT INTO formados (nome_aluno, responsavel, ano_conclusao, whatsapp, certificado_emitido) VALUES ($1,$2,$3,$4,$5) RETURNING *`, [nome, responsavel, ano, whatsapp, emitido]);
+    res.status(201).json(r.rows[0]);
+  } catch (e) { console.error('Erro salvar formado:', e); res.status(500).json({ erro: 'Erro ao salvar o cadastro.' }); }
+});
+app.post('/admin/formados/:id/emissao', autenticar, somenteGestao, async (req, res) => {
+  try { const emitido = !!(req.body || {}).certificado_emitido;
+    const r = await pool.query(`UPDATE formados SET certificado_emitido=$1, atualizado_em=NOW() WHERE id=$2 RETURNING *`, [emitido, req.params.id]);
+    if (!r.rows.length) return res.status(404).json({ erro: 'Registro não encontrado.' }); res.json(r.rows[0]);
+  } catch (e) { console.error('Erro emissao certificado:', e); res.status(500).json({ erro: 'Erro ao atualizar a emissão.' }); }
+});
+app.post('/admin/formados/:id/entrega', autenticar, somenteGestao, async (req, res) => {
+  try { const bd = req.body || {}; const entregue = !!bd.entregue;
+    const hoje = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Fortaleza' });
+    const data = entregue ? (bd.data_entrega ? String(bd.data_entrega).slice(0, 10) : hoje) : null;
+    const quem = entregue ? ((bd.responsavel_recebeu != null ? String(bd.responsavel_recebeu).trim() : '') || null) : null;
+    const r = await pool.query(`UPDATE formados SET entregue=$1, data_entrega=$2, responsavel_recebeu=$3, certificado_emitido = CASE WHEN $1 THEN TRUE ELSE certificado_emitido END, atualizado_em=NOW() WHERE id=$4 RETURNING *`, [entregue, data, quem, req.params.id]);
+    if (!r.rows.length) return res.status(404).json({ erro: 'Registro não encontrado.' }); res.json(r.rows[0]);
+  } catch (e) { console.error('Erro entrega certificado:', e); res.status(500).json({ erro: 'Erro ao atualizar a entrega.' }); }
+});
+app.delete('/admin/formados/:id', autenticar, somenteGestao, async (req, res) => {
+  try { const r = await pool.query('DELETE FROM formados WHERE id = $1 RETURNING id', [req.params.id]);
+    if (!r.rows.length) return res.status(404).json({ erro: 'Registro não encontrado.' }); res.json({ ok: true });
+  } catch (e) { console.error('Erro excluir formado:', e); res.status(500).json({ erro: 'Erro ao excluir.' }); }
+});
+// ===== Correção de Faltas (master corrige a chamada lançada pelo professor) =====
+app.get('/admin/aulas/:id/chamada', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const a = await pool.query(`SELECT a.id, a.data, a.conteudo, a.turma_id, t.nome AS turma_nome FROM aulas a JOIN turmas t ON t.id=a.turma_id WHERE a.id=$1`, [req.params.id]);
+    if (!a.rows.length) return res.status(404).json({ erro: 'Aula não encontrada.' });
+    const tId = a.rows[0].turma_id;
+    const r = await pool.query(
+      `SELECT m.id AS matricula_id, al.nome,
+              COALESCE(f.presente, TRUE) AS presente, f.justificativa,
+              COALESCE(f.justificada, FALSE) AS justificada, (f.id IS NOT NULL) AS lancado
+       FROM matriculas m JOIN alunos al ON al.id = m.aluno_id
+       LEFT JOIN frequencias f ON f.matricula_id = m.id AND f.aula_id = $2
+       WHERE m.turma_id = $1 AND m.status = 'ativa' ORDER BY al.nome`, [tId, req.params.id]);
+    res.json({ aula: a.rows[0], alunos: r.rows });
+  } catch (e) { console.error('Erro GET chamada admin:', e); res.status(500).json({ erro: 'Erro ao carregar a chamada.' }); }
+});
+app.post('/admin/aulas/:id/chamada', autenticar, somenteGestao, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const a = await client.query(`SELECT id FROM aulas WHERE id=$1`, [req.params.id]);
+    if (!a.rows.length) { client.release(); return res.status(404).json({ erro: 'Aula não encontrada.' }); }
+    const lista = Array.isArray(req.body.presencas) ? req.body.presencas : [];
+    if (!lista.length) { client.release(); return res.status(400).json({ erro: 'Nenhuma presença informada.' }); }
+    await client.query('BEGIN');
+    for (const p of lista) {
+      await client.query(
+        `INSERT INTO frequencias (aula_id, matricula_id, presente, justificativa) VALUES ($1,$2,$3,$4)
+         ON CONFLICT (aula_id, matricula_id) DO UPDATE SET presente = EXCLUDED.presente, justificativa = EXCLUDED.justificativa`,
+        [req.params.id, Number(p.matricula_id), p.presente !== false, (p.justificativa || '').trim() || null]);
+    }
+    await client.query(
+      `UPDATE frequencias f SET justificada = TRUE, justificativa_falta_id = j.id
+         FROM matriculas m, aulas au, justificativas_falta j
+        WHERE f.aula_id = $1 AND f.presente = FALSE AND m.id = f.matricula_id AND au.id = f.aula_id
+          AND j.aluno_id = m.aluno_id AND j.data_falta = au.data AND j.status = 'deferida'`, [req.params.id]);
+    await client.query('COMMIT'); client.release();
+    res.json({ ok: true, registros: lista.length });
+  } catch (e) { try { await client.query('ROLLBACK'); } catch(_){} client.release(); console.error('Erro POST chamada admin:', e); res.status(500).json({ erro: 'Erro ao salvar a correção.' }); }
 });
 
 // ---------- Portal dos Pais: acadêmico (professor -> responsável) ----------
