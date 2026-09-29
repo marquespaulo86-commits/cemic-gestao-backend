@@ -573,6 +573,7 @@ async function initDB() {
   await migrar('idx_declprof_prof_vig', `CREATE UNIQUE INDEX IF NOT EXISTS idx_declprof_prof_vig ON declaracoes_professor (professor_id, vigencia_inicio)`);
   // ---------- Calendário acadêmico, Circulares e Sistema de Avaliação (v3.33) ----------
   await migrar('avaliacoes', `ALTER TABLE avaliacoes ADD COLUMN IF NOT EXISTS bimestre INTEGER`);
+  await pool.query(`ALTER TABLE notas ADD COLUMN IF NOT EXISTS manual BOOLEAN NOT NULL DEFAULT FALSE`);
   await migrar('calendario', `CREATE TABLE IF NOT EXISTS calendario (
     id SERIAL PRIMARY KEY,
     semestre TEXT NOT NULL,
@@ -2763,7 +2764,8 @@ async function atualizarNotaDesempenho(alunoId) {
     if (!av.rows.length) return; // avaliação do modelo ainda não criada nesta turma
     await pool.query(
       `INSERT INTO notas (avaliacao_id, matricula_id, nota, lancada_em) VALUES ($1,$2,$3,NOW())
-       ON CONFLICT (avaliacao_id, matricula_id) DO UPDATE SET nota = EXCLUDED.nota, lancada_em = NOW()`,
+       ON CONFLICT (avaliacao_id, matricula_id) DO UPDATE SET nota = EXCLUDED.nota, lancada_em = NOW()
+       WHERE notas.manual = FALSE`,
       [av.rows[0].id, matricula_id, nota]);
   } catch (e) { console.error('Erro atualizar nota de desempenho:', e); }
 }
@@ -4684,6 +4686,57 @@ app.post('/admin/aulas/:id/chamada', autenticar, somenteGestao, async (req, res)
     await client.query('COMMIT'); client.release();
     res.json({ ok: true, registros: lista.length });
   } catch (e) { try { await client.query('ROLLBACK'); } catch(_){} client.release(); console.error('Erro POST chamada admin:', e); res.status(500).json({ erro: 'Erro ao salvar a correção.' }); }
+});
+
+// ===== Ajustes de Notas (Gestão corrige notas diretamente) =====
+app.get('/admin/turmas/:id/notas-grade', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const t = await pool.query(`SELECT id, nome FROM turmas WHERE id = $1`, [req.params.id]);
+    if (!t.rows.length) return res.status(404).json({ erro: 'Turma não encontrada.' });
+    const avs = await pool.query(
+      `SELECT id, nome, peso, bimestre, (nome ILIKE '%desempenho%plataforma%') AS auto
+         FROM avaliacoes WHERE turma_id = $1 ORDER BY bimestre NULLS FIRST, id`, [req.params.id]);
+    const alunos = await pool.query(
+      `SELECT m.id AS matricula_id, a.nome FROM matriculas m JOIN alunos a ON a.id = m.aluno_id
+        WHERE m.turma_id = $1 AND m.status = 'ativa' ORDER BY a.nome`, [req.params.id]);
+    const notas = await pool.query(
+      `SELECT n.avaliacao_id, n.matricula_id, n.nota, n.manual
+         FROM notas n JOIN avaliacoes av ON av.id = n.avaliacao_id WHERE av.turma_id = $1`, [req.params.id]);
+    const mapa = {};
+    notas.rows.forEach(n => { (mapa[n.matricula_id] = mapa[n.matricula_id] || {})[n.avaliacao_id] = { nota: Number(n.nota), manual: n.manual }; });
+    res.json({ turma: t.rows[0], avaliacoes: avs.rows, alunos: alunos.rows.map(al => ({ matricula_id: al.matricula_id, nome: al.nome, notas: mapa[al.matricula_id] || {} })) });
+  } catch (e) { console.error('Erro grade de notas:', e); res.status(500).json({ erro: 'Erro ao carregar as notas.' }); }
+});
+app.post('/admin/notas', autenticar, somenteGestao, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const lista = Array.isArray(req.body.notas) ? req.body.notas : [];
+    if (!lista.length) { client.release(); return res.status(400).json({ erro: 'Nenhuma nota informada.' }); }
+    await client.query('BEGIN');
+    let salvas = 0, removidas = 0;
+    for (const it of lista) {
+      const av = Number(it.avaliacao_id), mat = Number(it.matricula_id);
+      if (!av || !mat) continue;
+      const vazio = (it.nota === null || it.nota === '' || it.nota === undefined);
+      if (vazio) {
+        const d = await client.query(`DELETE FROM notas WHERE avaliacao_id = $1 AND matricula_id = $2`, [av, mat]);
+        removidas += d.rowCount;
+      } else {
+        let v = Number(String(it.nota).replace(',', '.'));
+        if (!Number.isFinite(v)) continue;
+        v = Math.max(0, Math.min(10, v));
+        await client.query(
+          `INSERT INTO notas (avaliacao_id, matricula_id, nota, manual, lancada_por, lancada_em)
+           VALUES ($1,$2,$3,TRUE,$4,NOW())
+           ON CONFLICT (avaliacao_id, matricula_id)
+           DO UPDATE SET nota = EXCLUDED.nota, manual = TRUE, lancada_por = EXCLUDED.lancada_por, lancada_em = NOW()`,
+          [av, mat, v, req.usuario.id]);
+        salvas++;
+      }
+    }
+    await client.query('COMMIT'); client.release();
+    res.json({ ok: true, salvas, removidas });
+  } catch (e) { try { await client.query('ROLLBACK'); } catch(_){} client.release(); console.error('Erro salvar ajustes de notas:', e); res.status(500).json({ erro: 'Erro ao salvar os ajustes.' }); }
 });
 
 // ---------- Portal dos Pais: acadêmico (professor -> responsável) ----------
