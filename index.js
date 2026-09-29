@@ -2732,6 +2732,41 @@ app.get('/publico/portal/english-platform/status', autenticarResponsavel, async 
   try { res.json(await statusEnglishPlatform(req.responsavelId)); }
   catch (e) { console.error('Erro EP status:', e); res.status(500).json({ erro: 'Erro ao consultar o acesso.' }); }
 });
+// ===== Desempenho na Plataforma: nota automática (0-100% -> 0-10) =====
+async function computeDesempenhoPct(alunoId) {
+  const q = await pool.query(
+    `WITH prog AS (
+       SELECT atividade_idx, estacao, concluida
+         FROM english_platform_progresso
+        WHERE aluno_id = $1 AND estacao <> 'resumo'
+     )
+     SELECT (SELECT MAX(atividade_idx) FROM prog) AS maxidx,
+            (SELECT MAX(c) FROM (SELECT COUNT(DISTINCT estacao) AS c FROM prog GROUP BY atividade_idx) z) AS spa,
+            (SELECT COUNT(*) FROM prog WHERE concluida) AS feitas`, [alunoId]);
+  const row = q.rows[0];
+  if (!row || row.maxidx == null || !Number(row.spa)) return null;
+  const expected = (Number(row.maxidx) + 1) * Number(row.spa); // atividades postadas x estações obrigatórias
+  if (expected <= 0) return null;
+  return Math.min(100, Math.round(Number(row.feitas) / expected * 100));
+}
+async function atualizarNotaDesempenho(alunoId) {
+  try {
+    const pct = await computeDesempenhoPct(alunoId);
+    if (pct == null) return;
+    const nota = Math.min(10, Math.round(pct) / 10); // 78% -> 7.8
+    const mat = await pool.query(
+      `SELECT id AS matricula_id, turma_id FROM matriculas WHERE aluno_id = $1 AND status = 'ativa' ORDER BY id DESC LIMIT 1`, [alunoId]);
+    if (!mat.rows.length) return;
+    const { matricula_id, turma_id } = mat.rows[0];
+    const av = await pool.query(
+      `SELECT id FROM avaliacoes WHERE turma_id = $1 AND bimestre = 1 AND nome ILIKE '%desempenho%plataforma%' ORDER BY id LIMIT 1`, [turma_id]);
+    if (!av.rows.length) return; // avaliação do modelo ainda não criada nesta turma
+    await pool.query(
+      `INSERT INTO notas (avaliacao_id, matricula_id, nota, lancada_em) VALUES ($1,$2,$3,NOW())
+       ON CONFLICT (avaliacao_id, matricula_id) DO UPDATE SET nota = EXCLUDED.nota, lancada_em = NOW()`,
+      [av.rows[0].id, matricula_id, nota]);
+  } catch (e) { console.error('Erro atualizar nota de desempenho:', e); }
+}
 app.post('/publico/portal/english-platform/progresso', autenticarResponsavel, async (req, res) => {
   try {
     const b = req.body || {};
@@ -2756,6 +2791,7 @@ app.post('/publico/portal/english-platform/progresso', autenticarResponsavel, as
          audio_mime = COALESCE(EXCLUDED.audio_mime, english_platform_progresso.audio_mime),
          atualizado_em = NOW()`,
       [alunoId, modulo, atividade, estacao, b.concluida !== false, JSON.stringify(respostas), audio, mime]);
+    atualizarNotaDesempenho(alunoId); // lança/atualiza a nota "Desempenho na Plataforma" automaticamente
     res.json({ ok: true });
   } catch (e) { console.error('Erro salvar progresso EP:', e); res.status(500).json({ erro: 'Erro ao salvar o progresso.' }); }
 });
@@ -4709,19 +4745,20 @@ app.get('/publico/portal/aluno/:id/notas', autenticarResponsavel, async (req, re
     const mat = await matriculaAtivaDoAluno(alunoId);
     if (!mat) return res.json({ turma: null, itens: [], media: null });
     const r = await pool.query(
-      `SELECT av.id, av.nome, av.peso, av.data, n.nota
+      `SELECT av.id, av.nome, av.peso, av.data, av.bimestre, n.nota
        FROM avaliacoes av
        LEFT JOIN notas n ON n.avaliacao_id = av.id AND n.matricula_id = $2
        WHERE av.turma_id = $1
-       ORDER BY av.data NULLS LAST, av.id`, [mat.turma_id, mat.matricula_id]);
-    const comNota = r.rows.filter(x => x.nota !== null);
-    let media = null;
-    if (comNota.length) {
-      const somaPeso = comNota.reduce((s, x) => s + Number(x.peso || 1), 0);
-      const soma = comNota.reduce((s, x) => s + Number(x.nota) * Number(x.peso || 1), 0);
-      media = somaPeso > 0 ? Number((soma / somaPeso).toFixed(2)) : null;
-    }
-    res.json({ turma: mat.turma_nome, semestre: mat.semestre, itens: r.rows, media });
+       ORDER BY av.bimestre NULLS FIRST, av.data NULLS LAST, av.id`, [mat.turma_id, mat.matricula_id]);
+    const mediaBim = (bim) => {
+      const com = r.rows.filter(x => (x.bimestre || 1) === bim && x.nota !== null);
+      if (!com.length) return null;
+      const sp = com.reduce((s, x) => s + Number(x.peso || 1), 0);
+      const so = com.reduce((s, x) => s + Number(x.nota) * Number(x.peso || 1), 0);
+      return sp > 0 ? Number((so / sp).toFixed(2)) : null;
+    };
+    const medias = { 1: mediaBim(1), 2: mediaBim(2) };
+    res.json({ turma: mat.turma_nome, semestre: mat.semestre, itens: r.rows, medias, media: medias[1] });
   } catch (e) { console.error('Erro portal notas:', e); res.status(500).json({ erro: 'Erro ao carregar as notas.' }); }
 });
 
