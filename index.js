@@ -2793,7 +2793,7 @@ app.post('/publico/portal/english-platform/progresso', autenticarResponsavel, as
          audio_mime = COALESCE(EXCLUDED.audio_mime, english_platform_progresso.audio_mime),
          atualizado_em = NOW()`,
       [alunoId, modulo, atividade, estacao, b.concluida !== false, JSON.stringify(respostas), audio, mime]);
-    atualizarNotaDesempenho(alunoId); // lança/atualiza a nota "Desempenho na Plataforma" automaticamente
+    // nota de desempenho agora é lançada manualmente (tela Notas da Plataforma), não mais no salvamento
     res.json({ ok: true });
   } catch (e) { console.error('Erro salvar progresso EP:', e); res.status(500).json({ erro: 'Erro ao salvar o progresso.' }); }
 });
@@ -4739,6 +4739,74 @@ app.post('/admin/notas', autenticar, somenteGestao, async (req, res) => {
   } catch (e) { try { await client.query('ROLLBACK'); } catch(_){} client.release(); console.error('Erro salvar ajustes de notas:', e); res.status(500).json({ erro: 'Erro ao salvar os ajustes.' }); }
 });
 
+// ===== Notas da Plataforma: prévia e lançamento manual (turma + período de atividades) =====
+async function previaDesempenho(turmaId, de, ate) {
+  const de0 = Math.max(0, Number(de) - 1), ate0 = Math.max(de0, Number(ate) - 1);
+  const q = await pool.query(
+    `WITH alu AS (
+       SELECT m.id AS matricula_id, m.aluno_id, a.nome
+         FROM matriculas m JOIN alunos a ON a.id = m.aluno_id
+        WHERE m.turma_id = $1 AND m.status = 'ativa'
+     ),
+     prog AS (
+       SELECT aluno_id, atividade_idx, estacao, concluida
+         FROM english_platform_progresso
+        WHERE estacao <> 'resumo' AND atividade_idx BETWEEN $2 AND $3
+          AND aluno_id IN (SELECT aluno_id FROM alu)
+     ),
+     spa AS (
+       SELECT COALESCE(MAX(c), 5) AS n
+         FROM (SELECT aluno_id, atividade_idx, COUNT(DISTINCT estacao) AS c FROM prog GROUP BY aluno_id, atividade_idx) z
+     )
+     SELECT al.matricula_id, al.nome,
+            COALESCE((SELECT COUNT(*) FROM prog p WHERE p.aluno_id = al.aluno_id AND p.concluida), 0)::int AS feitas,
+            (SELECT n FROM spa)::int AS spa
+       FROM alu al ORDER BY al.nome`, [turmaId, de0, ate0]);
+  const nAtiv = ate0 - de0 + 1;
+  return q.rows.map(r => {
+    const spa = Number(r.spa) || 5;
+    const expected = nAtiv * spa;
+    const pct = expected > 0 ? Math.min(100, Math.round(Number(r.feitas) / expected * 100)) : 0;
+    const nota = Math.min(10, Math.round(pct) / 10);
+    return { matricula_id: r.matricula_id, nome: r.nome, feitas: Number(r.feitas), pct, nota };
+  });
+}
+app.get('/admin/turmas/:id/desempenho-previa', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const de = Number(req.query.de) || 1, ate = Number(req.query.ate) || de;
+    const t = await pool.query(`SELECT id, nome FROM turmas WHERE id = $1`, [req.params.id]);
+    if (!t.rows.length) return res.status(404).json({ erro: 'Turma não encontrada.' });
+    const alunos = await previaDesempenho(req.params.id, de, ate);
+    res.json({ turma: t.rows[0], de, ate, alunos });
+  } catch (e) { console.error('Erro prévia desempenho:', e); res.status(500).json({ erro: 'Erro ao gerar a prévia.' }); }
+});
+app.post('/admin/turmas/:id/desempenho-lancar', autenticar, somenteGestao, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const de = Number(req.body.de) || 1, ate = Number(req.body.ate) || de, bimestre = Number(req.body.bimestre) || 1;
+    const av = await pool.query(
+      `SELECT id FROM avaliacoes WHERE turma_id = $1 AND bimestre = $2 AND nome ILIKE '%desempenho%plataforma%' ORDER BY id LIMIT 1`,
+      [req.params.id, bimestre]);
+    if (!av.rows.length) { client.release(); return res.status(400).json({ erro: 'A avaliação "Desempenho na Plataforma" do ' + bimestre + 'º bimestre não existe nesta turma. Aplique o modelo de avaliações primeiro.' }); }
+    const avId = av.rows[0].id;
+    const alunos = await previaDesempenho(req.params.id, de, ate);
+    await client.query('BEGIN');
+    let lancadas = 0;
+    for (const a of alunos) {
+      const u = await client.query(
+        `INSERT INTO notas (avaliacao_id, matricula_id, nota, manual, lancada_por, lancada_em)
+         VALUES ($1,$2,$3,FALSE,$4,NOW())
+         ON CONFLICT (avaliacao_id, matricula_id)
+         DO UPDATE SET nota = EXCLUDED.nota, lancada_por = EXCLUDED.lancada_por, lancada_em = NOW()
+         WHERE notas.manual = FALSE`,
+        [avId, a.matricula_id, a.nota, req.usuario.id]);
+      lancadas += u.rowCount;
+    }
+    await client.query('COMMIT'); client.release();
+    res.json({ ok: true, lancadas, total: alunos.length });
+  } catch (e) { try { await client.query('ROLLBACK'); } catch(_){} client.release(); console.error('Erro lançar desempenho:', e); res.status(500).json({ erro: 'Erro ao lançar as notas.' }); }
+});
+
 // ---------- Portal dos Pais: acadêmico (professor -> responsável) ----------
 async function vinculoOk(respId, alunoId) {
   const r = await pool.query(`SELECT 1 FROM aluno_responsavel WHERE responsavel_id = $1 AND aluno_id = $2`, [respId, alunoId]);
@@ -5306,7 +5374,7 @@ async function montarCalendario(semestre) {
 }
 
 app.get('/calendario', autenticar, async (req, res) => {
-  try { res.json(await montarCalendario(req.query.semestre)); }
+  try { res.set('Cache-Control', 'no-store'); res.json(await montarCalendario(req.query.semestre)); }
   catch (e) { console.error('Erro GET calendario:', e); res.status(500).json({ erro: 'Erro ao carregar o calendário.' }); }
 });
 
@@ -5350,7 +5418,7 @@ app.delete('/calendario/:id', autenticar, somenteGestao, async (req, res) => {
 
 // Portal dos Pais: leitura do calendário do semestre vigente
 app.get('/publico/portal/calendario', autenticarResponsavel, async (req, res) => {
-  try { res.json(await montarCalendario(req.query.semestre)); }
+  try { res.set('Cache-Control', 'no-store'); res.json(await montarCalendario(req.query.semestre)); }
   catch (e) { console.error('Erro calendario portal:', e); res.status(500).json({ erro: 'Erro ao carregar o calendário.' }); }
 });
 
