@@ -4740,18 +4740,26 @@ app.post('/admin/notas', autenticar, somenteGestao, async (req, res) => {
 });
 
 // ===== Notas da Plataforma: prévia e lançamento manual (turma + período de atividades) =====
-async function previaDesempenho(turmaId, de, ate) {
-  const de0 = Math.max(0, Number(de) - 1), ate0 = Math.max(de0, Number(ate) - 1);
+async function previaDesempenho(turmaId, inicio, fim) {
+  // As atividades consideradas são as trabalhadas pela turma no período (datas); a nota é a conclusão dessas atividades.
   const q = await pool.query(
     `WITH alu AS (
        SELECT m.id AS matricula_id, m.aluno_id, a.nome
          FROM matriculas m JOIN alunos a ON a.id = m.aluno_id
         WHERE m.turma_id = $1 AND m.status = 'ativa'
      ),
+     pacts AS (
+       SELECT DISTINCT atividade_idx
+         FROM english_platform_progresso
+        WHERE estacao <> 'resumo'
+          AND (atualizado_em AT TIME ZONE 'America/Fortaleza')::date BETWEEN $2 AND $3
+          AND aluno_id IN (SELECT aluno_id FROM alu)
+     ),
      prog AS (
        SELECT aluno_id, atividade_idx, estacao, concluida
          FROM english_platform_progresso
-        WHERE estacao <> 'resumo' AND atividade_idx BETWEEN $2 AND $3
+        WHERE estacao <> 'resumo'
+          AND atividade_idx IN (SELECT atividade_idx FROM pacts)
           AND aluno_id IN (SELECT aluno_id FROM alu)
      ),
      spa AS (
@@ -4760,12 +4768,13 @@ async function previaDesempenho(turmaId, de, ate) {
      )
      SELECT al.matricula_id, al.nome,
             COALESCE((SELECT COUNT(*) FROM prog p WHERE p.aluno_id = al.aluno_id AND p.concluida), 0)::int AS feitas,
-            (SELECT n FROM spa)::int AS spa
-       FROM alu al ORDER BY al.nome`, [turmaId, de0, ate0]);
-  const nAtiv = ate0 - de0 + 1;
+            (SELECT n FROM spa)::int AS spa,
+            (SELECT COUNT(*) FROM pacts)::int AS nact
+       FROM alu al ORDER BY al.nome`, [turmaId, inicio, fim]);
   return q.rows.map(r => {
     const spa = Number(r.spa) || 5;
-    const expected = nAtiv * spa;
+    const nact = Number(r.nact) || 0;
+    const expected = nact * spa;
     const pct = expected > 0 ? Math.min(100, Math.round(Number(r.feitas) / expected * 100)) : 0;
     const nota = Math.min(10, Math.round(pct) / 10);
     return { matricula_id: r.matricula_id, nome: r.nome, feitas: Number(r.feitas), pct, nota };
@@ -4773,23 +4782,25 @@ async function previaDesempenho(turmaId, de, ate) {
 }
 app.get('/admin/turmas/:id/desempenho-previa', autenticar, somenteGestao, async (req, res) => {
   try {
-    const de = Number(req.query.de) || 1, ate = Number(req.query.ate) || de;
+    const inicio = String(req.query.inicio || '').slice(0, 10), fim = String(req.query.fim || '').slice(0, 10);
+    if (!inicio || !fim) return res.status(400).json({ erro: 'Informe o período inicial e final.' });
     const t = await pool.query(`SELECT id, nome FROM turmas WHERE id = $1`, [req.params.id]);
     if (!t.rows.length) return res.status(404).json({ erro: 'Turma não encontrada.' });
-    const alunos = await previaDesempenho(req.params.id, de, ate);
-    res.json({ turma: t.rows[0], de, ate, alunos });
+    const alunos = await previaDesempenho(req.params.id, inicio, fim);
+    res.json({ turma: t.rows[0], inicio, fim, alunos });
   } catch (e) { console.error('Erro prévia desempenho:', e); res.status(500).json({ erro: 'Erro ao gerar a prévia.' }); }
 });
 app.post('/admin/turmas/:id/desempenho-lancar', autenticar, somenteGestao, async (req, res) => {
   const client = await pool.connect();
   try {
-    const de = Number(req.body.de) || 1, ate = Number(req.body.ate) || de, bimestre = Number(req.body.bimestre) || 1;
+    const inicio = String(req.body.inicio || '').slice(0, 10), fim = String(req.body.fim || '').slice(0, 10), bimestre = Number(req.body.bimestre) || 1;
+    if (!inicio || !fim) { client.release(); return res.status(400).json({ erro: 'Informe o período inicial e final.' }); }
     const av = await pool.query(
       `SELECT id FROM avaliacoes WHERE turma_id = $1 AND bimestre = $2 AND nome ILIKE '%desempenho%plataforma%' ORDER BY id LIMIT 1`,
       [req.params.id, bimestre]);
     if (!av.rows.length) { client.release(); return res.status(400).json({ erro: 'A avaliação "Desempenho na Plataforma" do ' + bimestre + 'º bimestre não existe nesta turma. Aplique o modelo de avaliações primeiro.' }); }
     const avId = av.rows[0].id;
-    const alunos = await previaDesempenho(req.params.id, de, ate);
+    const alunos = await previaDesempenho(req.params.id, inicio, fim);
     await client.query('BEGIN');
     let lancadas = 0;
     for (const a of alunos) {
