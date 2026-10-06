@@ -661,12 +661,27 @@ async function initDB() {
     estacao TEXT NOT NULL,
     concluida BOOLEAN NOT NULL DEFAULT FALSE,
     respostas JSONB,
-    audio_base64 TEXT,
-    audio_mime TEXT,
     atualizado_em TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     UNIQUE (aluno_id, modulo_key, atividade_idx, estacao)
   )`);
   await migrar('idx_ep_prog_aluno', `CREATE INDEX IF NOT EXISTS idx_ep_prog_aluno ON english_platform_progresso (aluno_id)`);
+  // Áudio separado da tabela de progresso (tira os blobs da tabela quente; reduz backup).
+  await migrar('ep_audio_tabela', `CREATE TABLE IF NOT EXISTS english_platform_audio (
+    progresso_id INTEGER PRIMARY KEY REFERENCES english_platform_progresso(id) ON DELETE CASCADE,
+    audio_base64 TEXT NOT NULL,
+    audio_mime TEXT,
+    atualizado_em TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  )`);
+  await migrar('ep_audio_migrar', `DO $mig$ BEGIN
+    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'english_platform_progresso' AND column_name = 'audio_base64') THEN
+      INSERT INTO english_platform_audio (progresso_id, audio_base64, audio_mime, atualizado_em)
+        SELECT id, audio_base64, COALESCE(audio_mime, 'audio/webm'), atualizado_em
+          FROM english_platform_progresso WHERE audio_base64 IS NOT NULL
+        ON CONFLICT (progresso_id) DO NOTHING;
+      ALTER TABLE english_platform_progresso DROP COLUMN audio_base64;
+      ALTER TABLE english_platform_progresso DROP COLUMN audio_mime;
+    END IF;
+  END $mig$;`);
   // SVA (Atividade Programada Virtual): conclusão por aluno (existir a linha = concluiu).
   await migrar('sva_conclusoes', `CREATE TABLE IF NOT EXISTS sva_conclusoes (
     aluno_id INTEGER PRIMARY KEY REFERENCES alunos(id) ON DELETE CASCADE,
@@ -764,6 +779,7 @@ async function initDB() {
   await migrar('idx_cr_competencia', `CREATE INDEX IF NOT EXISTS idx_cr_competencia ON contas_receber (competencia)`);
   await migrar('idx_professor_horas_prof', `CREATE INDEX IF NOT EXISTS idx_professor_horas_prof ON professor_horas (professor_id, data)`);
   await migrar('idx_ep_prog_ativ', `CREATE INDEX IF NOT EXISTS idx_ep_prog_ativ ON english_platform_progresso (aluno_id, atividade_idx)`);
+  await migrar('idx_ep_prog_atualizado', `CREATE INDEX IF NOT EXISTS idx_ep_prog_atualizado ON english_platform_progresso (atualizado_em)`);
   try { await seedCalendario(); } catch (e) { falhasMigracao.push('seed calendario: ' + e.message); console.error('Falha ao semear o calendário:', e.message); }
   try { await seedConfiguracoes(); } catch (e) { falhasMigracao.push('seed configuracoes: ' + e.message); console.error('Falha ao semear as configurações:', e.message); }
   await seedCursosNiveis();
@@ -2071,7 +2087,6 @@ app.put('/admin/matriculas/:id', autenticar, somenteGestao, async (req, res) => 
 // ============================================================
 app.get('/admin/contas-receber', autenticar, somenteGestao, async (req, res) => {
   try {
-    await marcarAtrasados();
     const cond = []; const params = [];
     if (req.query.aluno_id) { params.push(req.query.aluno_id); cond.push(`cr.aluno_id = $${params.length}`); }
     if (req.query.status) { params.push(req.query.status); cond.push(`cr.status = $${params.length}`); }
@@ -2184,6 +2199,7 @@ app.post('/admin/contas-receber/:id/baixa', autenticar, somenteGestao, async (re
     const descCfg = Number(await getConfig('desconto_pontualidade', 0)) || 0;
     const sugestao = (ehMensalidade && pontual) ? Math.min(descCfg, valorFinal) : 0;
     let desconto = req.body.desconto !== undefined ? Number(req.body.desconto) || 0 : sugestao;
+    if (ehMensalidade && pontual) desconto = Math.max(desconto, sugestao); // garante o desconto automático de pontualidade
     desconto = +Math.max(0, Math.min(desconto, valorFinal)).toFixed(2);
     const juros = +Math.max(0, Number(req.body.juros || 0)).toFixed(2);
     let valorRecebido = req.body.valor_recebido !== undefined
@@ -2293,7 +2309,6 @@ app.delete('/admin/fornecedores/:id', autenticar, somenteGestao, async (req, res
 // ============================================================
 app.get('/admin/contas-pagar', autenticar, somenteGestao, async (req, res) => {
   try {
-    await marcarAtrasados();
     const cond = []; const params = [];
     if (req.query.status) { params.push(req.query.status); cond.push(`cp.status = $${params.length}`); }
     if (req.query.categoria) { params.push(req.query.categoria); cond.push(`cp.categoria = $${params.length}`); }
@@ -2361,7 +2376,6 @@ app.delete('/admin/contas-pagar/:id', autenticar, somenteGestao, async (req, res
 // ============================================================
 app.get('/admin/relatorios/financeiro', autenticar, somenteGestao, async (req, res) => {
   try {
-    await marcarAtrasados();
     const hoje = new Date();
     const ini = req.query.inicio || `${hoje.getFullYear()}-${String(hoje.getMonth() + 1).padStart(2, '0')}-01`;
     const fim = req.query.fim || hoje.toISOString().slice(0, 10);
@@ -2420,7 +2434,6 @@ app.get('/admin/relatorios/turmas', autenticar, somenteGestao, async (req, res) 
 
 app.get('/admin/relatorios/financeiro-detalhado', autenticar, somenteGestao, async (req, res) => {
   try {
-    await marcarAtrasados();
     const hoje = new Date();
     const ini = req.query.inicio || `${hoje.getFullYear()}-${String(hoje.getMonth() + 1).padStart(2, '0')}-01`;
     const fim = req.query.fim || hoje.toISOString().slice(0, 10);
@@ -2800,16 +2813,22 @@ app.post('/publico/portal/english-platform/progresso', autenticarResponsavel, as
     if (audio && audio.length > 4200000) audio = null; // ~3 MB máx. de áudio por estação (protege o banco)
     const mime = audio ? String(b.audio_mime || 'audio/webm').slice(0, 40) : null;
     const respostas = (b.respostas && typeof b.respostas === 'object') ? b.respostas : {};
-    await pool.query(
-      `INSERT INTO english_platform_progresso (aluno_id, modulo_key, atividade_idx, estacao, concluida, respostas, audio_base64, audio_mime, atualizado_em)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW())
+    const up = await pool.query(
+      `INSERT INTO english_platform_progresso (aluno_id, modulo_key, atividade_idx, estacao, concluida, respostas, atualizado_em)
+       VALUES ($1,$2,$3,$4,$5,$6,NOW())
        ON CONFLICT (aluno_id, modulo_key, atividade_idx, estacao) DO UPDATE SET
          concluida = EXCLUDED.concluida,
          respostas = EXCLUDED.respostas,
-         audio_base64 = COALESCE(EXCLUDED.audio_base64, english_platform_progresso.audio_base64),
-         audio_mime = COALESCE(EXCLUDED.audio_mime, english_platform_progresso.audio_mime),
-         atualizado_em = NOW()`,
-      [alunoId, modulo, atividade, estacao, b.concluida !== false, JSON.stringify(respostas), audio, mime]);
+         atualizado_em = NOW()
+       RETURNING id`,
+      [alunoId, modulo, atividade, estacao, b.concluida !== false, JSON.stringify(respostas)]);
+    if (audio && up.rows.length) {
+      await pool.query(
+        `INSERT INTO english_platform_audio (progresso_id, audio_base64, audio_mime, atualizado_em)
+         VALUES ($1,$2,$3,NOW())
+         ON CONFLICT (progresso_id) DO UPDATE SET audio_base64 = EXCLUDED.audio_base64, audio_mime = EXCLUDED.audio_mime, atualizado_em = NOW()`,
+        [up.rows[0].id, audio, mime]);
+    }
     // nota de desempenho agora é lançada manualmente (tela Notas da Plataforma), não mais no salvamento
     res.json({ ok: true });
   } catch (e) { console.error('Erro salvar progresso EP:', e); res.status(500).json({ erro: 'Erro ao salvar o progresso.' }); }
@@ -2821,7 +2840,7 @@ app.get('/publico/portal/english-platform/progresso', autenticarResponsavel, asy
     const pert = await pool.query(`SELECT 1 FROM aluno_responsavel WHERE aluno_id = $1 AND responsavel_id = $2`, [alunoId, req.responsavelId]);
     if (!pert.rows.length) return res.status(403).json({ erro: 'Aluno não vinculado a este responsável.' });
     const r = await pool.query(
-      `SELECT modulo_key, atividade_idx, estacao, concluida, (audio_base64 IS NOT NULL) AS tem_audio, atualizado_em
+      `SELECT modulo_key, atividade_idx, estacao, concluida, (EXISTS (SELECT 1 FROM english_platform_audio ea WHERE ea.progresso_id = english_platform_progresso.id)) AS tem_audio, atualizado_em
          FROM english_platform_progresso WHERE aluno_id = $1`, [alunoId]);
     res.json({ itens: r.rows });
   } catch (e) { console.error('Erro carregar progresso EP:', e); res.status(500).json({ erro: 'Erro ao carregar o progresso.' }); }
@@ -2834,7 +2853,7 @@ app.get('/publico/portal/english-platform/relatorio', autenticarResponsavel, asy
     if (!pert.rows.length) return res.status(403).json({ erro: 'Aluno não vinculado a este responsável.' });
     const r = await pool.query(
       `SELECT id, modulo_key, atividade_idx, estacao, concluida, respostas,
-              (audio_base64 IS NOT NULL) AS tem_audio, atualizado_em
+              (EXISTS (SELECT 1 FROM english_platform_audio ea WHERE ea.progresso_id = english_platform_progresso.id)) AS tem_audio, atualizado_em
          FROM english_platform_progresso
         WHERE aluno_id = $1
         ORDER BY modulo_key, atividade_idx, estacao`, [alunoId]);
@@ -2876,10 +2895,11 @@ app.get('/publico/portal/english-platform/sva-status', autenticarResponsavel, as
 app.get('/publico/portal/english-platform/progresso-audio/:id', autenticarResponsavel, async (req, res) => {
   try {
     const r = await pool.query(
-      `SELECT p.audio_base64, p.audio_mime
-         FROM english_platform_progresso p
+      `SELECT ea.audio_base64, ea.audio_mime
+         FROM english_platform_audio ea
+         JOIN english_platform_progresso p ON p.id = ea.progresso_id
          JOIN aluno_responsavel ar ON ar.aluno_id = p.aluno_id
-        WHERE p.id = $1 AND ar.responsavel_id = $2`, [Number(req.params.id), req.responsavelId]);
+        WHERE ea.progresso_id = $1 AND ar.responsavel_id = $2`, [Number(req.params.id), req.responsavelId]);
     if (!r.rows.length || !r.rows[0].audio_base64) return res.status(404).json({ erro: 'Áudio não encontrado.' });
     res.json({ audio_base64: r.rows[0].audio_base64, audio_mime: r.rows[0].audio_mime || 'audio/webm' });
   } catch (e) { console.error('Erro áudio EP (pais):', e); res.status(500).json({ erro: 'Erro ao carregar o áudio.' }); }
@@ -3169,7 +3189,7 @@ app.get('/admin/english-platform/progresso/:alunoId', autenticar, exigirPerfil('
     if (!al.rows.length) return res.status(404).json({ erro: 'Aluno não encontrado.' });
     const r = await pool.query(
       `SELECT id, modulo_key, atividade_idx, estacao, concluida, respostas,
-              (audio_base64 IS NOT NULL) AS tem_audio, atualizado_em
+              (EXISTS (SELECT 1 FROM english_platform_audio ea WHERE ea.progresso_id = english_platform_progresso.id)) AS tem_audio, atualizado_em
          FROM english_platform_progresso
         WHERE aluno_id = $1
         ORDER BY modulo_key, atividade_idx, estacao`, [alunoId]);
@@ -3178,7 +3198,7 @@ app.get('/admin/english-platform/progresso/:alunoId', autenticar, exigirPerfil('
 });
 app.get('/admin/english-platform/progresso-audio/:id', autenticar, exigirPerfil('master'), async (req, res) => {
   try {
-    const r = await pool.query(`SELECT audio_base64, audio_mime FROM english_platform_progresso WHERE id = $1`, [Number(req.params.id)]);
+    const r = await pool.query(`SELECT audio_base64, audio_mime FROM english_platform_audio WHERE progresso_id = $1`, [Number(req.params.id)]);
     if (!r.rows.length || !r.rows[0].audio_base64) return res.status(404).json({ erro: 'Áudio não encontrado.' });
     res.json({ audio_base64: r.rows[0].audio_base64, audio_mime: r.rows[0].audio_mime || 'audio/webm' });
   } catch (e) { console.error('Erro áudio EP (admin):', e); res.status(500).json({ erro: 'Erro ao carregar o áudio.' }); }
@@ -4774,7 +4794,8 @@ async function previaDesempenho(turmaId, inicio, fim) {
        SELECT DISTINCT atividade_idx
          FROM english_platform_progresso
         WHERE estacao <> 'resumo'
-          AND (atualizado_em AT TIME ZONE 'America/Fortaleza')::date BETWEEN $2 AND $3
+          AND atualizado_em >= ($2::date::timestamp AT TIME ZONE 'America/Fortaleza')
+          AND atualizado_em <  (($3::date + INTERVAL '1 day')::timestamp AT TIME ZONE 'America/Fortaleza')
           AND aluno_id IN (SELECT aluno_id FROM alu)
      ),
      prog AS (
@@ -6748,4 +6769,6 @@ initDB()
     console.log(`CEMIC Gestão — backend v4.2 rodando na porta ${PORT}`);
     if (erroInicializacao) console.error('ATENÇÃO: o sistema subiu com falha de inicialização —', erroInicializacao);
     if (falhasMigracao.length) console.error('ATENÇÃO: migrações com falha —', falhasMigracao.join(' | '));
+    marcarAtrasados().catch(() => {});
+    setInterval(() => marcarAtrasados().catch(() => {}), 6 * 60 * 60 * 1000);
   }));
