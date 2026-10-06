@@ -882,7 +882,8 @@ async function seedConfiguracoes() {
       }
     }), 'Composição da nota por bimestre (etapas e pesos) — base para as avaliações das turmas'],
     ['calendario_observacao', JSON.stringify('O presente calendário está sujeito a modificações, considerando o Calendário Escolar Regular do IEMA Pleno Dr.º João Bacelar Portela.'), 'Observação exibida ao pé do calendário acadêmico'],
-    ['valor_hora_aula', JSON.stringify(0), 'Valor padrão da hora-aula do professor (R$)']
+    ['valor_hora_aula', JSON.stringify(0), 'Valor padrão da hora-aula do professor (R$)'],
+    ['bimestre_periodos', JSON.stringify({ '1': { inicio: '2026-08-01', fim: '2026-10-15' }, '2': { inicio: '2026-10-16', fim: '2026-12-14' } }), 'Períodos dos bimestres (início e fim) usados na geração de notas da Plataforma']
   ];
   for (const [chave, valor, descricao] of padroes) {
     await pool.query(
