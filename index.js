@@ -39,7 +39,11 @@ const MASTER_SENHA = process.env.MASTER_SENHA || null; // se ausente, master só
 
 const pool = new Pool({
   connectionString: DATABASE_URL,
-  ssl: { rejectUnauthorized: false }
+  ssl: { rejectUnauthorized: false },
+  max: 25,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 10000,
+  statement_timeout: 30000
 });
 
 // ============================================================
@@ -747,6 +751,19 @@ async function initDB() {
   await migrar('idx_ar_responsavel', `CREATE INDEX IF NOT EXISTS idx_ar_responsavel ON aluno_responsavel (responsavel_id)`);
   await migrar('idx_ar_aluno', `CREATE INDEX IF NOT EXISTS idx_ar_aluno ON aluno_responsavel (aluno_id)`);
   await migrar('idx_matriculas_aluno', `CREATE INDEX IF NOT EXISTS idx_matriculas_aluno ON matriculas (aluno_id, status)`);
+  // Índices adicionais nas tabelas quentes (análise de desempenho).
+  await migrar('idx_avaliacoes_turma', `CREATE INDEX IF NOT EXISTS idx_avaliacoes_turma ON avaliacoes (turma_id)`);
+  await migrar('idx_notas_matricula', `CREATE INDEX IF NOT EXISTS idx_notas_matricula ON notas (matricula_id)`);
+  await migrar('idx_aulas_turma', `CREATE INDEX IF NOT EXISTS idx_aulas_turma ON aulas (turma_id, data)`);
+  await migrar('idx_frequencias_aula', `CREATE INDEX IF NOT EXISTS idx_frequencias_aula ON frequencias (aula_id)`);
+  await migrar('idx_matriculas_turma', `CREATE INDEX IF NOT EXISTS idx_matriculas_turma ON matriculas (turma_id, status)`);
+  await migrar('idx_turmas_professor', `CREATE INDEX IF NOT EXISTS idx_turmas_professor ON turmas (professor_id)`);
+  await migrar('idx_cr_aluno', `CREATE INDEX IF NOT EXISTS idx_cr_aluno ON contas_receber (aluno_id)`);
+  await migrar('idx_cr_matricula', `CREATE INDEX IF NOT EXISTS idx_cr_matricula ON contas_receber (matricula_id)`);
+  await migrar('idx_cr_status_venc', `CREATE INDEX IF NOT EXISTS idx_cr_status_venc ON contas_receber (status, vencimento)`);
+  await migrar('idx_cr_competencia', `CREATE INDEX IF NOT EXISTS idx_cr_competencia ON contas_receber (competencia)`);
+  await migrar('idx_professor_horas_prof', `CREATE INDEX IF NOT EXISTS idx_professor_horas_prof ON professor_horas (professor_id, data)`);
+  await migrar('idx_ep_prog_ativ', `CREATE INDEX IF NOT EXISTS idx_ep_prog_ativ ON english_platform_progresso (aluno_id, atividade_idx)`);
   try { await seedCalendario(); } catch (e) { falhasMigracao.push('seed calendario: ' + e.message); console.error('Falha ao semear o calendário:', e.message); }
   try { await seedConfiguracoes(); } catch (e) { falhasMigracao.push('seed configuracoes: ' + e.message); console.error('Falha ao semear as configurações:', e.message); }
   await seedCursosNiveis();
@@ -4181,13 +4198,14 @@ app.post('/professor/aulas/:id/chamada', autenticar, somenteProfessor, async (re
     const lista = Array.isArray(req.body.presencas) ? req.body.presencas : [];
     if (!lista.length) { client.release(); return res.status(400).json({ erro: 'Nenhuma presença informada.' }); }
     await client.query('BEGIN');
-    for (const p of lista) {
+    if (lista.length) {
+      const vals = [], params = [];
+      lista.forEach((p, i) => { const base = i * 4; vals.push(`($${base+1},$${base+2},$${base+3},$${base+4})`); params.push(req.params.id, Number(p.matricula_id), p.presente !== false, (p.justificativa || '').trim() || null); });
       await client.query(
         `INSERT INTO frequencias (aula_id, matricula_id, presente, justificativa)
-         VALUES ($1,$2,$3,$4)
+         VALUES ${vals.join(',')}
          ON CONFLICT (aula_id, matricula_id)
-         DO UPDATE SET presente = EXCLUDED.presente, justificativa = EXCLUDED.justificativa`,
-        [req.params.id, Number(p.matricula_id), p.presente !== false, (p.justificativa || '').trim() || null]);
+         DO UPDATE SET presente = EXCLUDED.presente, justificativa = EXCLUDED.justificativa`, params);
     }
     // Faltas com justificativa já DEFERIDA nesta data entram automaticamente como "justificada"
     await client.query(
@@ -4714,25 +4732,29 @@ app.post('/admin/notas', autenticar, somenteGestao, async (req, res) => {
     if (!lista.length) { client.release(); return res.status(400).json({ erro: 'Nenhuma nota informada.' }); }
     await client.query('BEGIN');
     let salvas = 0, removidas = 0;
+    const upserts = [], deletes = [];
     for (const it of lista) {
       const av = Number(it.avaliacao_id), mat = Number(it.matricula_id);
       if (!av || !mat) continue;
       const vazio = (it.nota === null || it.nota === '' || it.nota === undefined);
-      if (vazio) {
-        const d = await client.query(`DELETE FROM notas WHERE avaliacao_id = $1 AND matricula_id = $2`, [av, mat]);
-        removidas += d.rowCount;
-      } else {
-        let v = Number(String(it.nota).replace(',', '.'));
-        if (!Number.isFinite(v)) continue;
-        v = Math.max(0, Math.min(10, v));
-        await client.query(
-          `INSERT INTO notas (avaliacao_id, matricula_id, nota, manual, lancada_por, lancada_em)
-           VALUES ($1,$2,$3,TRUE,$4,NOW())
-           ON CONFLICT (avaliacao_id, matricula_id)
-           DO UPDATE SET nota = EXCLUDED.nota, manual = TRUE, lancada_por = EXCLUDED.lancada_por, lancada_em = NOW()`,
-          [av, mat, v, req.usuario.id]);
-        salvas++;
-      }
+      if (vazio) { deletes.push([av, mat]); }
+      else { let v = Number(String(it.nota).replace(',', '.')); if (!Number.isFinite(v)) continue; v = Math.max(0, Math.min(10, v)); upserts.push([av, mat, v]); }
+    }
+    if (upserts.length) {
+      const vals = [], params = [];
+      upserts.forEach((u, i) => { const base = i * 4; vals.push(`($${base+1},$${base+2},$${base+3},TRUE,$${base+4},NOW())`); params.push(u[0], u[1], u[2], req.usuario.id); });
+      const r = await client.query(
+        `INSERT INTO notas (avaliacao_id, matricula_id, nota, manual, lancada_por, lancada_em)
+         VALUES ${vals.join(',')}
+         ON CONFLICT (avaliacao_id, matricula_id)
+         DO UPDATE SET nota = EXCLUDED.nota, manual = TRUE, lancada_por = EXCLUDED.lancada_por, lancada_em = NOW()`, params);
+      salvas = r.rowCount;
+    }
+    if (deletes.length) {
+      const conds = deletes.map((d, i) => `(avaliacao_id = $${i*2+1} AND matricula_id = $${i*2+2})`).join(' OR ');
+      const params = []; deletes.forEach(d => { params.push(d[0], d[1]); });
+      const r = await client.query(`DELETE FROM notas WHERE ${conds}`, params);
+      removidas = r.rowCount;
     }
     await client.query('COMMIT'); client.release();
     res.json({ ok: true, salvas, removidas });
@@ -4803,15 +4825,16 @@ app.post('/admin/turmas/:id/desempenho-lancar', autenticar, somenteGestao, async
     const alunos = await previaDesempenho(req.params.id, inicio, fim);
     await client.query('BEGIN');
     let lancadas = 0;
-    for (const a of alunos) {
+    if (alunos.length) {
+      const vals = [], params = [];
+      alunos.forEach((a, i) => { const base = i * 4; vals.push(`($${base+1},$${base+2},$${base+3},FALSE,$${base+4},NOW())`); params.push(avId, a.matricula_id, a.nota, req.usuario.id); });
       const u = await client.query(
         `INSERT INTO notas (avaliacao_id, matricula_id, nota, manual, lancada_por, lancada_em)
-         VALUES ($1,$2,$3,FALSE,$4,NOW())
+         VALUES ${vals.join(',')}
          ON CONFLICT (avaliacao_id, matricula_id)
          DO UPDATE SET nota = EXCLUDED.nota, lancada_por = EXCLUDED.lancada_por, lancada_em = NOW()
-         WHERE notas.manual = FALSE`,
-        [avId, a.matricula_id, a.nota, req.usuario.id]);
-      lancadas += u.rowCount;
+         WHERE notas.manual = FALSE`, params);
+      lancadas = u.rowCount;
     }
     await client.query('COMMIT'); client.release();
     res.json({ ok: true, lancadas, total: alunos.length });
