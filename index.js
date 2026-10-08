@@ -450,6 +450,18 @@ async function initDB() {
     conteudo BYTEA NOT NULL,
     enviado_em TIMESTAMP DEFAULT NOW()
   )`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS aulas_virtuais (
+    id SERIAL PRIMARY KEY,
+    turma_id INTEGER NOT NULL REFERENCES turmas(id) ON DELETE CASCADE,
+    professor_id INTEGER REFERENCES professores(id) ON DELETE SET NULL,
+    data DATE NOT NULL,
+    hora_inicio TEXT,
+    hora_fim TEXT,
+    link1 TEXT, link2 TEXT, link3 TEXT,
+    instrucoes TEXT,
+    criado_em TIMESTAMP DEFAULT NOW()
+  )`);
+  await migrar('idx_aulas_virtuais_turma', `CREATE INDEX IF NOT EXISTS idx_aulas_virtuais_turma ON aulas_virtuais (turma_id, data)`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_ocorrencias_aluno ON ocorrencias (aluno_id, data)`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_atividades_turma ON atividades (turma_id, criado_em)`);
   // ---------- Reuniões de Pais (v3.52) ----------
@@ -3620,7 +3632,8 @@ async function turmaDaAvaliacao(avId) {
 const MIMES_OK = {
   'image/jpeg': 1, 'image/png': 1, 'image/webp': 1, 'image/gif': 1, 'application/pdf': 1,
   'application/msword': 1,
-  'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 1
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 1,
+  'audio/webm': 1, 'audio/mpeg': 1, 'audio/mp4': 1, 'audio/ogg': 1, 'audio/wav': 1, 'audio/x-m4a': 1, 'audio/aac': 1, 'audio/3gpp': 1
 };
 const LIMITE_ARQUIVO = 5 * 1024 * 1024;
 
@@ -4983,6 +4996,53 @@ app.get('/publico/portal/aluno/:id/atividades', autenticarResponsavel, async (re
        GROUP BY at.id ORDER BY at.criado_em DESC`, [mat.turma_id]);
     res.json({ turma: mat.turma_nome, semestre: mat.semestre, itens: r.rows });
   } catch (e) { console.error('Erro portal atividades:', e); res.status(500).json({ erro: 'Erro ao carregar as atividades.' }); }
+});
+
+// ---------- Aula Virtual (professor cria; pais acessam) ----------
+app.get('/professor/turmas/:id/aulas-virtuais', autenticar, somenteProfessor, async (req, res) => {
+  try {
+    if (!await podeTurma(req, req.params.id)) return res.status(403).json({ erro: 'Turma não vinculada ao seu cadastro.' });
+    const r = await pool.query(`SELECT * FROM aulas_virtuais WHERE turma_id = $1 ORDER BY data DESC, hora_inicio DESC NULLS LAST, id DESC`, [req.params.id]);
+    res.json(r.rows);
+  } catch (e) { console.error('Erro GET aulas-virtuais:', e); res.status(500).json({ erro: 'Erro ao listar as aulas virtuais.' }); }
+});
+app.post('/professor/turmas/:id/aulas-virtuais', autenticar, somenteProfessor, async (req, res) => {
+  try {
+    if (!await podeTurma(req, req.params.id)) return res.status(403).json({ erro: 'Turma não vinculada ao seu cadastro.' });
+    const data = String(req.body.data || '').slice(0, 10);
+    if (!data) return res.status(400).json({ erro: 'Informe a data da aula.' });
+    const prep = (l) => { l = String(l || '').trim(); if (!l) return null; return /^https?:\/\//i.test(l) ? l : 'https://' + l; };
+    const l1 = prep(req.body.link1), l2 = prep(req.body.link2), l3 = prep(req.body.link3);
+    if (!l1 && !l2 && !l3) return res.status(400).json({ erro: 'Informe ao menos um link de acesso.' });
+    const r = await pool.query(
+      `INSERT INTO aulas_virtuais (turma_id, professor_id, data, hora_inicio, hora_fim, link1, link2, link3, instrucoes)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id`,
+      [req.params.id, escopoProfessor(req), data,
+       String(req.body.hora_inicio || '').slice(0, 5) || null, String(req.body.hora_fim || '').slice(0, 5) || null,
+       l1, l2, l3, String(req.body.instrucoes || '').trim() || null]);
+    res.status(201).json({ id: r.rows[0].id });
+  } catch (e) { console.error('Erro POST aula-virtual:', e); res.status(500).json({ erro: 'Erro ao salvar a aula virtual.' }); }
+});
+app.delete('/professor/aulas-virtuais/:id', autenticar, somenteProfessor, async (req, res) => {
+  try {
+    const q = await pool.query(`SELECT turma_id FROM aulas_virtuais WHERE id = $1`, [req.params.id]);
+    if (!q.rows.length) return res.status(404).json({ erro: 'Aula não encontrada.' });
+    if (!await podeTurma(req, q.rows[0].turma_id)) return res.status(403).json({ erro: 'Turma não vinculada ao seu cadastro.' });
+    await pool.query(`DELETE FROM aulas_virtuais WHERE id = $1`, [req.params.id]);
+    res.json({ ok: true });
+  } catch (e) { console.error('Erro DELETE aula-virtual:', e); res.status(500).json({ erro: 'Erro ao excluir a aula virtual.' }); }
+});
+app.get('/publico/portal/aluno/:id/aulas-virtuais', autenticarResponsavel, async (req, res) => {
+  try {
+    const alunoId = Number(req.params.id);
+    if (!await vinculoOk(req.responsavelId, alunoId)) return res.status(403).json({ erro: 'Acesso negado a este aluno.' });
+    const mat = await matriculaAtivaDoAluno(alunoId);
+    if (!mat) return res.json({ turma: null, itens: [] });
+    const r = await pool.query(
+      `SELECT id, data, hora_inicio, hora_fim, link1, link2, link3, instrucoes
+         FROM aulas_virtuais WHERE turma_id = $1 ORDER BY data DESC, hora_inicio DESC NULLS LAST, id DESC`, [mat.turma_id]);
+    res.json({ turma: mat.turma_nome, itens: r.rows });
+  } catch (e) { console.error('Erro portal aulas-virtuais:', e); res.status(500).json({ erro: 'Erro ao carregar as aulas virtuais.' }); }
 });
 
 // ---------- Portal: Financeiro do aluno ----------
