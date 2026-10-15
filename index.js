@@ -4865,11 +4865,35 @@ app.post('/admin/turmas/:id/desempenho-lancar', autenticar, somenteGestao, async
   try {
     const inicio = String(req.body.inicio || '').slice(0, 10), fim = String(req.body.fim || '').slice(0, 10), bimestre = Number(req.body.bimestre) || 1;
     if (!inicio || !fim) { client.release(); return res.status(400).json({ erro: 'Informe o período inicial e final.' }); }
+    // Resolve (ou cria) a avaliação "Desempenho na Plataforma" deste bimestre.
+    // Autocorreção: se a turma não teve o modelo aplicado, ou teve antes da coluna
+    // bimestre existir, cria/adota a avaliação em vez de falhar o lançamento.
+    let avId;
     const av = await pool.query(
       `SELECT id FROM avaliacoes WHERE turma_id = $1 AND bimestre = $2 AND nome ILIKE '%desempenho%plataforma%' ORDER BY id LIMIT 1`,
       [req.params.id, bimestre]);
-    if (!av.rows.length) { client.release(); return res.status(400).json({ erro: 'A avaliação "Desempenho na Plataforma" do ' + bimestre + 'º bimestre não existe nesta turma. Aplique o modelo de avaliações primeiro.' }); }
-    const avId = av.rows[0].id;
+    if (av.rows.length) {
+      avId = av.rows[0].id;
+    } else {
+      // avaliação pode existir sem bimestre (criada antes da coluna) — adota-a para este bimestre
+      const avNull = await pool.query(
+        `SELECT id FROM avaliacoes WHERE turma_id = $1 AND bimestre IS NULL AND nome ILIKE '%desempenho%plataforma%' ORDER BY id LIMIT 1`,
+        [req.params.id]);
+      if (avNull.rows.length) {
+        avId = avNull.rows[0].id;
+        await pool.query(`UPDATE avaliacoes SET bimestre = $1 WHERE id = $2`, [bimestre, avId]);
+      } else {
+        // cria a avaliação a partir do modelo (peso do modelo; 1 como padrão)
+        const modelo = await getConfig('sistema_avaliacao', null);
+        const etapas = (modelo && modelo.etapas && modelo.etapas[String(bimestre)]) || [];
+        const et = etapas.find(e => /desempenho.*plataforma/i.test(e && e.nome || ''));
+        const peso = et && Number(et.peso) > 0 ? Number(et.peso) : 1;
+        const ins = await pool.query(
+          `INSERT INTO avaliacoes (turma_id, nome, peso, bimestre) VALUES ($1,$2,$3,$4) RETURNING id`,
+          [req.params.id, 'Desempenho na Plataforma', peso, bimestre]);
+        avId = ins.rows[0].id;
+      }
+    }
     const alunos = (await previaDesempenho(req.params.id, inicio, fim)).alunos;
     await client.query('BEGIN');
     let lancadas = 0;
@@ -6823,7 +6847,7 @@ app.get('/health', async (req, res) => {
     res.json({
       status: (erroInicializacao || falhasMigracao.length) ? 'degradado' : 'ok',
       sistema: 'CEMIC Gestão',
-      versao: '4.2 (PIX: segundo QR/chave para parcelas vencidas)',
+      versao: '4.3 (Notas da Plataforma: autocria a avaliação Desempenho na Plataforma no lançamento)',
       inicializacao: erroInicializacao || 'ok',
       migracoes_com_falha: falhasMigracao
     });
@@ -6840,7 +6864,7 @@ initDB()
     console.error('Falha ao inicializar o banco:', e);
   })
   .finally(() => app.listen(PORT, () => {
-    console.log(`CEMIC Gestão — backend v4.2 rodando na porta ${PORT}`);
+    console.log(`CEMIC Gestão — backend v4.3 rodando na porta ${PORT}`);
     if (erroInicializacao) console.error('ATENÇÃO: o sistema subiu com falha de inicialização —', erroInicializacao);
     if (falhasMigracao.length) console.error('ATENÇÃO: migrações com falha —', falhasMigracao.join(' | '));
     marcarAtrasados().catch(() => {});
