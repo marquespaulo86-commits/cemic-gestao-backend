@@ -5231,10 +5231,26 @@ app.post('/admin/pix-comprovantes/:id/baixar', autenticar, somenteGestao, async 
     if (!c.rows.length) { await client.query('ROLLBACK'); client.release(); return res.status(404).json({ erro: 'Comprovante não encontrado.' }); }
     let contaPaga = null;
     if (c.rows[0].conta_id) {
-      const up = await client.query(
-        `UPDATE contas_receber SET status='paga', data_pagamento=CURRENT_DATE, forma_pagamento='PIX', recebido_por=$2 WHERE id=$1 AND status <> 'paga' RETURNING id`,
-        [c.rows[0].conta_id, req.usuario.id]);
-      contaPaga = up.rows.length ? c.rows[0].conta_id : null;
+      // Mesmo critério da baixa manual: mensalidade paga até o vencimento ganha o desconto de pontualidade.
+      // Data e pontualidade no fuso America/Fortaleza para não errar por 1 dia.
+      const ct = await client.query(
+        `SELECT id, descricao, valor_final,
+                ((NOW() AT TIME ZONE 'America/Fortaleza')::date <= vencimento) AS pontual
+           FROM contas_receber WHERE id = $1 AND status <> 'paga' FOR UPDATE`,
+        [c.rows[0].conta_id]);
+      if (ct.rows.length) {
+        const conta = ct.rows[0];
+        const valorFinal = Number(conta.valor_final);
+        const ehMensalidade = String(conta.descricao || '').startsWith('Mensalidade');
+        const descCfg = Number(await getConfig('desconto_pontualidade', 0)) || 0;
+        const desconto = (ehMensalidade && conta.pontual) ? +Math.max(0, Math.min(descCfg, valorFinal)).toFixed(2) : 0;
+        const valorRecebido = +Math.max(0, valorFinal - desconto).toFixed(2);
+        await client.query(
+          `UPDATE contas_receber SET status='paga', data_pagamento=(NOW() AT TIME ZONE 'America/Fortaleza')::date,
+                  forma_pagamento='PIX', desconto_pontualidade=$2, valor_recebido=$3, recebido_por=$4 WHERE id=$1`,
+          [conta.id, desconto, valorRecebido, req.usuario.id]);
+        contaPaga = conta.id;
+      }
     }
     await client.query(`UPDATE pix_comprovantes SET status='baixado', resolvido_em=NOW(), resolvido_por=$2 WHERE id=$1`, [id, req.usuario.id]);
     await client.query('COMMIT'); client.release();
@@ -6888,7 +6904,7 @@ app.get('/health', async (req, res) => {
     res.json({
       status: (erroInicializacao || falhasMigracao.length) ? 'degradado' : 'ok',
       sistema: 'CEMIC Gestão',
-      versao: '4.5 (Relatorio individual de desempenho na English Platform no admin)',
+      versao: '4.6 (PIX comprovante: baixa aplica o desconto de pontualidade da mensalidade)',
       inicializacao: erroInicializacao || 'ok',
       migracoes_com_falha: falhasMigracao
     });
@@ -6905,7 +6921,7 @@ initDB()
     console.error('Falha ao inicializar o banco:', e);
   })
   .finally(() => app.listen(PORT, () => {
-    console.log(`CEMIC Gestão — backend v4.5 rodando na porta ${PORT}`);
+    console.log(`CEMIC Gestão — backend v4.6 rodando na porta ${PORT}`);
     if (erroInicializacao) console.error('ATENÇÃO: o sistema subiu com falha de inicialização —', erroInicializacao);
     if (falhasMigracao.length) console.error('ATENÇÃO: migrações com falha —', falhasMigracao.join(' | '));
     marcarAtrasados().catch(() => {});
