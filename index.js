@@ -4746,15 +4746,28 @@ app.get('/admin/turmas/:id/notas-grade', autenticar, somenteGestao, async (req, 
       `SELECT id, nome, peso, bimestre, (nome ILIKE '%desempenho%plataforma%') AS auto
          FROM avaliacoes WHERE turma_id = $1 ORDER BY bimestre NULLS FIRST, id`, [req.params.id]);
     const alunos = await pool.query(
-      `SELECT m.id AS matricula_id, a.nome FROM matriculas m JOIN alunos a ON a.id = m.aluno_id
+      `SELECT m.id AS matricula_id, a.id AS aluno_id, a.nome FROM matriculas m JOIN alunos a ON a.id = m.aluno_id
         WHERE m.turma_id = $1 AND m.status = 'ativa' ORDER BY a.nome`, [req.params.id]);
     const notas = await pool.query(
       `SELECT n.avaliacao_id, n.matricula_id, n.nota, n.manual
          FROM notas n JOIN avaliacoes av ON av.id = n.avaliacao_id WHERE av.turma_id = $1`, [req.params.id]);
     const mapa = {};
     notas.rows.forEach(n => { (mapa[n.matricula_id] = mapa[n.matricula_id] || {})[n.avaliacao_id] = { nota: Number(n.nota), manual: n.manual }; });
-    res.json({ turma: t.rows[0], avaliacoes: avs.rows, alunos: alunos.rows.map(al => ({ matricula_id: al.matricula_id, nome: al.nome, notas: mapa[al.matricula_id] || {} })) });
+    res.json({ turma: t.rows[0], avaliacoes: avs.rows, alunos: alunos.rows.map(al => ({ matricula_id: al.matricula_id, aluno_id: al.aluno_id, nome: al.nome, notas: mapa[al.matricula_id] || {} })) });
   } catch (e) { console.error('Erro grade de notas:', e); res.status(500).json({ erro: 'Erro ao carregar as notas.' }); }
+});
+
+app.get('/admin/alunos/:id/english-platform-desempenho', autenticar, somenteGestao, async (req, res) => {
+  try {
+    const al = await pool.query(`SELECT id, nome FROM alunos WHERE id = $1`, [req.params.id]);
+    if (!al.rows.length) return res.status(404).json({ erro: 'Aluno não encontrado.' });
+    const r = await pool.query(
+      `SELECT modulo_key, atividade_idx, estacao, concluida, respostas
+         FROM english_platform_progresso
+        WHERE aluno_id = $1
+        ORDER BY modulo_key, atividade_idx, estacao`, [req.params.id]);
+    res.json({ aluno: al.rows[0], itens: r.rows });
+  } catch (e) { console.error('Erro desempenho EP (admin):', e); res.status(500).json({ erro: 'Erro ao carregar o desempenho do aluno.' }); }
 });
 app.post('/admin/notas', autenticar, somenteGestao, async (req, res) => {
   const client = await pool.connect();
@@ -6875,7 +6888,7 @@ app.get('/health', async (req, res) => {
     res.json({
       status: (erroInicializacao || falhasMigracao.length) ? 'degradado' : 'ok',
       sistema: 'CEMIC Gestão',
-      versao: '4.4 (Nota da Plataforma = acerto da 1a tentativa; erros visiveis ao aluno e aos pais)',
+      versao: '4.5 (Relatorio individual de desempenho na English Platform no admin)',
       inicializacao: erroInicializacao || 'ok',
       migracoes_com_falha: falhasMigracao
     });
@@ -6892,7 +6905,7 @@ initDB()
     console.error('Falha ao inicializar o banco:', e);
   })
   .finally(() => app.listen(PORT, () => {
-    console.log(`CEMIC Gestão — backend v4.4 rodando na porta ${PORT}`);
+    console.log(`CEMIC Gestão — backend v4.5 rodando na porta ${PORT}`);
     if (erroInicializacao) console.error('ATENÇÃO: o sistema subiu com falha de inicialização —', erroInicializacao);
     if (falhasMigracao.length) console.error('ATENÇÃO: migrações com falha —', falhasMigracao.join(' | '));
     marcarAtrasados().catch(() => {});
