@@ -2779,19 +2779,16 @@ app.get('/publico/portal/english-platform/status', autenticarResponsavel, async 
 // ===== Desempenho na Plataforma: nota automática (0-100% -> 0-10) =====
 async function computeDesempenhoPct(alunoId) {
   const q = await pool.query(
-    `WITH prog AS (
-       SELECT atividade_idx, estacao, concluida
-         FROM english_platform_progresso
-        WHERE aluno_id = $1 AND estacao <> 'resumo'
-     )
-     SELECT (SELECT MAX(atividade_idx) FROM prog) AS maxidx,
-            (SELECT MAX(c) FROM (SELECT COUNT(DISTINCT estacao) AS c FROM prog GROUP BY atividade_idx) z) AS spa,
-            (SELECT COUNT(*) FROM prog WHERE concluida) AS feitas`, [alunoId]);
+    `SELECT COALESCE(SUM((respostas->>'acertos')::int),0) AS acertos,
+            COALESCE(SUM((respostas->>'total')::int),0)  AS total
+       FROM english_platform_progresso
+      WHERE aluno_id = $1 AND estacao IN ('listening','vocab','check')
+        AND respostas ? 'total' AND (respostas->>'total') ~ '^[0-9]+$'`, [alunoId]);
   const row = q.rows[0];
-  if (!row || row.maxidx == null || !Number(row.spa)) return null;
-  const expected = (Number(row.maxidx) + 1) * Number(row.spa); // atividades postadas x estações obrigatórias
-  if (expected <= 0) return null;
-  return Math.min(100, Math.round(Number(row.feitas) / expected * 100));
+  const total = Number(row && row.total) || 0;
+  if (total <= 0) return null;            // sem correcao registrada ainda (atividade antiga)
+  const acertos = Number(row.acertos) || 0;
+  return Math.min(100, Math.round(acertos / total * 100));
 }
 async function atualizarNotaDesempenho(alunoId) {
   try {
@@ -4814,21 +4811,20 @@ async function rodarPrevia(turmaId, inicio, fim) {
           AND p.atualizado_em >= lim.ini AND p.atualizado_em < lim.f
           AND p.aluno_id IN (SELECT aluno_id FROM alu)
      ),
-     prog AS (
-       SELECT p.aluno_id, p.atividade_idx, p.estacao, p.concluida
+     scored AS (
+       SELECT p.aluno_id,
+              COALESCE((p.respostas->>'acertos')::int,0) AS acertos,
+              COALESCE((p.respostas->>'total')::int,0)  AS total
          FROM english_platform_progresso p, lim
-        WHERE p.estacao <> 'resumo'
+        WHERE p.estacao IN ('listening','vocab','check')
+          AND p.respostas ? 'total' AND (p.respostas->>'total') ~ '^[0-9]+$'
           AND p.atividade_idx IN (SELECT atividade_idx FROM pacts)
           AND p.aluno_id IN (SELECT aluno_id FROM alu)
           AND p.atualizado_em < lim.f
-     ),
-     spa AS (
-       SELECT COALESCE(MAX(c), 5) AS n
-         FROM (SELECT aluno_id, atividade_idx, COUNT(DISTINCT estacao) AS c FROM prog GROUP BY aluno_id, atividade_idx) z
      )
      SELECT al.matricula_id, al.nome,
-            COALESCE((SELECT COUNT(*) FROM prog p WHERE p.aluno_id = al.aluno_id AND p.concluida), 0)::int AS feitas,
-            (SELECT n FROM spa)::int AS spa,
+            COALESCE((SELECT SUM(sc.acertos) FROM scored sc WHERE sc.aluno_id = al.aluno_id),0)::int AS acertos,
+            COALESCE((SELECT SUM(sc.total)   FROM scored sc WHERE sc.aluno_id = al.aluno_id),0)::int AS total,
             (SELECT COUNT(*) FROM pacts)::int AS nact
        FROM alu al ORDER BY al.nome`, [turmaId, inicio, fim]);
   return q.rows;
@@ -4841,12 +4837,12 @@ async function previaDesempenho(turmaId, inicio, fim) {
   if (rows.length && Number(rows[0].nact) === 0) { rows = await rodarPrevia(turmaId, '1900-01-01', fim); janela = false; }
   const atividades = rows.length ? Number(rows[0].nact) : 0;
   const alunos = rows.map(r => {
-    const spa = Number(r.spa) || 5;
-    const nact = Number(r.nact) || 0;
-    const expected = nact * spa;
-    const pct = expected > 0 ? Math.min(100, Math.round(Number(r.feitas) / expected * 100)) : 0;
-    const nota = Math.min(10, Math.round(pct) / 10);
-    return { matricula_id: r.matricula_id, nome: r.nome, feitas: Number(r.feitas), pct, nota };
+    const total = Number(r.total) || 0;
+    const acertos = Number(r.acertos) || 0;
+    const corrigido = total > 0;
+    const pct = corrigido ? Math.min(100, Math.round(acertos / total * 100)) : null;
+    const nota = corrigido ? Math.min(10, Math.round(pct) / 10) : null;
+    return { matricula_id: r.matricula_id, nome: r.nome, acertos, total, corrigido, pct, nota };
   });
   return { alunos, atividades, janela };
 }
@@ -4895,11 +4891,12 @@ app.post('/admin/turmas/:id/desempenho-lancar', autenticar, somenteGestao, async
       }
     }
     const alunos = (await previaDesempenho(req.params.id, inicio, fim)).alunos;
+    const comNota = alunos.filter(a => a.nota != null);
     await client.query('BEGIN');
     let lancadas = 0;
-    if (alunos.length) {
+    if (comNota.length) {
       const vals = [], params = [];
-      alunos.forEach((a, i) => { const base = i * 4; vals.push(`($${base+1},$${base+2},$${base+3},FALSE,$${base+4},NOW())`); params.push(avId, a.matricula_id, a.nota, req.usuario.id); });
+      comNota.forEach((a, i) => { const base = i * 4; vals.push(`($${base+1},$${base+2},$${base+3},FALSE,$${base+4},NOW())`); params.push(avId, a.matricula_id, a.nota, req.usuario.id); });
       const u = await client.query(
         `INSERT INTO notas (avaliacao_id, matricula_id, nota, manual, lancada_por, lancada_em)
          VALUES ${vals.join(',')}
@@ -4909,7 +4906,7 @@ app.post('/admin/turmas/:id/desempenho-lancar', autenticar, somenteGestao, async
       lancadas = u.rowCount;
     }
     await client.query('COMMIT'); client.release();
-    res.json({ ok: true, lancadas, total: alunos.length });
+    res.json({ ok: true, lancadas, total: alunos.length, sem_correcao: alunos.length - comNota.length });
   } catch (e) { try { await client.query('ROLLBACK'); } catch(_){} client.release(); console.error('Erro lançar desempenho:', e); res.status(500).json({ erro: 'Erro ao lançar as notas.' }); }
 });
 
@@ -5067,6 +5064,37 @@ app.get('/publico/portal/aluno/:id/aulas-virtuais', autenticarResponsavel, async
          FROM aulas_virtuais WHERE turma_id = $1 ORDER BY data DESC, hora_inicio DESC NULLS LAST, id DESC`, [mat.turma_id]);
     res.json({ turma: mat.turma_nome, itens: r.rows });
   } catch (e) { console.error('Erro portal aulas-virtuais:', e); res.status(500).json({ erro: 'Erro ao carregar as aulas virtuais.' }); }
+});
+
+app.get('/publico/portal/aluno/:id/plataforma-desempenho', autenticarResponsavel, async (req, res) => {
+  try {
+    const alunoId = Number(req.params.id);
+    if (!await vinculoOk(req.responsavelId, alunoId)) return res.status(403).json({ erro: 'Acesso negado a este aluno.' });
+    const r = await pool.query(
+      `SELECT modulo_key, atividade_idx, estacao, respostas
+         FROM english_platform_progresso
+        WHERE aluno_id = $1 AND estacao IN ('listening','vocab','check')
+          AND respostas ? 'total' AND (respostas->>'total') ~ '^[0-9]+$'
+        ORDER BY modulo_key, atividade_idx, estacao`, [alunoId]);
+    const mapa = new Map();
+    for (const row of r.rows) {
+      const key = row.modulo_key + '#' + row.atividade_idx;
+      if (!mapa.has(key)) mapa.set(key, { modulo_key: row.modulo_key, atividade_idx: Number(row.atividade_idx), acertos: 0, total: 0, erros: [] });
+      const o = mapa.get(key), resp = row.respostas || {};
+      o.acertos += Number(resp.acertos) || 0;
+      o.total += Number(resp.total) || 0;
+      const estNome = row.estacao === 'listening' ? 'Listening' : (row.estacao === 'vocab' ? 'Vocabulary' : 'Check');
+      (Array.isArray(resp.erros) ? resp.erros : []).forEach(e => o.erros.push({ estacao: estNome, q: e.q, sua: e.sua, correta: e.correta }));
+    }
+    const atividades = [...mapa.values()].map(o => {
+      const pct = o.total > 0 ? Math.min(100, Math.round(o.acertos / o.total * 100)) : null;
+      return { modulo_key: o.modulo_key, atividade_idx: o.atividade_idx, acertos: o.acertos, total: o.total, pct, erros: o.erros };
+    }).sort((a, b) => a.modulo_key.localeCompare(b.modulo_key) || a.atividade_idx - b.atividade_idx);
+    let ac = 0, tot = 0; atividades.forEach(o => { ac += o.acertos; tot += o.total; });
+    const pctGeral = tot > 0 ? Math.min(100, Math.round(ac / tot * 100)) : null;
+    const geral = { acertos: ac, total: tot, pct: pctGeral, nota: pctGeral == null ? null : Math.min(10, Math.round(pctGeral) / 10) };
+    res.json({ geral, atividades });
+  } catch (e) { console.error('Erro plataforma-desempenho:', e); res.status(500).json({ erro: 'Erro ao carregar o desempenho na plataforma.' }); }
 });
 
 // ---------- Portal: Financeiro do aluno ----------
@@ -6847,7 +6875,7 @@ app.get('/health', async (req, res) => {
     res.json({
       status: (erroInicializacao || falhasMigracao.length) ? 'degradado' : 'ok',
       sistema: 'CEMIC Gestão',
-      versao: '4.3 (Notas da Plataforma: autocria a avaliação Desempenho na Plataforma no lançamento)',
+      versao: '4.4 (Nota da Plataforma = acerto da 1a tentativa; erros visiveis ao aluno e aos pais)',
       inicializacao: erroInicializacao || 'ok',
       migracoes_com_falha: falhasMigracao
     });
@@ -6864,7 +6892,7 @@ initDB()
     console.error('Falha ao inicializar o banco:', e);
   })
   .finally(() => app.listen(PORT, () => {
-    console.log(`CEMIC Gestão — backend v4.3 rodando na porta ${PORT}`);
+    console.log(`CEMIC Gestão — backend v4.4 rodando na porta ${PORT}`);
     if (erroInicializacao) console.error('ATENÇÃO: o sistema subiu com falha de inicialização —', erroInicializacao);
     if (falhasMigracao.length) console.error('ATENÇÃO: migrações com falha —', falhasMigracao.join(' | '));
     marcarAtrasados().catch(() => {});
