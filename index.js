@@ -400,6 +400,8 @@ async function initDB() {
   )`);
   await pool.query(`ALTER TABLE professores ADD COLUMN IF NOT EXISTS cpf TEXT`);
   await pool.query(`ALTER TABLE professores ADD COLUMN IF NOT EXISTS data_ingresso DATE`);
+  await pool.query(`ALTER TABLE professores ADD COLUMN IF NOT EXISTS pix_tipo TEXT`);
+  await pool.query(`ALTER TABLE professores ADD COLUMN IF NOT EXISTS pix_chave TEXT`);
   await pool.query(`CREATE TABLE IF NOT EXISTS professor_pagamentos (
     id SERIAL PRIMARY KEY,
     professor_id INTEGER NOT NULL REFERENCES professores(id) ON DELETE CASCADE,
@@ -755,34 +757,6 @@ async function initDB() {
     resolvido_por INTEGER REFERENCES usuarios(id)
   )`);
   await migrar('idx_pix_comprovantes_status', `CREATE INDEX IF NOT EXISTS idx_pix_comprovantes_status ON pix_comprovantes (status, criado_em DESC)`);
-  await migrar('pre_matriculas', `CREATE TABLE IF NOT EXISTS pre_matriculas (
-    id SERIAL PRIMARY KEY,
-    protocolo TEXT UNIQUE,
-    semestre TEXT NOT NULL DEFAULT '2027.1',
-    aluno_nome TEXT NOT NULL,
-    aluno_cpf TEXT,
-    aluno_nascimento DATE,
-    aluno_whatsapp TEXT,
-    aluno_telefone TEXT,
-    aluno_email TEXT,
-    responsavel_nome TEXT,
-    responsavel_cpf TEXT,
-    responsavel_whatsapp TEXT,
-    modulo TEXT,
-    turno TEXT,
-    unidade TEXT DEFAULT 'IEMA Pleno Dr.º João Bacelar Portela',
-    data_inscricao_opcao TEXT,
-    como_soube TEXT,
-    observacao TEXT,
-    status TEXT NOT NULL DEFAULT 'pendente' CHECK (status IN ('pendente','efetivada','cancelada')),
-    criado_em TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    efetivada_em TIMESTAMPTZ,
-    efetivada_por INTEGER REFERENCES usuarios(id),
-    observacao_interna TEXT
-  )`);
-  await migrar('idx_pre_matriculas', `CREATE INDEX IF NOT EXISTS idx_pre_matriculas ON pre_matriculas (semestre, status, criado_em DESC)`);
-  await migrar('pre_matriculas_aluno_id', `ALTER TABLE pre_matriculas ADD COLUMN IF NOT EXISTS aluno_id INTEGER REFERENCES alunos(id)`);
-  await migrar('pre_matriculas_matricula_id', `ALTER TABLE pre_matriculas ADD COLUMN IF NOT EXISTS matricula_id INTEGER REFERENCES matriculas(id)`);
   // Entrega de livros: registro por matrícula (existir a linha = livro entregue).
   await migrar('entrega_livros', `CREATE TABLE IF NOT EXISTS entrega_livros (
     matricula_id INTEGER PRIMARY KEY REFERENCES matriculas(id) ON DELETE CASCADE,
@@ -1531,8 +1505,8 @@ app.post('/admin/professores', autenticar, somenteGestao, async (req, res) => {
     const erro = obrigatorios(req.body, ['nome']);
     if (erro) return res.status(400).json({ erro });
     const r = await pool.query(
-      `INSERT INTO professores (nome, cpf, email, formacao, whatsapp, data_nascimento, data_ingresso) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
-      [req.body.nome, req.body.cpf || null, req.body.email || null, req.body.formacao || null, req.body.whatsapp || null, req.body.data_nascimento || null, req.body.data_ingresso || null]
+      `INSERT INTO professores (nome, cpf, email, formacao, whatsapp, data_nascimento, data_ingresso, pix_tipo, pix_chave) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
+      [req.body.nome, req.body.cpf || null, req.body.email || null, req.body.formacao || null, req.body.whatsapp || null, req.body.data_nascimento || null, req.body.data_ingresso || null, req.body.pix_tipo || null, req.body.pix_chave || null]
     );
     res.status(201).json(r.rows[0]);
   } catch (e) {
@@ -1547,11 +1521,12 @@ app.put('/admin/professores/:id', autenticar, somenteGestao, async (req, res) =>
     if (!atual.rows.length) return res.status(404).json({ erro: 'Professor não encontrado.' });
     const x = atual.rows[0];
     const r = await pool.query(
-      `UPDATE professores SET nome=$1, cpf=$2, email=$3, formacao=$4, whatsapp=$5, data_nascimento=$6, data_ingresso=$7, status=$8 WHERE id=$9 RETURNING *`,
+      `UPDATE professores SET nome=$1, cpf=$2, email=$3, formacao=$4, whatsapp=$5, data_nascimento=$6, data_ingresso=$7, status=$8, pix_tipo=$9, pix_chave=$10 WHERE id=$11 RETURNING *`,
       [
         req.body.nome ?? x.nome, req.body.cpf ?? x.cpf, req.body.email ?? x.email, req.body.formacao ?? x.formacao,
         req.body.whatsapp ?? x.whatsapp, req.body.data_nascimento ?? x.data_nascimento,
-        req.body.data_ingresso ?? x.data_ingresso, req.body.status ?? x.status, req.params.id
+        req.body.data_ingresso ?? x.data_ingresso, req.body.status ?? x.status,
+        req.body.pix_tipo ?? x.pix_tipo, req.body.pix_chave ?? x.pix_chave, req.params.id
       ]
     );
     res.json(r.rows[0]);
@@ -2097,16 +2072,8 @@ app.post('/admin/matriculas', autenticar, somenteGestao, async (req, res) => {
         valor: taxa, forma: formaTaxa, data: hoje
       };
     }
-    let preMatriculaEfetivada = false;
-    if (req.body.pre_matricula_id) {
-      const upm = await client.query(
-        `UPDATE pre_matriculas SET status='efetivada', aluno_id=$2, matricula_id=$3, efetivada_em=NOW(), efetivada_por=$4
-           WHERE id=$1 AND status='pendente' RETURNING id`,
-        [Number(req.body.pre_matricula_id), aluno.id, matricula.id, req.usuario.id]);
-      preMatriculaEfetivada = upm.rows.length > 0;
-    }
     await client.query('COMMIT'); client.release();
-    res.status(201).json({ matricula, mensalidades_geradas: parcelas, plataforma_lancada: plataformaLancada, bolsista, recibo, pre_matricula_efetivada: preMatriculaEfetivada });
+    res.status(201).json({ matricula, mensalidades_geradas: parcelas, plataforma_lancada: plataformaLancada, bolsista, recibo });
   } catch (e) {
     try { await client.query('ROLLBACK'); } catch {}
     client.release();
@@ -6934,135 +6901,13 @@ app.get('/', (req, res) => {
 // ============================================================
 // 12. SAÚDE E INICIALIZAÇÃO
 // ============================================================
-// ===================== Pré-Matrícula (pré-inscrição gratuita 2027.1) =====================
-// Página pública /preinscricao registra interessados; aparecem no Gestão em "Pré-Matrícula";
-// somente o master efetiva a matrícula no comparecimento (datas de inscrição 05 e 12/12).
-app.post('/publico/pre-matricula', async (req, res) => {
-  const client = await pool.connect();
-  try {
-    const b = req.body || {};
-    const s = (v, n) => String(v == null ? '' : v).trim().slice(0, n);
-    const aluno_nome = s(b.aluno_nome, 160);
-    if (!aluno_nome) { client.release(); return res.status(400).json({ erro: 'Informe o nome do aluno.' }); }
-    const semestre = '2027.1';
-    const nasc = /^\d{4}-\d{2}-\d{2}$/.test(s(b.aluno_nascimento, 10)) ? s(b.aluno_nascimento, 10) : null;
-    await client.query('BEGIN');
-    await client.query(`SELECT pg_advisory_xact_lock(hashtext($1))`, ['prematr-' + semestre]);
-    const seqRow = await client.query(`SELECT COUNT(*)::int AS n FROM pre_matriculas WHERE semestre = $1`, [semestre]);
-    const seq = (seqRow.rows[0].n || 0) + 1;
-    const protocolo = 'PRE-' + semestre + '-' + String(seq).padStart(4, '0');
-    const ins = await client.query(
-      `INSERT INTO pre_matriculas
-         (protocolo, semestre, aluno_nome, aluno_cpf, aluno_nascimento, aluno_whatsapp, aluno_telefone, aluno_email,
-          responsavel_nome, responsavel_cpf, responsavel_whatsapp, modulo, turno, unidade, data_inscricao_opcao, como_soube, observacao)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) RETURNING id, protocolo, criado_em`,
-      [protocolo, semestre, aluno_nome, s(b.aluno_cpf, 20), nasc, s(b.aluno_whatsapp, 20), s(b.aluno_telefone, 20), s(b.aluno_email, 120),
-       s(b.responsavel_nome, 160), s(b.responsavel_cpf, 20), s(b.responsavel_whatsapp, 20), s(b.modulo, 40), s(b.turno, 20),
-       s(b.unidade, 120) || 'IEMA Pleno Dr.º João Bacelar Portela', s(b.data_inscricao_opcao, 20), s(b.como_soube, 40), s(b.observacao, 500)]);
-    await client.query('COMMIT'); client.release();
-    res.status(201).json({ ok: true, id: ins.rows[0].id, protocolo: ins.rows[0].protocolo, criado_em: ins.rows[0].criado_em, semestre });
-  } catch (e) { try { await client.query('ROLLBACK'); } catch (_) {} client.release(); console.error('Erro pré-matrícula:', e); res.status(500).json({ erro: 'Erro ao registrar a pré-inscrição. Tente novamente.' }); }
-});
-app.get('/admin/pre-matriculas', autenticar, somenteGestao, async (req, res) => {
-  try {
-    const status = String(req.query.status || '').trim();
-    const cond = ['efetivada', 'cancelada', 'pendente'].includes(status) ? ' WHERE status = $1' : '';
-    const params = cond ? [status] : [];
-    const r = await pool.query(`SELECT * FROM pre_matriculas${cond} ORDER BY criado_em DESC`, params);
-    const resumo = await pool.query(`SELECT status, COUNT(*)::int AS n FROM pre_matriculas GROUP BY status`);
-    const cont = { pendente: 0, efetivada: 0, cancelada: 0 }; resumo.rows.forEach(x => { cont[x.status] = x.n; });
-    res.json({ itens: r.rows, resumo: cont });
-  } catch (e) { console.error('Erro listar pré-matrículas:', e); res.status(500).json({ erro: 'Erro ao listar as pré-inscrições.' }); }
-});
-app.post('/admin/pre-matriculas/:id/iniciar', autenticar, exigirPerfil('master'), async (req, res) => {
-  // Prepara a rotina de matrícula a partir da pré-matrícula: localiza/cria o aluno (por CPF),
-  // vincula o responsável quando houver CPF válido, e grava o aluno_id na pré-matrícula (sem efetivar).
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-    const pm = await client.query(`SELECT * FROM pre_matriculas WHERE id = $1 FOR UPDATE`, [Number(req.params.id)]);
-    if (!pm.rows.length) { await client.query('ROLLBACK'); client.release(); return res.status(404).json({ erro: 'Pré-matrícula não encontrada.' }); }
-    const p = pm.rows[0];
-    if (p.status !== 'pendente') { await client.query('ROLLBACK'); client.release(); return res.status(409).json({ erro: 'Esta pré-matrícula já foi ' + (p.status === 'efetivada' ? 'efetivada' : 'cancelada') + '.' }); }
-
-    // Localiza ou cria o aluno pelo CPF
-    const cpf = p.aluno_cpf ? soDigitos(p.aluno_cpf) : null;
-    let alunoId = null, alunoCriado = false;
-    if (cpf) {
-      const ex = await client.query(`SELECT id FROM alunos WHERE cpf = $1`, [cpf]);
-      if (ex.rows.length) alunoId = ex.rows[0].id;
-    }
-    if (!alunoId) {
-      const obs = 'Origem: Pré-Matrícula ' + (p.protocolo || '') + (p.observacao ? (' \u2014 ' + p.observacao) : '');
-      const nova = await client.query(
-        `INSERT INTO alunos (nome, data_nascimento, email, cpf, whatsapp, modalidade, observacoes, status)
-         VALUES ($1,$2,$3,$4,$5,'pagante',$6,'ativo') RETURNING id`,
-        [p.aluno_nome, p.aluno_nascimento || null, p.aluno_email || null, cpf, p.aluno_whatsapp || null, obs]);
-      alunoId = nova.rows[0].id; alunoCriado = true;
-    }
-
-    // Responsável: vincula quando houver CPF válido (reaproveita cadastro existente)
-    let respVinc = false;
-    const rcpf = p.responsavel_cpf ? soDigitos(p.responsavel_cpf) : null;
-    if (rcpf && cpfValido(rcpf) && p.responsavel_nome) {
-      let respId = null;
-      const re = await client.query(`SELECT id FROM responsaveis WHERE cpf = $1`, [rcpf]);
-      if (re.rows.length) {
-        respId = re.rows[0].id;
-        await client.query(`UPDATE responsaveis SET nome = $1, whatsapp = COALESCE(NULLIF($2,''), whatsapp) WHERE id = $3`,
-          [p.responsavel_nome, p.responsavel_whatsapp || '', respId]);
-      } else {
-        const rn = await client.query(`INSERT INTO responsaveis (nome, cpf, whatsapp) VALUES ($1,$2,$3) RETURNING id`,
-          [p.responsavel_nome, rcpf, p.responsavel_whatsapp || null]);
-        respId = rn.rows[0].id;
-      }
-      const jv = await client.query(`SELECT 1 FROM aluno_responsavel WHERE aluno_id = $1 AND responsavel_id = $2`, [alunoId, respId]);
-      if (!jv.rows.length) {
-        await client.query(`INSERT INTO aluno_responsavel (aluno_id, responsavel_id, parentesco, responsavel_financeiro) VALUES ($1,$2,$3,TRUE)`,
-          [alunoId, respId, 'RESPONSÁVEL']);
-      }
-      respVinc = true;
-    }
-
-    await client.query(`UPDATE pre_matriculas SET aluno_id = $2 WHERE id = $1`, [p.id, alunoId]);
-    await client.query('COMMIT'); client.release();
-    res.json({ ok: true, aluno_id: alunoId, aluno_criado: alunoCriado, responsavel_vinculado: respVinc, protocolo: p.protocolo });
-  } catch (e) {
-    try { await client.query('ROLLBACK'); } catch (_) {}
-    client.release();
-    if (e.code === '23505') return res.status(409).json({ erro: 'Conflito de CPF ao preparar o cadastro. Verifique se o aluno já existe no sistema.' });
-    console.error('Erro iniciar matrícula (pré-matrícula):', e);
-    res.status(500).json({ erro: 'Erro ao iniciar a matrícula a partir da pré-matrícula.' });
-  }
-});
-app.post('/admin/pre-matriculas/:id/efetivar', autenticar, exigirPerfil('master'), async (req, res) => {
-  try {
-    const r = await pool.query(
-      `UPDATE pre_matriculas SET status='efetivada', efetivada_em=NOW(), efetivada_por=$2, observacao_interna=$3
-         WHERE id=$1 AND status='pendente' RETURNING id`,
-      [Number(req.params.id), req.usuario.id, String(req.body.observacao_interna || '').slice(0, 500) || null]);
-    if (!r.rows.length) return res.status(409).json({ erro: 'Pré-inscrição não encontrada ou já processada.' });
-    res.json({ ok: true });
-  } catch (e) { console.error('Erro efetivar pré-matrícula:', e); res.status(500).json({ erro: 'Erro ao efetivar a pré-inscrição.' }); }
-});
-app.post('/admin/pre-matriculas/:id/cancelar', autenticar, exigirPerfil('master'), async (req, res) => {
-  try {
-    const r = await pool.query(
-      `UPDATE pre_matriculas SET status='cancelada', observacao_interna=$3, efetivada_em=NOW(), efetivada_por=$2
-         WHERE id=$1 AND status<>'efetivada' RETURNING id`,
-      [Number(req.params.id), req.usuario.id, String(req.body.observacao_interna || '').slice(0, 500) || null]);
-    if (!r.rows.length) return res.status(409).json({ erro: 'Pré-inscrição não encontrada ou já efetivada.' });
-    res.json({ ok: true });
-  } catch (e) { console.error('Erro cancelar pré-matrícula:', e); res.status(500).json({ erro: 'Erro ao cancelar a pré-inscrição.' }); }
-});
-
 app.get('/health', async (req, res) => {
   try {
     await pool.query('SELECT 1');
     res.json({
       status: (erroInicializacao || falhasMigracao.length) ? 'degradado' : 'ok',
       sistema: 'CEMIC Gestão',
-      versao: '4.8 (Pré-Matrícula: iniciar matrícula a partir da ficha, com Termo e Recibo)',
+      versao: '4.5 (Relatorio individual de desempenho na English Platform no admin)',
       inicializacao: erroInicializacao || 'ok',
       migracoes_com_falha: falhasMigracao
     });
@@ -7079,7 +6924,7 @@ initDB()
     console.error('Falha ao inicializar o banco:', e);
   })
   .finally(() => app.listen(PORT, () => {
-    console.log(`CEMIC Gestão — backend v4.8 rodando na porta ${PORT}`);
+    console.log(`CEMIC Gestão — backend v4.5 rodando na porta ${PORT}`);
     if (erroInicializacao) console.error('ATENÇÃO: o sistema subiu com falha de inicialização —', erroInicializacao);
     if (falhasMigracao.length) console.error('ATENÇÃO: migrações com falha —', falhasMigracao.join(' | '));
     marcarAtrasados().catch(() => {});
